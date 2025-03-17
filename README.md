@@ -2,7 +2,8 @@
 
 A lightning-fast, memory-efficient LRU cache for Go applications. Originally developed for the [nanite router](https://github.com/xDarkicex/nanite), now available as a standalone package to supercharge your caching needs.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/xDarki.go.dev/github.com/xDarkicexd](https://goreportcard.com/badge/github.com/xDarkicextcard.com/report/github.coures
+[![Go Reference](https://pkg.go.dev/badge/github.com/xDarkicex/liteLRU)](https://pkg.go.dev/github.com/xDarkicex/liteLRU)
+[![Go Report Card](https://goreportcard.com/badge/github.com/xDarkicex/liteLRU)](https://goreportcard.com/report/github.com/xDarkicex/liteLRU)
 
 - **Blazing Fast**: Get operations as low as 79ns with zero allocations
 - **Memory Efficient**: Smart parameter pooling minimizes GC pressure
