@@ -7,15 +7,16 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/dgraph-io/ristretto"
+	"github.com/maypok86/otter"
 	"github.com/xDarkicex/liteLRU"
 )
 
 const workingSetSize = 100000
 const numOps = 2000000
+const warmupOps = 400000 // 20% of operations for warmup
 
 func main() {
-	fmt.Println("Running Zipfian Hit-Rate Benchmarks...")
+	fmt.Println("Running Zipfian Hit-Rate Benchmarks (with warmup)...")
 
 	// Generate Zipfian access sequence
 	r := rand.New(rand.NewSource(42))
@@ -35,9 +36,18 @@ func main() {
 		lite := liteLRU.NewLRUCache(cap, 5)
 		var liteHits, liteMisses atomic.Uint64
 
+		// Warmup liteLRU
+		for i := 0; i < warmupOps; i++ {
+			key := ops[i]
+			if _, _, ok := lite.Get("GET", key); !ok {
+				lite.Add("GET", key, nil, nil)
+			}
+		}
+
+		// Measured Phase
 		var wg sync.WaitGroup
 		wg.Add(8)
-		chunkSize := numOps / 8
+		chunkSize := (numOps - warmupOps) / 8
 		for i := 0; i < 8; i++ {
 			go func(start, end int) {
 				for j := start; j < end; j++ {
@@ -50,37 +60,45 @@ func main() {
 					}
 				}
 				wg.Done()
-			}(i*chunkSize, (i+1)*chunkSize)
+			}(warmupOps+(i*chunkSize), warmupOps+((i+1)*chunkSize))
 		}
 		wg.Wait()
-		fmt.Printf("liteLRU   Hit Rate: %.2f%%\n", float64(liteHits.Load())/float64(numOps)*100)
+		measuredOps := numOps - warmupOps
+		fmt.Printf("liteLRU   Hit Rate: %.2f%%\n", float64(liteHits.Load())/float64(measuredOps)*100)
 
-		// 2. Ristretto
-		ristrettoCache, _ := ristretto.NewCache(&ristretto.Config{
-			NumCounters: int64(cap * 10),
-			MaxCost:     int64(cap),
-			BufferItems: 64,
-		})
-		var ristHits, ristMisses atomic.Uint64
+		// 2. Otter
+		otterCache, err := otter.MustBuilder[string, any](cap).
+			CollectStats().
+			Build()
+		if err != nil {
+			panic(err)
+		}
+		var otterHits, otterMisses atomic.Uint64
+
+		// Warmup Otter
+		for i := 0; i < warmupOps; i++ {
+			key := ops[i]
+			if !otterCache.Has(key) {
+				otterCache.Set(key, nil)
+			}
+		}
 
 		wg.Add(8)
 		for i := 0; i < 8; i++ {
 			go func(start, end int) {
 				for j := start; j < end; j++ {
 					key := ops[j]
-					if _, ok := ristrettoCache.Get(key); ok {
-						ristHits.Add(1)
+					if _, ok := otterCache.Get(key); ok {
+						otterHits.Add(1)
 					} else {
-						ristMisses.Add(1)
-						ristrettoCache.Set(key, nil, 1)
+						otterMisses.Add(1)
+						otterCache.Set(key, nil)
 					}
 				}
 				wg.Done()
-			}(i*chunkSize, (i+1)*chunkSize)
+			}(warmupOps+(i*chunkSize), warmupOps+((i+1)*chunkSize))
 		}
 		wg.Wait()
-		// Wait for ristretto background processing
-		ristrettoCache.Wait()
-		fmt.Printf("Ristretto Hit Rate: %.2f%%\n", float64(ristHits.Load())/float64(numOps)*100)
+		fmt.Printf("Otter Hit Rate: %.2f%%\n", float64(otterHits.Load())/float64(measuredOps)*100)
 	}
 }

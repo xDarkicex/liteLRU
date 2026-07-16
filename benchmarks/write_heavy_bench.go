@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dgraph-io/ristretto"
+	"github.com/maypok86/otter"
 	"github.com/xDarkicex/liteLRU"
 )
 
@@ -72,29 +72,24 @@ func main() {
 		duration := time.Since(start)
 		fmt.Printf("liteLRU   Ops/sec: %d\n", int(float64(numOps)/duration.Seconds()))
 
-		// Ristretto
-		rist, _ := ristretto.NewCache(&ristretto.Config{
-			NumCounters: int64(1024 * 10),
-			MaxCost:     1024,
-			BufferItems: 64,
-		})
+		// Otter
+		otterCache, _ := otter.MustBuilder[string, any](1024).Build()
 		start = time.Now()
 		wg.Add(8)
 		for i := 0; i < 8; i++ {
 			go func(s, e int) {
 				for j := s; j < e; j++ {
 					if ops[j].isGet {
-						rist.Get(ops[j].key)
+						otterCache.Get(ops[j].key)
 					} else {
-						rist.Set(ops[j].key, nil, 1)
+						otterCache.Set(ops[j].key, nil)
 					}
 				}
 				wg.Done()
 			}(i*chunkSize, (i+1)*chunkSize)
 		}
 		wg.Wait()
-		rist.Wait()
 		duration = time.Since(start)
-		fmt.Printf("Ristretto Ops/sec: %d\n", int(float64(numOps)/duration.Seconds()))
+		fmt.Printf("Otter     Ops/sec: %d\n", int(float64(numOps)/duration.Seconds()))
 	}
 }

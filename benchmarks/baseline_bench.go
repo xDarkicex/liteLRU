@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dgraph-io/ristretto"
+	"github.com/maypok86/otter"
 	"github.com/xDarkicex/liteLRU"
 )
 
@@ -45,17 +45,13 @@ func main() {
 		lCache.Add("GET", key, nil, nil)
 	})
 
-	// 2. Benchmark Ristretto
-	fmt.Println("\n--- Ristretto ---")
-	rCache, _ := ristretto.NewCache(&ristretto.Config{
-		NumCounters: 1e7,     // number of keys to track frequency of (10M).
-		MaxCost:     1024,    // maximum cost of cache (1KB).
-		BufferItems: 64,      // number of keys per Get buffer.
-	})
+	// 2. Benchmark Otter
+	fmt.Println("\n--- Otter ---")
+	oCache, _ := otter.MustBuilder[string, any](capacity).Build()
 	runBench(ops, numWorkers, func(key string) {
-		rCache.Get(key)
+		oCache.Get(key)
 	}, func(key string) {
-		rCache.Set(key, 1, 1)
+		oCache.Set(key, 1)
 	})
 
 	// 3. Benchmark Mutex LRU

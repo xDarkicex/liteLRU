@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/dgraph-io/ristretto"
+	"github.com/maypok86/otter"
 	"github.com/xDarkicex/liteLRU"
 )
 
@@ -26,22 +26,20 @@ func main() {
 	fmt.Printf("liteLRU Sys (Includes Mmap): %.2f MB\n", float64(m2.Sys-m1.Sys)/1024/1024)
 
 	// Keep alive
-	_ = lite
-
-	// 2. Ristretto
+	fmt.Println("\nMeasuring Otter Memory...")
 	runtime.GC()
 	runtime.ReadMemStats(&m1)
-	
-	rist, _ := ristretto.NewCache(&ristretto.Config{
-		NumCounters: int64(capacity * 10),
-		MaxCost:     int64(capacity),
-		BufferItems: 64,
-	})
 
+	otterCache, _ := otter.MustBuilder[string, any](capacity).Build()
+
+	for i := 0; i < capacity; i++ {
+		key := fmt.Sprintf("route-destination-%d", i)
+		otterCache.Set(key, nil)
+	}
+
+	runtime.GC()
 	runtime.ReadMemStats(&m2)
-	ristAlloc := m2.Alloc - m1.Alloc
-	fmt.Printf("Ristretto (Heap Alloc): %d bytes (%.2f MB)\n", ristAlloc, float64(ristAlloc)/1024/1024)
-	fmt.Printf("Ristretto Sys: %.2f MB\n", float64(m2.Sys-m1.Sys)/1024/1024)
+	fmt.Printf("Otter     Allocated: %v MB\n", (m2.Alloc-m1.Alloc)/1024/1024)
 	
-	_ = rist
+	_ = lite
 }

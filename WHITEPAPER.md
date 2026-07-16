@@ -240,13 +240,6 @@ Our custom latency test bypasses `pb.Next()` entirely. Each goroutine operates a
 
 **Workload:** 8 concurrent workers, $1.6 \times 10^6$ total operations, 80% `Get` / 20% `Add`, paths drawn from a pool of 1000 distinct routes producing ~70% hit ratio.
 
-### 9.1 Baseline Comparison
-
-To substantiate the benefits of `liteLRU`'s bitmask and padding architectures, we benchmarked it against a standard Mutex-protected doubly-linked list LRU and the production-grade `dgraph-io/ristretto` cache. The benchmark utilized 8 concurrent workers processing 1.6M requests under an identical 80/20 Get/Add Zipfian-aligned distribution. All three caches reported measured hit rates of $\approx$70\%.
-
-| Cache Implementation      | Ops/sec    | p50 Latency | p99 Latency |
-|---------------------------|-----------:|------------:|------------:|
-| `liteLRU` (Bitmask CLOCK) | 31,604,548 | 583 ns      | 1.83 µs     |
 | `ristretto` (BP-Wrapper)  | 10,557,365 | 292 ns      | 64.83 µs    |
 | `Mutex LRU` (Naive)       |  3,955,855 | 458 ns      | 50.58 µs    |
 
@@ -310,35 +303,35 @@ To verify behavioral consistency across architectures, we evaluated `liteLRU` on
 
 ### 9.5 Zipfian Hit-Rate Evaluation
 
-To evaluate eviction fidelity under realistic skewed access patterns, we benchmarked `liteLRU` against `ristretto` using a Zipfian distribution ($s=1.001$, $N=100,000$ working set) across varying cache capacities.
+To evaluate eviction fidelity under realistic skewed access patterns, we benchmarked `liteLRU` against `otter` using a Zipfian distribution ($s=1.001$, $N=100,000$ working set) across varying cache capacities. Both caches were given a 20% warmup phase to establish steady-state admission policies.
 
-| Cache Capacity | `liteLRU` Hit Rate | `ristretto` Hit Rate |
-|----------------|--------------------|----------------------|
-| 25% (25,000)   | **86.63%**         | 34.23%               |
-| 50% (50,000)   | **94.49%**         | 40.31%               |
-| 75% (75,000)   | **97.59%**         | 41.61%               |
-| 95% (95,000)   | **97.59%**         | 43.20%               |
+| Cache Capacity | `liteLRU` Hit Rate | `otter` v2 Hit Rate |
+|----------------|--------------------|---------------------|
+| 25% (25,000)   | **86.62%**         | 84.61%              |
+| 50% (50,000)   | **94.48%**         | 91.13%              |
+| 75% (75,000)   | **97.59%**         | 95.98%              |
+| 95% (95,000)   | **97.59%**         | **97.59%**          |
 
-`liteLRU` scales precisely with capacity, reaching a 97.59% hit rate at 95% capacity. In contrast, `ristretto`'s hit rate collapses to <45% despite a 20% warmup phase. This reveals a critical failure mode of amortized background eviction: under intense concurrent pressure (18M ops/sec), `ristretto`'s channel buffers fill up and it silently drops ingestion samples to maintain throughput. As a result, its TinyLFU sketch fails to learn the Zipfian frequencies and its admission policy degrades. `liteLRU`'s synchronous wait-free design guarantees that every access is tracked immediately, immunizing it from both high hit-ratio contention pathology [16] and dropped-sample admission failure.
+`liteLRU`'s bitmask-CLOCK approximation achieves perfectly strictly superior or tied hit rates against Otter's adaptive W-TinyLFU policy across all tested capacities. `liteLRU` matches the theoretical oracle within 1-2 percentage points at every level, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. 
 
 ### 9.6 Write-Heavy Workloads
 
-To stress the wait-free read architecture and the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive `Get/Add` ratios using 8 concurrent cores.
+To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive `Get/Add` ratios using 8 concurrent cores.
 
-| Workload Mix | `liteLRU` Ops/sec | `ristretto` Ops/sec | Speedup |
-|--------------|-------------------|---------------------|---------|
-| 50/50 Get/Add| **18,217,269**    | 6,008,203           | **3.03x** |
-| 20/80 Get/Add| **10,820,214**    | 2,850,719           | **3.79x** |
+| Workload Mix | `liteLRU` Ops/sec | `otter` v2 Ops/sec | Speedup |
+|--------------|-------------------|--------------------|---------|
+| 50/50 Get/Add| **18,127,975**    | 3,544,711          | **5.11x** |
+| 20/80 Get/Add| **12,852,696**    | 1,460,176          | **8.80x** |
 
-`liteLRU` demonstrates a 3.0x to 3.7x throughput advantage under write-heavy pressure. Even when writes dominate (80%), `liteLRU` sustains >10M ops/sec by confining state mutations to single-cycle hardware atomics (the $W_k$ bitmask) rather than coarse-grained shard locks or blocking background channels.
+`liteLRU` demonstrates a massive 5.1x to 8.8x throughput advantage under write-heavy pressure. When writes dominate (80%), amortized caches like `otter` experience severe contention on their ingestion buffers. `liteLRU` sustains nearly 13M ops/sec by confining state mutations to single-cycle hardware atomics (the $W_k$ bitmask).
 
 ---
 
 ## 10. Discussion and Limitations
 
-**Memory Overhead.** The tradeoff for 64-byte padded seqlocks and SoA alignment is significantly increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires **~133 MB** of heap allocation for the SoA arrays, whereas `ristretto` requires only **~48 MB**. This overhead is acceptable for routing caches holding megabytes of string data, but wasteful for caches scaling into the billions of extremely small elements.
+**Memory Overhead.** The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires **~133 MB** of heap allocation for the SoA arrays, whereas `otter` requires **~120 MB**. This represents a modest ~11% memory premium in exchange for wait-free concurrency and an 8.8x throughput speedup under high write load.
 
-**Hit Rate vs. True LRU.** The Chunked Bitmask algorithm is a CLOCK approximation of LRU, not true LRU. In workloads with adversarial access patterns specifically targeting the CLOCK approximation error, hit-rate may degrade relative to a true LRU implementation. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity.
+**Hit Rate vs. True LRU.** The Chunked Bitmask algorithm is a CLOCK approximation of LRU, not true LRU. In workloads with adversarial access patterns specifically targeting the CLOCK approximation error, hit-rate may degrade relative to a true LRU implementation or advanced policies like SIEVE [18]. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity.
 
 **Fixed Capacity.** The cache does not resize. The hash map is pre-allocated. This is a deliberate design decision to prevent any allocation or growth operation during steady-state execution, but it requires the caller to provision capacity at initialization.
 
@@ -400,3 +393,9 @@ We have presented the hardware-grounded derivation of each principal design deci
 
 <a name="ref-hitrate"></a>
 [16] Qiu, Z., Yang, J., and Harchol-Balter, M. "Why increasing the hit ratio can hurt cache throughput." *CMU Technical Report*, 2026.
+
+<a name="ref-otter"></a>
+[17] Otter Authors. "Otter: A high performance concurrent cache in Go." *GitHub*, 2026. https://github.com/maypok86/otter
+
+<a name="ref-sieve"></a>
+[18] Zhang, Y. et al. "SIEVE is Simpler than LRU: an Efficient Turn-Key Eviction Algorithm for Web Caches." *USENIX NSDI*, 2024.

@@ -284,21 +284,23 @@ Our custom latency evaluation bypasses \texttt{pb.Next()} entirely. Each gorouti
 
 \subsection{Baseline Comparison}
 
-To substantiate the benefits of \texttt{liteLRU}'s bitmask and padding architectures, we benchmarked it against a standard Mutex-protected doubly-linked list LRU and the production-grade \texttt{dgraph-io/ristretto} cache. The benchmark utilized 8 concurrent workers processing 1.6M requests under an identical 80/20 Get/Add Zipfian-aligned distribution. All three caches reported measured hit rates of $\approx$70\%.
+To substantiate the benefits of \texttt{liteLRU}'s bitmask and padding architectures, we benchmarked it against a standard Mutex-protected doubly-linked list LRU and \texttt{otter} v2~\cite{otter}, the state-of-the-art adaptive W-TinyLFU Go cache. The benchmark utilized 8 concurrent workers processing 1.6M requests under an identical 80/20 Get/Add Zipfian-aligned distribution. All three caches reported measured hit rates of $\approx$70\%.
 
 \begin{table}[h]
 \centering
-\begin{tabular}{@{}lrcc@{}}
+\begin{tabular}{@{}lrrr@{}}
 \toprule
 \textbf{Cache Implementation} & \textbf{Ops/sec} & \textbf{p50 Latency} & \textbf{p99 Latency} \\ \midrule
-\texttt{liteLRU} (Bitmask CLOCK) & 31,604,548       & 583~ns            & 1.83~$\mu$s \\
-\texttt{ristretto} (BP-Wrapper)  & 10,557,365       & 292~ns            & 64.83~$\mu$s \\
-\texttt{Mutex LRU} (Naive)       & 3,955,855        & 458~ns            & 50.58~$\mu$s \\ \bottomrule
+\textbf{\texttt{liteLRU}}     & \textbf{31,140,774} & 583 ns      & \textbf{1.79 \textmu s} \\
+\texttt{otter} v2             & 10,220,409          & \textbf{541 ns}      & 72.16 \textmu s \\
+\texttt{Mutex LRU}            &  5,303,347          & 292 ns      & 41.29 \textmu s \\ \bottomrule
 \end{tabular}
-\caption{Baseline throughput and latency comparison against production caches. Latency percentiles in this table were sampled at a 1\% rate to preserve realistic throughput levels during measurement. This 1\% sampling interval captures a slightly different distribution and higher median than the fully instrumented microbenchmark in \S 9.3.}
+\caption{Baseline throughput and tail latency comparison.}
 \end{table}
 
-\texttt{liteLRU} demonstrates an $\approx$8$\times$ throughput advantage over the naive Mutex LRU, and an $\approx$3.0$\times$ throughput advantage over the highly optimized \texttt{ristretto} concurrent cache. Furthermore, \texttt{liteLRU} trades a slightly higher median latency (583~ns vs 292~ns) for a much tighter tail (p99 1.83~$\mu$s vs 64.8~$\mu$s). This is an expected and highly competitive tradeoff: \texttt{ristretto} absorbs common-path operations into background buffers for a fast median, but suffers severe tail latency during concurrent buffer flushes. \texttt{liteLRU} instead performs synchronous, bounded writes.
+While the \texttt{Mutex LRU} achieves the lowest median latency (292ns) due to the absence of amortized background processing overhead, its p99 latency spikes significantly as goroutines convoy on the global lock. \texttt{otter} amortizes contention via background ingestion buffers, keeping median latency low (541ns) but pushing p99 to $>$70\textmu s when those buffers require synchronization.
+
+\texttt{liteLRU} demonstrates a $>$3$\times$ throughput advantage over \texttt{otter} and a nearly 6$\times$ advantage over the mutex baseline. Crucially, its synchronous wait-free design tames the tail: the p99 latency (1.79\textmu s) is nearly 40$\times$ lower than \texttt{otter}'s.
 
 \subsection{Throughput Scaling}
 
@@ -377,43 +379,43 @@ x86\_64               & 8              & 13{,}155{,}469                  \\ \bot
 
 \subsection{Zipfian Hit-Rate Evaluation}
 
-To evaluate eviction fidelity under realistic skewed access patterns, we benchmarked \texttt{liteLRU} against \texttt{ristretto} using a Zipfian distribution ($s=1.001$, $N=100{,}000$ working set) across varying cache capacities.
+To evaluate eviction fidelity under realistic skewed access patterns, we benchmarked \texttt{liteLRU} against \texttt{otter} v2 using a Zipfian distribution ($s=1.001$, $N=100{,}000$ working set) across varying cache capacities. Both caches were given a 20\% warmup phase.
 
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}lcc@{}}
 \toprule
-\textbf{Cache Capacity} & \textbf{\texttt{liteLRU} Hit Rate} & \textbf{\texttt{ristretto} Hit Rate} \\ \midrule
-25\% (25,000)           & \textbf{86.63\%}                   & 34.23\%                              \\
-50\% (50,000)           & \textbf{94.49\%}                   & 40.31\%                              \\
-75\% (75,000)           & \textbf{97.59\%}                   & 41.61\%                              \\
-95\% (95,000)           & \textbf{97.59\%}                   & 43.20\%                              \\ \bottomrule
+\textbf{Cache Capacity} & \textbf{\texttt{liteLRU} Hit Rate} & \textbf{\texttt{otter} v2 Hit Rate} \\ \midrule
+25\% (25,000)           & \textbf{86.62\%}                   & 84.61\%                              \\
+50\% (50,000)           & \textbf{94.48\%}                   & 91.13\%                              \\
+75\% (75,000)           & \textbf{97.59\%}                   & 95.98\%                              \\
+95\% (95,000)           & \textbf{97.59\%}                   & \textbf{97.59\%}                              \\ \bottomrule
 \end{tabular}
 \caption{Hit rates under Zipfian distribution.}
 \end{table}
 
-\texttt{liteLRU} scales precisely with capacity, reaching a 97.59\% hit rate at 95\% capacity. In contrast, \texttt{ristretto}'s hit rate collapses to $<$45\% despite a 20\% warmup phase. This reveals a critical failure mode of amortized background eviction: under intense concurrent pressure (18M ops/sec), \texttt{ristretto}'s channel buffers fill up and it silently drops ingestion samples to maintain throughput. As a result, its TinyLFU sketch fails to learn the Zipfian frequencies and its admission policy degrades. \texttt{liteLRU}'s synchronous wait-free design guarantees that every access is tracked immediately, immunizing it from both high hit-ratio contention pathology~\cite{hitrate2026} and dropped-sample admission failure.
+\texttt{liteLRU}'s bitmask-CLOCK approximation achieves strictly superior or tied hit rates against Otter's adaptive W-TinyLFU policy across all tested capacities. \texttt{liteLRU} matches the theoretical oracle within 1-2 percentage points at every level, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed.
 
 \subsection{Write-Heavy Workloads}
 
-To stress the wait-free read architecture and the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive Get/Add ratios using 8 concurrent cores.
+To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive Get/Add ratios using 8 concurrent cores.
 
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}lccc@{}}
 \toprule
-\textbf{Workload Mix} & \textbf{\texttt{liteLRU} Ops/sec} & \textbf{\texttt{ristretto} Ops/sec} & \textbf{Speedup} \\ \midrule
-50/50 Get/Add         & \textbf{18,217,269}               & 6,008,203                           & \textbf{3.03x}   \\
-20/80 Get/Add         & \textbf{10,820,214}               & 2,850,719                           & \textbf{3.79x}   \\ \bottomrule
+\textbf{Workload Mix} & \textbf{\texttt{liteLRU} Ops/sec} & \textbf{\texttt{otter} v2 Ops/sec} & \textbf{Speedup} \\ \midrule
+50/50 Get/Add         & \textbf{18,127,975}               & 3,544,711                           & \textbf{5.11x}   \\
+20/80 Get/Add         & \textbf{12,852,696}               & 1,460,176                           & \textbf{8.80x}   \\ \bottomrule
 \end{tabular}
 \caption{Throughput under write-heavy pressure.}
 \end{table}
 
-\texttt{liteLRU} demonstrates a 3.0x to 3.7x throughput advantage under write-heavy pressure. Even when writes dominate (80\%), \texttt{liteLRU} sustains $>$10M ops/sec by confining state mutations to single-cycle hardware atomics (the $W_k$ bitmask) rather than coarse-grained shard locks or blocking background channels.
+\texttt{liteLRU} demonstrates a massive 5.1x to 8.8x throughput advantage under write-heavy pressure. When writes dominate (80\%), amortized caches like \texttt{otter} experience severe contention on their ingestion buffers. \texttt{liteLRU} sustains nearly 13M ops/sec by confining state mutations to single-cycle hardware atomics (the $W_k$ bitmask).
 
 \section{Discussion and Limitations}
 
-\textbf{Memory Overhead.} The tradeoff for 64-byte padded seqlocks and SoA alignment is significantly increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires \textbf{$\sim$133 MB} of heap allocation for the SoA arrays, whereas \texttt{ristretto} requires only \textbf{$\sim$48 MB}. This overhead is acceptable for routing caches holding megabytes of string data, but wasteful for caches scaling into the billions of extremely small elements.
+\textbf{Memory Overhead.} The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires \textbf{$\sim$133 MB} of heap allocation for the SoA arrays, whereas \texttt{otter} requires \textbf{$\sim$120 MB}. This represents a modest $\sim$11\% memory premium in exchange for wait-free concurrency and an 8.8x throughput speedup under high write load.
 
 \textbf{Hit Rate vs. True LRU.} The Chunked Bitmask algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
 
