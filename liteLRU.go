@@ -47,6 +47,21 @@ type chunk struct {
 	_        [40]byte
 }
 
+// slotState holds the seqlock, padded to a full 64-byte cache line 
+// to completely eliminate false-sharing during concurrent writes.
+type slotState struct {
+	seq atomic.Uint32
+	_   [60]byte
+}
+
+// statStripe shards cache statistics across 64 independent cache lines
+// to prevent global atomic contention during high-throughput parallel access.
+type statStripe struct {
+	hits   atomic.Int64
+	misses atomic.Int64
+	_      [48]byte
+}
+
 // LRUCache implements an ultra-low latency lock-free cache with fixed capacity.
 // It uses a Chunked Bitmask CLOCK algorithm for O(1) eviction.
 type LRUCache struct {
@@ -63,14 +78,11 @@ type LRUCache struct {
 	params   [][]Param
 
 	// Concurrency control
-	states []atomic.Uint32 // seqlocks (1 per slot) to prevent read-tearing
-	chunks []chunk         // bitmasks (64 slots per chunk)
+	states []slotState // padded seqlocks to prevent read-tearing
+	chunks []chunk     // padded bitmasks (64 slots per chunk)
 
-	clockGroup atomic.Uint32 // sweeps across chunks for eviction
 	numGroups  uint32
-
-	hits   atomic.Int64
-	misses atomic.Int64
+	stats      [64]statStripe
 }
 
 func nextPowerOfTwo(n int) int {
@@ -158,7 +170,7 @@ func NewLRUCache(capacity, maxParams int) *LRUCache {
 		paths:     make([]string, capacity),
 		handlers:  make([]HandlerFunc, capacity),
 		params:    make([][]Param, capacity),
-		states:    make([]atomic.Uint32, capacity),
+		states:    make([]slotState, capacity),
 		chunks:    make([]chunk, numGroups),
 		numGroups: numGroups,
 	}
@@ -167,10 +179,12 @@ func NewLRUCache(capacity, maxParams int) *LRUCache {
 }
 
 // findVictim uses bitwise operations to instantly find an eviction victim in O(1) time.
-func (c *LRUCache) findVictim() uint32 {
-	for {
-		groupIdx := c.clockGroup.Add(1) - 1
-		group := groupIdx % c.numGroups
+// It uses the hash to pick a starting group, naturally distributing the eviction sweep 
+// and eliminating the need for a highly-contended global clock hand.
+func (c *LRUCache) findVictim(hash uint64) uint32 {
+	startGroup := uint32(hash % uint64(c.numGroups))
+	for offset := uint32(0); ; offset++ {
+		group := (startGroup + offset) % c.numGroups
 		chk := &c.chunks[group]
 
 		for {
@@ -206,14 +220,14 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 	hash := hashRoute(method, path)
 
 	// O(1) Bitwise victim selection
-	victimIdx := c.findVictim()
+	victimIdx := c.findVictim(hash)
 	group := victimIdx / 64
 	bit := victimIdx % 64
 	chk := &c.chunks[group]
 
 	// We own the writing bit. Set seqlock to odd.
-	seq := c.states[victimIdx].Load()
-	c.states[victimIdx].Store(seq + 1) // odd
+	seq := c.states[victimIdx].seq.Load()
+	c.states[victimIdx].seq.Store(seq + 1) // odd
 
 	// If it was valid previously, cleanly delete the old hash from indexMap
 	// to allow memory.HashMap to safely recycle the tombstone and prevent resizes!
@@ -271,7 +285,7 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 	c.indexMap.Put(hash, unsafe.Pointer(uintptr(victimIdx+1)))
 
 	// Finish write: seq becomes even
-	c.states[victimIdx].Store(seq + 2)
+	c.states[victimIdx].seq.Store(seq + 2)
 
 	// Release writing bit
 	for {
@@ -286,9 +300,11 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 // 100% lock-free, zero allocation, utilizing seqlocks and O(1) bitmask lookups.
 func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
 	hash := hashRoute(method, path)
+	stripeIdx := hash & 63
+
 	ptr, found := c.indexMap.Get(hash)
 	if !found {
-		c.misses.Add(1)
+		c.stats[stripeIdx].misses.Add(1)
 		return nil, nil, false
 	}
 
@@ -300,20 +316,20 @@ func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
 	// Verify the slot is valid
 	validBits := chk.valid.Load()
 	if (validBits & (1 << bit)) == 0 {
-		c.misses.Add(1)
+		c.stats[stripeIdx].misses.Add(1)
 		return nil, nil, false
 	}
 
 	// Start read seqlock
-	seq1 := c.states[idx].Load()
+	seq1 := c.states[idx].seq.Load()
 	if seq1%2 != 0 {
-		c.misses.Add(1)
+		c.stats[stripeIdx].misses.Add(1)
 		return nil, nil, false
 	}
 
 	// Validate method/path against concurrent evictions and collisions
 	if c.methods[idx] != method || c.paths[idx] != path {
-		c.misses.Add(1)
+		c.stats[stripeIdx].misses.Add(1)
 		return nil, nil, false
 	}
 
@@ -328,13 +344,13 @@ func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
 	}
 
 	// Validate read seqlock
-	seq2 := c.states[idx].Load()
+	seq2 := c.states[idx].seq.Load()
 	if seq1 != seq2 {
 		// Slot was modified while we were reading!
 		if copiedParams != nil {
 			putParamSlice(copiedParams)
 		}
-		c.misses.Add(1)
+		c.stats[stripeIdx].misses.Add(1)
 		return nil, nil, false
 	}
 
@@ -349,7 +365,7 @@ func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
 		}
 	}
 
-	c.hits.Add(1)
+	c.stats[stripeIdx].hits.Add(1)
 	return handler, copiedParams, true
 }
 
@@ -385,20 +401,24 @@ func (c *LRUCache) Clear() {
 			c.methods[idx] = ""
 			c.paths[idx] = ""
 			c.handlers[idx] = nil
-			c.states[idx].Store(0)
+			c.states[idx].seq.Store(0)
 		}
 
 		chk.writing.Store(0)
 	}
 
-	c.hits.Store(0)
-	c.misses.Store(0)
+	for i := 0; i < 64; i++ {
+		c.stats[i].hits.Store(0)
+		c.stats[i].misses.Store(0)
+	}
 }
 
 // Stats returns cache hit/miss statistics.
 func (c *LRUCache) Stats() (hits, misses int64, ratio float64) {
-	hits = c.hits.Load()
-	misses = c.misses.Load()
+	for i := 0; i < 64; i++ {
+		hits += c.stats[i].hits.Load()
+		misses += c.stats[i].misses.Load()
+	}
 	total := hits + misses
 	if total > 0 {
 		ratio = float64(hits) / float64(total)
