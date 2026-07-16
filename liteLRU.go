@@ -62,20 +62,92 @@ type statStripe struct {
 	_      [48]byte
 }
 
+//go:nosplit
+func noescape(p unsafe.Pointer) unsafe.Pointer {
+	x := uintptr(p)
+	return unsafe.Pointer(x ^ 0)
+}
+
+type atomicString struct {
+	ptr atomic.Pointer[byte]
+	len atomic.Int64
+}
+
+func (a *atomicString) Store(s string) {
+	a.ptr.Store(unsafe.StringData(s))
+	a.len.Store(int64(len(s)))
+}
+
+func (a *atomicString) Load() string {
+	ptr := a.ptr.Load()
+	l := a.len.Load()
+	if ptr == nil {
+		return ""
+	}
+	return unsafe.String(ptr, int(l))
+}
+
+type atomicSlice struct {
+	ptr atomic.Pointer[Param]
+	len atomic.Int64
+	cap atomic.Int64
+}
+
+func (a *atomicSlice) Store(s []Param) {
+	a.ptr.Store(unsafe.SliceData(s))
+	a.len.Store(int64(len(s)))
+	a.cap.Store(int64(cap(s)))
+}
+
+func (a *atomicSlice) Load() []Param {
+	ptr := a.ptr.Load()
+	if ptr == nil {
+		return nil
+	}
+	l := a.len.Load()
+	c := a.cap.Load()
+	s := unsafe.Slice(ptr, c)
+	return s[:l]
+}
+
+type atomicHandler struct {
+	ptr atomic.Pointer[byte]
+}
+
+func (a *atomicHandler) Store(h HandlerFunc) {
+	if h == nil {
+		a.ptr.Store(nil)
+		return
+	}
+	p := *(*unsafe.Pointer)(noescape(unsafe.Pointer(&h)))
+	a.ptr.Store((*byte)(p))
+}
+
+func (a *atomicHandler) Load() HandlerFunc {
+	ptr := a.ptr.Load()
+	if ptr == nil {
+		return nil
+	}
+	return *(*HandlerFunc)(unsafe.Pointer(&ptr))
+}
+
 // LRUCache implements an ultra-low latency lock-free cache with fixed capacity.
 // It uses a Chunked Bitmask CLOCK algorithm for O(1) eviction.
 type LRUCache struct {
 	capacity  uint32
 	maxParams int
 
-	// Lock-free HashMap maps a route hash to an SoA index + 1
+	// Lock-free HashMap maps a route hash to a pointer to an SoA index
 	indexMap *memory.HashMap
 
+	// Pre-allocated index pointers to prevent checkptr panics
+	indices []uint32
+
 	// Structure of Arrays (SoA) for fast contiguous memory access
-	methods  []string
-	paths    []string
-	handlers []HandlerFunc
-	params   [][]Param
+	methods  []atomicString
+	paths    []atomicString
+	handlers []atomicHandler
+	params   []atomicSlice
 
 	// Concurrency control
 	states []slotState // padded seqlocks to prevent read-tearing
@@ -166,13 +238,18 @@ func NewLRUCache(capacity, maxParams int) *LRUCache {
 		capacity:  uint32(capacity),
 		maxParams: maxParams,
 		indexMap:  hm,
-		methods:   make([]string, capacity),
-		paths:     make([]string, capacity),
-		handlers:  make([]HandlerFunc, capacity),
-		params:    make([][]Param, capacity),
+		methods:   make([]atomicString, capacity),
+		paths:     make([]atomicString, capacity),
+		handlers:  make([]atomicHandler, capacity),
+		params:    make([]atomicSlice, capacity),
 		states:    make([]slotState, capacity),
 		chunks:    make([]chunk, numGroups),
-		numGroups: numGroups,
+		numGroups: uint32(numGroups),
+		indices:   make([]uint32, capacity),
+	}
+
+	for i := uint32(0); i < uint32(capacity); i++ {
+		c.indices[i] = i
 	}
 
 	return c
@@ -233,18 +310,18 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 	// to allow memory.HashMap to safely recycle the tombstone and prevent resizes!
 	validBits := chk.valid.Load()
 	if (validBits & (1 << bit)) != 0 {
-		oldHash := hashRoute(c.methods[victimIdx], c.paths[victimIdx])
-		if ptr, found := c.indexMap.Get(oldHash); found && uint32(uintptr(ptr))-1 == victimIdx {
+		oldHash := hashRoute(c.methods[victimIdx].Load(), c.paths[victimIdx].Load())
+		if ptr, found := c.indexMap.Get(oldHash); found && ptr != nil && *(*uint32)(ptr) == victimIdx {
 			c.indexMap.Delete(oldHash)
 		}
 	}
 
 	// Write new data safely under seqlock
-	c.methods[victimIdx] = method
-	c.paths[victimIdx] = path
-	c.handlers[victimIdx] = handler
+	c.methods[victimIdx].Store(method)
+	c.paths[victimIdx].Store(path)
+	c.handlers[victimIdx].Store(handler)
 
-	oldParams := c.params[victimIdx]
+	oldParams := c.params[victimIdx].Load()
 	var newParams []Param
 	if len(params) > 0 {
 		if cap(oldParams) >= len(params) {
@@ -263,7 +340,7 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 		}
 		newParams = nil
 	}
-	c.params[victimIdx] = newParams
+	c.params[victimIdx].Store(newParams)
 
 	// Mark as accessed
 	for {
@@ -281,8 +358,8 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 		}
 	}
 
-	// Insert into lock-free map (using index+1 so 0 is never stored as a valid pointer)
-	c.indexMap.Put(hash, unsafe.Pointer(uintptr(victimIdx+1)))
+	// Insert pointer to the pre-allocated index into the lock-free map
+	c.indexMap.Put(hash, unsafe.Pointer(&c.indices[victimIdx]))
 
 	// Finish write: seq becomes even
 	c.states[victimIdx].seq.Store(seq + 2)
@@ -303,12 +380,12 @@ func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
 	stripeIdx := hash & 63
 
 	ptr, found := c.indexMap.Get(hash)
-	if !found {
+	if !found || ptr == nil {
 		c.stats[stripeIdx].misses.Add(1)
 		return nil, nil, false
 	}
 
-	idx := uint32(uintptr(ptr)) - 1
+	idx := *(*uint32)(ptr)
 	group := idx / 64
 	bit := idx % 64
 	chk := &c.chunks[group]
@@ -328,14 +405,14 @@ func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
 	}
 
 	// Validate method/path against concurrent evictions and collisions
-	if c.methods[idx] != method || c.paths[idx] != path {
+	if c.methods[idx].Load() != method || c.paths[idx].Load() != path {
 		c.stats[stripeIdx].misses.Add(1)
 		return nil, nil, false
 	}
 
 	// Safely read data
-	handler := c.handlers[idx]
-	params := c.params[idx]
+	handler := c.handlers[idx].Load()
+	params := c.params[idx].Load()
 
 	var copiedParams []Param
 	if len(params) > 0 {
@@ -394,13 +471,14 @@ func (c *LRUCache) Clear() {
 
 		for bit := uint32(0); bit < 64; bit++ {
 			idx := group*64 + bit
-			if c.params[idx] != nil {
-				putParamSlice(c.params[idx])
-				c.params[idx] = nil
+			oldParams := c.params[idx].Load()
+			if oldParams != nil {
+				putParamSlice(oldParams)
+				c.params[idx].Store(nil)
 			}
-			c.methods[idx] = ""
-			c.paths[idx] = ""
-			c.handlers[idx] = nil
+			c.methods[idx].Store("")
+			c.paths[idx].Store("")
+			c.handlers[idx].Store(nil)
 			c.states[idx].seq.Store(0)
 		}
 
