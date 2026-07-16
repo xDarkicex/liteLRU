@@ -1,0 +1,9 @@
+# Test and benchmark output
+*.out
+*.test
+raw_benchmarks.txt
+
+# OS/Editor
+.DS_Store
+.idea/
+.vscode/
