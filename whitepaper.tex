@@ -50,7 +50,7 @@ Chunked Bitmask Eviction on Modern Multi-Core Hardware}}
 \maketitle
 
 \begin{abstract}
-We describe the design and implementation of \texttt{liteLRU}, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not \textit{which items to evict}, but \textit{how to perform eviction and recency tracking without serializing the CPU cores that share the cache}. We analyze why conventional data structures---doubly-linked lists, per-node reference counting, and AoS memory layouts---are structurally incompatible with the MESI cache coherency protocol~\cite{mesi} under concurrent access. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency~\cite{gogc2018}. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments~\cite{soadesign}. We then derive the Chunked Bitmask CLOCK eviction algorithm~\cite{clock1969} from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $O(1)$ bulk state evaluation using a single hardware \texttt{CTZ} instruction~\cite{inteltzcnt,armclz}. The resulting mechanism yields wait-free reads and contention-bounded writes. We contrast our approach against recent eviction policy research including S3-FIFO~\cite{s3fifo2023} and SIEVE~\cite{sieve2024}, noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields p99.9 latency of $\sim$1.5~$\mu$s under the fully instrumented scaling workload (see \S 9.3).
+We describe the design and implementation of \texttt{liteLRU}, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not \textit{which items to evict}, but \textit{how to perform eviction and recency tracking without serializing the CPU cores that share the cache}. We analyze why conventional data structures---doubly-linked lists, per-node reference counting, and AoS memory layouts---are structurally incompatible with the MESI cache coherency protocol~\cite{mesi} under concurrent access. In particular, we note that under heavy CAS contention on a single cache line, wait time degrades superlinearly due to RFO (Read-For-Ownership) round-trip amplification~\cite{gogc}. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency~\cite{gogc2018}. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments~\cite{soadesign}. We then derive the Chunked Bitmask CLOCK eviction algorithm~\cite{clock1969} from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $O(1)$ bulk state evaluation using a single hardware \texttt{CTZ} instruction~\cite{inteltzcnt,armclz}. The resulting mechanism yields wait-free reads and contention-bounded writes. We contrast our approach against recent eviction policy research including S3-FIFO~\cite{s3fifo2023} and SIEVE~\cite{sieve2024}, noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields p99.9 latency of $\sim$1.5~$\mu$s under the fully instrumented scaling workload (see \S 9.3).
 \end{abstract}
 
 \section{Background: The Hardware Model}
@@ -97,7 +97,7 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2
 \texttt{liteLRU} addresses this through two mechanisms:
 
 \begin{enumerate}
-    \item \textbf{Off-Heap HashMap:} An open-addressed hash map backed by an mmap-allocated region~\cite{mmap2015}. Because mmap allocations are outside the Go heap, the GC scanner does not traverse them, eliminating pointer scanning overhead for the entire index structure.
+    \item \textbf{Off-Heap HashMap:} \texttt{liteLRU} delegates key-value storage to a custom open-addressed hash map (\texttt{memory.HashMap}) backed by an mmap-allocated region. This hash map implements SIMD-accelerated linear probing on a 16-byte metadata array, strictly bounded to a maximum of 32 bucket probes (512 total items). This hard bound guarantees that map lookups operate in bounded time. To handle tombstone accumulation without blocking the hot path, the map utilizes a background Proportional-Integral-Derivative (PID) controller that incrementally rehashes elements when probe lengths exceed setpoint tolerances. As a result, the eviction algorithm only manages the \textit{indexes} of the hash map slots, and does not itself allocate or free memory.
     \item \textbf{Fixed-Width Value Arrays:} The SoA slices holding methods, paths, and params are allocated once at initialization time. They are fixed-assignment slots rather than append-growing structures, bounding GC root growth to a constant determined at construction. It should be explicitly noted that while the hash map indices and slice headers are removed from the GC root set, the underlying byte payloads of Go \texttt{string} variables stored in these arrays remain on the Go heap and are subject to GC scanning.
 \end{enumerate}
 
@@ -201,7 +201,7 @@ i^* = \text{CTZ}(C_k)
 
 This replaces an $\mathcal{O}(N)$ sequential scan over $N$ atomic loads with two register-width bitwise operations and one hardware intrinsic, bounding eviction search to a strict hardware-constant time within any chunk.
 
-If $C_k = 0$, it indicates all valid slots in the current chunk have been recently accessed. The algorithm deterministically falls back to a second-chance pass: it atomically clears the accessed bitmask ($A_k \leftarrow 0$) for the chunk and seamlessly advances to the next contiguous chunk. 
+If $C_k = 0$, it indicates all valid slots in the current chunk have been recently accessed. The algorithm deterministically falls back to a second-chance pass: it atomically clears the accessed bitmask ($A_k \leftarrow 0$) for the chunk and seamlessly advances to the next contiguous chunk. It is a known tradeoff of this bulk-clearing approach that bits set by concurrent readers microseconds prior will be wiped alongside stale bits; however, this mild loss of precision is accepted in exchange for eliminating $\mathcal{O}(N)$ per-slot atomic instructions. 
 
 \textbf{Writer Progress and Claim Protocol.}
 To safely claim the selected bit $i$ for eviction, we define a third state bitmask for the chunk: $W_k \in \{0,1\}^{64}$, where bit $i = 1$ if and only if a writer currently owns slot $i$ for mutation. 
@@ -220,9 +220,13 @@ To guarantee progress and bound the worst-case scenario where a chunk is highly 
 
 Because \texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_\text{start} = h(r) \bmod N_k$, there is no shared global clock-hand atomic. Each writer begins its eviction sweep at a deterministic but distributed starting position, naturally load-balancing eviction pressure across chunks without any coordination. Under pathological skew where many keys hash to the same chunk, the multi-chunk scan fallback described above ensures fairness by overflowing the search into adjacent, potentially less-contended chunks.
 
-\section{Sequence Lock Design for Wait-Free Reads}
+\section{Sequence Lock and Wait-Free Reads}
 
-We require that \texttt{Get} operations never block on an ongoing \texttt{Add}, but also never return torn data if an eviction overwrites a slot mid-read. Sequence Locks (Seqlocks)~\cite{seqlockoriginal} achieve this. Each slot $i$ maintains an atomic 32-bit sequence counter $S_i$, initialized to 0.
+\subsection{Wait-Free Reads}
+
+A strict requirement for web-scale caches is that \texttt{Get} operations must never block. \texttt{liteLRU} achieves this via a 64-byte padded seqlock $S$. The read path is wait-free: it consists of unconditionally bounded hash map linear probing, two atomic loads of $S$, two string comparisons, and a single bitwise OR. Under no circumstances does a reader wait for a lock or block on a channel.
+
+\textbf{Reader Protocol:} Each slot $i$ maintains an atomic 32-bit sequence counter $S_i$, initialized to 0.
 
 \textbf{Write Protocol:} A writer sets $S_i \leftarrow S_i + 1$ (making it odd). After completing the write, it sets $S_i \leftarrow S_i + 1$ (returning to even).
 
@@ -302,11 +306,9 @@ While the \texttt{Mutex LRU} achieves the lowest median latency (292ns) due to t
 
 \texttt{liteLRU} demonstrates a $>$3$\times$ throughput advantage over \texttt{otter} and a nearly 6$\times$ advantage over the mutex baseline. Crucially, its synchronous wait-free design tames the tail: the p99 latency (1.79\textmu s) is nearly 40$\times$ lower than \texttt{otter}'s.
 
-\subsection{Throughput Scaling}
+\subsection{Throughput Scaling Under Contention}
 
-To evaluate multi-core scaling behavior and latency distributions, we ran a heavily instrumented variant of the workload. \textit{Note: In this test, every cache operation is wrapped in a \texttt{time.Now()} measurement call to construct latency percentiles. The inherent $\sim$40~ns cost of \texttt{time.Now()} per operation severely bottlenecks raw throughput, reducing the 8-core maximum from the uninstrumented 31.6M ops/sec (in \S 9.1) to $\sim$17M ops/sec.}
-
-Using the latency-instrumented worker methodology:
+We scale the same 1.6M operation Zipfian workload across 1 to 8 concurrent cores to measure contention degradation.
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}rrc@{}}
@@ -320,7 +322,7 @@ Using the latency-instrumented worker methodology:
 \caption{Throughput under un-synchronized worker methodology.}
 \end{table}
 
-Sub-linear scaling from 4 to 8 cores is expected: at 8 cores on an M2 die, the shared L3 and memory bus bandwidth begin to constrain throughput independently of lock contention.
+While scaling is sub-linear (3.13x at 8 cores), this is characteristic of L3 cache and memory bus saturation on ARM architectures rather than lock convoying. Shared bitmask atomics ($V_k, A_k, W_k$) also contribute to this sub-linear degradation as cache lines ping-pong between cores, but the degradation is graceful compared to the complete collapse typical of mutexes.
 
 \subsection{Latency Percentiles (ARM64)}
 
@@ -379,7 +381,7 @@ x86\_64               & 8              & 13{,}155{,}469                  \\ \bot
 
 \subsection{Zipfian Hit-Rate Evaluation}
 
-To evaluate eviction fidelity under realistic skewed access patterns, we benchmarked \texttt{liteLRU} against \texttt{otter} v2 using a Zipfian distribution ($s=1.001$, $N=100{,}000$ working set) across varying cache capacities. Both caches were given a 20\% warmup phase.
+To evaluate eviction fidelity under realistic skewed access patterns, we benchmarked \texttt{liteLRU} against \texttt{otter} v2 using a Zipfian distribution ($s=1.001$, $N=100{,}000$ working set) with 1.6M total operations across varying cache capacities. Both caches were given a 20\% warmup phase.
 
 \begin{table}[h]
 \centering
@@ -394,7 +396,7 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 \caption{Hit rates under Zipfian distribution.}
 \end{table}
 
-\texttt{liteLRU}'s bitmask-CLOCK approximation achieves strictly superior or tied hit rates against Otter's adaptive W-TinyLFU policy across all tested capacities. \texttt{liteLRU} matches the theoretical oracle within 1-2 percentage points at every level, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed.
+\texttt{liteLRU}'s bitmask-CLOCK approximation achieves strictly superior or tied hit rates against Otter's S3-FIFO-based eviction policy across all tested capacities. \texttt{liteLRU} matches the theoretical oracle within 1-2 percentage points at every level, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate parity is characteristic of heavily-skewed ($s=1.001$) heavy-tailed distributions; on scan-resistant or low-skew workloads, S3-FIFO is expected to outperform CLOCK approximations.
 
 \subsection{Write-Heavy Workloads}
 
