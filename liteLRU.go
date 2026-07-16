@@ -213,9 +213,6 @@ func NewLRUCache(capacity, maxParams int) *LRUCache {
 	if capacity <= 0 {
 		capacity = 1024
 	}
-	if capacity > 16384 {
-		capacity = 16384
-	}
 	capacity = nextPowerOfTwo(capacity)
 	if capacity < 64 {
 		capacity = 64
@@ -285,8 +282,9 @@ func (c *LRUCache) findVictim(hash uint64) uint32 {
 			}
 
 			// No candidates available in this chunk.
-			// Clear the accessed bits to give them a second chance.
-			chk.accessed.Store(0)
+			// Clear the accessed bits of currently valid items to give them a second chance,
+			// while preserving any concurrent access bits set by readers.
+			chk.accessed.And(^validBits)
 			break // move to the next chunk group
 		}
 	}
