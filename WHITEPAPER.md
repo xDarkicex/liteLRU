@@ -47,7 +47,7 @@ Under high concurrency, a single globally contested atomic (e.g., a global clock
 
 ## 2. Why Off-Heap Memory
 
-Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep [[9]](#ref-gogc). It introduces two categories of tail-latency interference directly relevant to a cache implementation:
+Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep [[9]](#ref-gogc). It introduces three categories of tail-latency interference directly relevant to a cache implementation:
 
 **Write Barrier Overhead.** The GC requires write barriers on every pointer store to maintain the tri-color invariant. For a structure that stores handler function pointers or string headers, every `Add` operation incurs GC bookkeeping cost proportional to the number of pointer-typed fields written.
 
@@ -147,7 +147,7 @@ The key observation driving `liteLRU`'s design: if we partition the cache into c
 
 A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$). The set of all candidates across all 64 slots is computed in a single bitwise expression:
 
-$$C_k = \neg (V_k \;\land\; A_k)$$
+$$C_k = \neg (V_k \;\land\; A_k) \;\land\; \neg W_k$$
 
 The index of the first candidate is then extracted using the hardware `CTZ` (Count Trailing Zeros) instruction [[10,11]](#ref-tzcnt). It is crucial to handle platform-specific zero behavior: on x86_64, `TZCNT` returns 64 when the input is zero, whereas on ARM64, `RBIT` + `CLZ` requires an explicit branch or zero-check. When a non-zero candidate mask exists:
 
@@ -214,7 +214,7 @@ type slotState struct {
 
 Since $\text{addr}(S_{i+1}) = \text{addr}(S_i) + 64$, adjacent entries reside on disjoint, non-overlapping 64-byte aligned cache lines. A write to $S_i$ sets the MESI state of line $\lfloor \text{addr}(S_i) / 64 \rfloor$ to Modified, which does not affect the state of line $\lfloor \text{addr}(S_j) / 64 \rfloor$ for any $j \neq i$. False sharing is structurally impossible. $\square$
 
-It is important to note that the 64-bit bitmasks ($V_k$, $A_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
+It is important to note that the 64-bit bitmasks ($V_k$, $A_k$, $W_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
 
 The same argument applies to the statistics counters. Aggregating hits and misses into two global `atomic.Int64` values would cause every `Get` on every core to contend on two shared cache lines. We instead shard into 64 independent `statStripe` structs, each padded to 64 bytes, selected by `hash & 63`. Each core writes exclusively to its own stripe with zero coherency interference.
 
@@ -296,7 +296,7 @@ To verify behavioral consistency across architectures, we evaluated `liteLRU` on
 
 **Memory Overhead.** The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths), which is acceptable for caches holding megabytes of data but potentially wasteful for caches scaling into the billions of extremely small elements.
 
-**Hit Rate vs. True LRU.** The Chunked Bitmask algorithm is a CLOCK approximation of LRU, not true LRU. In workloads with adversarial access patterns specifically targeting the CLOCK approximation error, hit-rate may degrade relative to a true LRU implementation. We defer comprehensive hit-rate evaluations (e.g., against `ristretto` under Zipfian distributions) to future work. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity.
+**Hit Rate vs. True LRU.** The Chunked Bitmask algorithm is a CLOCK approximation of LRU, not true LRU. In workloads with adversarial access patterns specifically targeting the CLOCK approximation error, hit-rate may degrade relative to a true LRU implementation. We defer comprehensive hit-rate evaluations (e.g., against `ristretto` under Zipfian distributions, beyond the matched ~70% workload in §9.1) to future work. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity.
 
 **Fixed Capacity.** The cache does not resize. The hash map is pre-allocated. This is a deliberate design decision to prevent any allocation or growth operation during steady-state execution, but it requires the caller to provision capacity at initialization.
 

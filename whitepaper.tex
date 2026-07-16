@@ -86,7 +86,7 @@ Under high concurrency, a single globally contested atomic (e.g., a global clock
 
 \section{Why Off-Heap Memory}
 
-Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2018}. It introduces two categories of tail-latency interference directly relevant to a cache implementation:
+Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2018}. It introduces three categories of tail-latency interference directly relevant to a cache implementation:
 
 \begin{itemize}
     \item \textbf{Write Barrier Overhead.} The GC requires write barriers on every pointer store to maintain the tri-color invariant. For a structure that stores handler function pointers or string headers, every \texttt{Add} operation incurs GC bookkeeping cost proportional to the number of pointer-typed fields written.
@@ -190,7 +190,7 @@ The key observation: if we partition the cache into chunks of exactly 64 entries
 A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$). The complete candidate set across all 64 slots is computed in a single bitwise expression:
 
 \begin{equation}
-C_k = \neg (V_k \;\land\; A_k)
+C_k = \neg (V_k \;\land\; A_k) \;\land\; \neg W_k
 \end{equation}
 
 The index of the first candidate is extracted using the hardware Count Trailing Zeros (CTZ) instruction~\cite{inteltzcnt,armclz}. It is crucial to handle platform-specific zero behavior: on x86\_64, \texttt{TZCNT} returns 64 when the input is zero, whereas on ARM64, \texttt{RBIT} + \texttt{CLZ} requires an explicit branch or zero-check. When a non-zero candidate mask exists:
@@ -258,7 +258,7 @@ type slotState struct {
 
 Since $\text{addr}(S_{i+1}) = \text{addr}(S_i) + 64$, adjacent entries reside on disjoint, 64-byte aligned cache lines. A write to $S_i$ sets the MESI state of line $\lfloor \text{addr}(S_i) / 64 \rfloor$ to Modified, which is disjoint from line $\lfloor \text{addr}(S_j) / 64 \rfloor$ for any $j \neq i$. False sharing is structurally impossible. $\square$
 
-It is important to note that the 64-bit bitmasks ($V_k$, $A_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
+It is important to note that the 64-bit bitmasks ($V_k$, $A_k$, $W_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
 
 The same principle is applied to the statistics counters. Rather than two globally shared \texttt{atomic.Int64} hit and miss counters, we maintain 64 independent \texttt{statStripe} structs, each padded to 64 bytes, with writers selecting a stripe via \texttt{hash \& 63}. Each core writes exclusively to its own stripe without generating coherency traffic for any other core.
 
@@ -355,7 +355,7 @@ x86\_64               & 8              & 13{,}155{,}469                  \\ \bot
 
 \textbf{Memory Overhead.} The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths), which is acceptable for caches holding megabytes of data but potentially wasteful for caches scaling into the billions of extremely small elements.
 
-\textbf{Hit Rate vs. True LRU.} The Chunked Bitmask algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. Although our 80/20 benchmark achieved comparable hit rates across all evaluated caches, we defer comprehensive hit-rate evaluations across broader Zipfian distributions to future work. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
+\textbf{Hit Rate vs. True LRU.} The Chunked Bitmask algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. Although our 80/20 benchmark achieved comparable hit rates across all evaluated caches, we defer comprehensive hit-rate evaluations across broader Zipfian distributions (beyond the matched $\sim$70\% workload in \S 9.1) to future work. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
 
 \textbf{Fixed Capacity.} The cache does not resize. The hash map is pre-allocated at construction. This prevents any allocation or growth during steady-state execution but requires the caller to correctly provision capacity at initialization time.
 
