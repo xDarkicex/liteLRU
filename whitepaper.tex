@@ -35,7 +35,7 @@
 }
 \lstset{style=mystyle}
 
-\title{\textbf{liteLRU: A Cache-Coherent, Lock-Free Approximate LRU via\\
+\title{\textbf{liteLRU: A MESI-Conscious, Contention-Bounded Approximate LRU via\\
 Chunked Bitmask Eviction on Modern Multi-Core Hardware}}
 \author{
   xDarkicex \\
@@ -50,7 +50,7 @@ Chunked Bitmask Eviction on Modern Multi-Core Hardware}}
 \maketitle
 
 \begin{abstract}
-We describe the design and implementation of \texttt{liteLRU}, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not \textit{which items to evict}, but \textit{how to perform eviction and recency tracking without serializing the CPU cores that share the cache}. We analyze why conventional data structures---doubly-linked lists, per-node reference counting, and Array of Structs memory layouts---are structurally incompatible with the MESI cache coherency protocol~\cite{mesi1984} under concurrent access. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency~\cite{gogc2018}. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments and derive the Chunked Bitmask CLOCK eviction algorithm~\cite{clock1969} from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $\mathcal{O}(1)$ bulk state evaluation using a single hardware \texttt{CTZ} instruction~\cite{inteltzcnt,armclz}. We contrast our approach against recent eviction policy research including S3-FIFO~\cite{s3fifo2023} and SIEVE~\cite{sieve2024}, noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields a p99.9 latency of 1.4~$\mu$s under a contended parallel workload.
+We describe the design and implementation of \texttt{liteLRU}, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not \textit{which items to evict}, but \textit{how to perform eviction and recency tracking without serializing the CPU cores that share the cache}. We analyze why conventional data structures---doubly-linked lists, per-node reference counting, and Array of Structs memory layouts---are structurally incompatible with the MESI cache coherency protocol~\cite{mesi1984} under concurrent access. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency~\cite{gogc2018}. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments and derive the Chunked Bitmask CLOCK eviction algorithm~\cite{clock1969} from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $\mathcal{O}(1)$ bulk state evaluation using a single hardware \texttt{CTZ} instruction~\cite{inteltzcnt,armclz}. The resulting mechanism yields wait-free reads and contention-bounded writes. We contrast our approach against recent eviction policy research including S3-FIFO~\cite{s3fifo2023} and SIEVE~\cite{sieve2024}, noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields a p99.9 latency of $\sim$1.5~$\mu$s under a contended parallel workload.
 \end{abstract}
 
 \section{Background: The Hardware Model}
@@ -101,6 +101,16 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2
     \item \textbf{Fixed-Width Value Arrays:} The SoA slices holding methods, paths, and params are allocated once at initialization time. They are fixed-assignment slots rather than append-growing structures, bounding GC root growth to a constant determined at construction.
 \end{enumerate}
 
+\section{Related Work}
+
+The problem of concurrent cache design generally branches into two orthogonal domains: optimizing the eviction \textit{policy} for higher hit rates, and optimizing the concurrent \textit{mechanism} for lower CPU overhead. \texttt{liteLRU} is strictly a contribution to the latter.
+
+\textbf{Concurrent CLOCK Mechanisms.} The closest published system to \texttt{liteLRU} is MemC3~\cite{memc3}, which optimized Memcached by introducing a concurrent CLOCK with 1-bit recency tags and optimistic locking to remove mutexes from the read path. \texttt{liteLRU} builds on this foundation by applying it to the Go runtime (off-heap mmap, zero-allocation SoA), but replaces MemC3's sequential bit-checks with bulk 64-bit bitmask evaluations via hardware \texttt{CTZ} intrinsics, drastically reducing eviction scan latency.
+
+\textbf{Advanced Eviction Policies.} Recent systems like CAR, CLOCK-Pro~\cite{clockpro2005}, S3-FIFO~\cite{s3fifo2023}, and SIEVE~\cite{sieve2024} demonstrate that scan-resistant eviction policies can outperform strict LRU on web workloads. These policy innovations are generally orthogonal to the mechanism: a SIEVE or S3-FIFO algorithm still requires a concurrent implementation strategy to scale across cores without locking.
+
+\textbf{Production Go Caches.} Existing Go caches like \texttt{freecache}, \texttt{bigcache}, and \texttt{ristretto} achieve high throughput via sharding and background eviction goroutines. \texttt{liteLRU} takes a different approach: rather than amortizing eviction cost over background threads or coarse-grained shard locks, \texttt{liteLRU} eliminates the locking overhead entirely via bitmask mathematics and seqlocks, enabling wait-free synchronous reads and inline contention-bounded writes.
+
 \section{Why Structure of Arrays over Array of Structs}
 
 The conventional cache entry is represented as an Array of Structs (AoS):
@@ -129,13 +139,13 @@ handlers []uintptr   // [h0, h1, h2, ...] -- contiguous
 
 When a \texttt{Get} operation scans \texttt{methods[i]} and \texttt{methods[i+1]}, both values reside in the same 64-byte cache line (a \texttt{string} header is 16 bytes, placing 4 per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4.
 
-Formally, let $W_f$ be the width of field $f$ and $L = 64$ bytes be the cache line size. For AoS, the number of cache lines fetched to access field $f$ across $n$ entries is:
+Formally, let $W_f$ be the width of field $f$ and $L = 64$ bytes be the cache line size. For AoS, the number of cache lines fetched to access field $f$ across $n$ consecutive entries depends heavily on padding and struct size. If $\text{sizeof}(\text{Entry}) \le L$ and the compiler naturally packs them, we approximate the cost as fetching one new cache line per entry:
 
 \begin{equation}
-\text{Lines}_{AoS}(n, f) = n \cdot \left\lceil \frac{\text{sizeof}(\text{Entry})}{L} \right\rceil
+\text{Lines}_{AoS}(n, f) \approx n
 \end{equation}
 
-For SoA:
+For SoA, because values are tightly packed back-to-back:
 
 \begin{equation}
 \text{Lines}_{SoA}(n, f) = \left\lceil \frac{n \cdot W_f}{L} \right\rceil
@@ -191,9 +201,11 @@ i^* = \text{CTZ}(C_k)
 
 This replaces an $\mathcal{O}(N)$ sequential scan over $N$ atomic loads with two register-width bitwise operations and one hardware intrinsic, bounding eviction search to a strict hardware-constant time within any chunk.
 
+If $C_k = 0$, it indicates all valid slots in the current chunk have been recently accessed. The algorithm deterministically falls back to a second-chance pass: it atomically clears the accessed bitmask ($A_k \leftarrow 0$) for the chunk and seamlessly advances to the next contiguous chunk. This guarantees progress and bounds the worst-case scan length.
+
 \subsection{Eliminating the Global Clock Hand}
 
-Because \texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_\text{start} = h(r) \bmod N_k$, there is no shared global clock-hand atomic. Each writer begins its eviction sweep at a deterministic but distributed starting position, naturally load-balancing eviction pressure across chunks without any coordination.
+Because \texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_\text{start} = h(r) \bmod N_k$, there is no shared global clock-hand atomic. Each writer begins its eviction sweep at a deterministic but distributed starting position, naturally load-balancing eviction pressure across chunks without any coordination. Under pathological skew where many keys hash to the same chunk, the multi-chunk scan fallback described above ensures fairness by overflowing the search into adjacent, potentially less-contended chunks.
 
 \section{Sequence Lock Design for Wait-Free Reads}
 
@@ -203,9 +215,18 @@ We require that \texttt{Get} operations never block on an ongoing \texttt{Add}, 
 
 \textbf{Read Protocol:} A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, the slot is being written; report a miss immediately. Read the data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, a concurrent write occurred; report a miss. Otherwise, the read is consistent.
 
+\textbf{Concurrent Hash Map Consistency.} Since \texttt{liteLRU} relies on an open-addressed hash map for indexing, eviction requires a strict ordering to prevent races where a reader observes a valid hash pointer but reads torn data. The writer protocol is:
+\begin{enumerate}
+    \item Atomically invalidate the slot bitmask ($V_k[i] \leftarrow 0$).
+    \item Delete the old hash entry from the map (tombstoning).
+    \item Under Seqlock, write the new route data to the SoA arrays.
+    \item Insert the new hash entry pointing to the fixed slot index.
+    \item Atomically validate the slot bitmask ($V_k[i] \leftarrow 1$).
+\end{enumerate}
+
 \textbf{Theorem (Wait-Free Reads).} \textit{The \texttt{Get} operation is wait-free: it completes in a bounded number of steps regardless of concurrent writer behavior.}
 
-\textit{Proof.} The reader executes no loops, no spin-waits, and acquires no locks. Each decision point (odd seqlock, changed seqlock, mismatched key) results in an immediate return. The total steps are bounded by a constant: two atomic loads, one key comparison, one bitmask check. $\square$
+\textit{Proof.} The reader executes no loops, no spin-waits, and acquires no locks or consensus objects. Each decision point (odd seqlock, changed seqlock, mismatched key) results in an immediate return. By returning a miss rather than blocking or spinning, we trade marginal hit-rate deflation under heavy write pressure for strict, guaranteed worst-case latency bounds. The total steps are bounded by a constant: two atomic loads, one key comparison, one bitmask check. $\square$
 
 \section{Cache-Line Padding to Eliminate False Sharing}
 
@@ -223,6 +244,8 @@ type slotState struct {
 \end{lstlisting}
 
 Since $\text{addr}(S_{i+1}) = \text{addr}(S_i) + 64$, adjacent entries reside on disjoint, 64-byte aligned cache lines. A write to $S_i$ sets the MESI state of line $\lfloor \text{addr}(S_i) / 64 \rfloor$ to Modified, which is disjoint from line $\lfloor \text{addr}(S_j) / 64 \rfloor$ for any $j \neq i$. False sharing is structurally impossible. $\square$
+
+It is important to note that the 64-bit bitmasks ($V_k$, $A_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
 
 The same principle is applied to the statistics counters. Rather than two globally shared \texttt{atomic.Int64} hit and miss counters, we maintain 64 independent \texttt{statStripe} structs, each padded to 64 bytes, with writers selecting a stripe via \texttt{hash \& 63}. Each core writes exclusively to its own stripe without generating coherency traffic for any other core.
 
@@ -263,7 +286,7 @@ Our custom latency evaluation bypasses \texttt{pb.Next()} entirely. Each gorouti
 
 Sub-linear scaling from 4 to 8 cores is expected: at 8 cores on an M2 die, the shared L3 and memory bus bandwidth begin to constrain throughput independently of lock contention.
 
-\subsection{Latency Percentiles}
+\subsection{Latency Percentiles (ARM64)}
 
 \begin{table}[h]
 \centering
@@ -271,18 +294,34 @@ Sub-linear scaling from 4 to 8 cores is expected: at 8 cores on an M2 die, the s
 \toprule
 \textbf{Percentile} & \textbf{Measured} & \textbf{Est. (40~ns overhead removed)} \\ \midrule
 p50                 & 250~ns            & $\sim$210~ns                           \\
-p99                 & 1{,}000~ns        & $\sim$960~ns                           \\
-p99.9               & 1{,}417~ns        & $\sim$1{,}377~ns                       \\
-Max                 & $\sim$7.1~ms      & ---                                    \\ \bottomrule
+p99                 & 1{,}125~ns        & $\sim$1{,}085~ns                       \\
+p99.9               & 1{,}583~ns        & $\sim$1{,}543~ns                       \\
+Max                 & $\sim$6.3~ms      & ---                                    \\ \bottomrule
 \end{tabular}
 \caption{Latency percentiles under 8-core contended workload. Measurement overhead due to \texttt{time.Now()} is $\sim$40~ns per sample.}
 \end{table}
 
 The observed maximum latency is dominated by OS goroutine scheduling jitter, not cache mechanics.
 
+\subsection{x86\_64 Performance Parity}
+
+To verify behavioral consistency across architectures, we evaluated \texttt{liteLRU} on an x86\_64 Docker container instance. Due to the differing memory models and MESI topologies between Intel/AMD and Apple Silicon, absolute latency numbers differ, but the lock-free scaling properties hold.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}ccc@{}}
+\toprule
+\textbf{Architecture} & \textbf{Cores} & \textbf{Ops/sec (x86\_64)} \\ \midrule
+x86\_64               & 8              & 13{,}155{,}469                  \\ \bottomrule
+\end{tabular}
+\caption{Throughput on x86\_64 architecture. *Note: Evaluation performed inside a Docker Desktop virtualized instance, which introduces nominal hypervisor overhead compared to bare-metal execution.}
+\end{table}
+
 \section{Discussion and Limitations}
 
-\textbf{Approximate Eviction.} The Chunked Bitmask CLOCK algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
+\textbf{Memory Overhead.} The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths), which is acceptable for caches holding megabytes of data but potentially wasteful for caches scaling into the billions of extremely small elements.
+
+\textbf{Hit Rate vs. True LRU.} The Chunked Bitmask algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. We defer comprehensive hit-rate evaluations (e.g., against \texttt{ristretto} under Zipfian distributions) to future work. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
 
 \textbf{Fixed Capacity.} The cache does not resize. The hash map is pre-allocated at construction. This prevents any allocation or growth during steady-state execution but requires the caller to correctly provision capacity at initialization time.
 

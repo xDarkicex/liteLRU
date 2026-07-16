@@ -1,0 +1,378 @@
+Starting latency test with 8 workers, 1600000 total ops (80% GET / 20% ADD)...
+fatal error: fatal error: checkptr: pointer arithmetic result points to invalid allocation
+fatal error: checkptr: pointer arithmetic result points to invalid allocation
+fatal error: checkptr: pointer arithmetic result points to invalid allocation
+fatal error: checkptr: pointer arithmetic result points to invalid allocation
+checkptr: pointer arithmetic result points to invalid allocation
+
+goroutine 34 gp=0xc000112540 m=3 mp=0xc000080008 [running]:
+runtime.throw({0x1007009e4?, 0x1006d8c6c?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/panic.go:1094 +0x34 fp=0xc00010fc20 sp=0xc00010fbf0 pc=0x1005e90f4
+runtime.checkptrArithmetic(0xc00110fc68?, {0x0, 0x0, 0x20?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/checkptr.go:69 +0xa8 fp=0xc00010fc50 sp=0xc00010fc20 pc=0x100582248
+github.com/xDarkicex/memory.(*HashMap).getInner(0xc0000fb318?, 0xc00009a660, 0xfaf614e75088c92a)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:394 +0x294 fp=0xc00010fd10 sp=0xc00010fc50 pc=0x1006d8c94
+github.com/xDarkicex/memory.(*HashMap).Get(0xc0000fb308, 0xfaf614e75088c92a)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:370 +0x11c fp=0xc00010fd70 sp=0xc00010fd10 pc=0x1006d89cc
+github.com/xDarkicex/liteLRU.(*LRUCache).Get(0xc0000fc608, {0x1006f3fa0, 0x4}, {0xc0000a4d50, 0x11})
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/liteLRU.go:382 +0xe0 fp=0xc00010fe30 sp=0xc00010fd70 pc=0x1006dc0e0
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.func2(0x6)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:62 +0x25c fp=0xc00010ffa0 sp=0xc00010fe30 pc=0x1006dd85c
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.gowrap1()
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:69 +0x44 fp=0xc00010ffd0 sp=0xc00010ffa0 pc=0x1006dd5c4
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc00010ffd0 sp=0xc00010ffd0 pc=0x1005f0da4
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 1 gp=0xc0000021c0 m=nil [chan receive]:
+runtime.gopark(0x3000961e0?, 0x101d514a8?, 0xc0?, 0x45?, 0x18?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc0000b1660 sp=0xc0000b1640 pc=0x1005e9210
+runtime.chanrecv(0xc0000d4200, 0xc0000b176e, 0x1)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/chan.go:667 +0x3c8 fp=0xc0000b16f0 sp=0xc0000b1660 pc=0x1005817e8
+runtime.chanrecv1(0x1008b13c0?, 0x100752780?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/chan.go:509 +0x14 fp=0xc0000b1720 sp=0xc0000b16f0 pc=0x100581414
+testing.(*T).Run(0xc000082700, {0x1006f8422, 0x15}, 0x1007881b8)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/testing/testing.go:2005 +0x700 fp=0xc0000b1860 sp=0xc0000b1720 pc=0x1006794d0
+testing.runTests.func1(0xc000082700)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/testing/testing.go:2477 +0x78 fp=0xc0000b18b0 sp=0xc0000b1860 pc=0x10067c958
+testing.tRunner(0xc000082700, 0xc0000b1ad8)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/testing/testing.go:1934 +0x168 fp=0xc0000b1990 sp=0xc0000b18b0 pc=0x100678158
+testing.runTests(0xc0000a6018, {0x1008a8860, 0x2, 0x2}, {0x35e573fae830c26c?, 0x0?, 0x1008b1540?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/testing/testing.go:2475 +0x738 fp=0xc0000b1b00 sp=0xc0000b1990 pc=0x10067c818
+testing.(*M).Run(0xc000096140)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/testing/testing.go:2337 +0xaf8 fp=0xc0000b1e70 sp=0xc0000b1b00 pc=0x10067a768
+main.main()
+	_testmain.go:53 +0x104 fp=0xc0000b1f40 sp=0xc0000b1e70 pc=0x1006e18f4
+runtime.main()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:285 +0x278 fp=0xc0000b1fd0 sp=0xc0000b1f40 pc=0x1005b3c38
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc0000b1fd0 sp=0xc0000b1fd0 pc=0x1005f0da4
+
+goroutine 2 gp=0xc000002700 m=nil [force gc (idle)]:
+runtime.gopark(0x0?, 0x1008892b0?, 0xe0?, 0x22?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc000054790 sp=0xc000054770 pc=0x1005e9210
+runtime.goparkunlock(...)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:466
+runtime.forcegchelper()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:373 +0xb4 fp=0xc0000547d0 sp=0xc000054790 pc=0x1005b3f84
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc0000547d0 sp=0xc0000547d0 pc=0x1005f0da4
+created by runtime.init.7 in goroutine 1
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:361 +0x24
+
+goroutine 3 gp=0xc000002c40 m=nil [GC sweep wait]:
+runtime.gopark(0x1?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc000064f60 sp=0xc000064f40 pc=0x1005e9210
+runtime.goparkunlock(...)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:466
+runtime.bgsweep(0xc000076000)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgcsweep.go:323 +0x104 fp=0xc000064fb0 sp=0xc000064f60 pc=0x10059d444
+runtime.gcenable.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:212 +0x28 fp=0xc000064fd0 sp=0xc000064fb0 pc=0x1005910a8
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc000064fd0 sp=0xc000064fd0 pc=0x1005f0da4
+created by runtime.gcenable in goroutine 1
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:212 +0x6c
+
+goroutine 4 gp=0xc000002e00 m=nil [GC scavenge wait]:
+runtime.gopark(0x10000?, 0x100732618?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc000069f60 sp=0xc000069f40 pc=0x1005e9210
+runtime.goparkunlock(...)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:466
+runtime.(*scavengerState).park(0x1008b15c0)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgcscavenge.go:425 +0x5c fp=0xc000069f90 sp=0xc000069f60 pc=0x10059af6c
+runtime.bgscavenge(0xc000076000)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgcscavenge.go:658 +0xac fp=0xc000069fb0 sp=0xc000069f90 pc=0x10059b50c
+runtime.gcenable.gowrap2()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:213 +0x28 fp=0xc000069fd0 sp=0xc000069fb0 pc=0x100591048
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc000069fd0 sp=0xc000069fd0 pc=0x1005f0da4
+created by runtime.gcenable in goroutine 1
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:213 +0xac
+
+goroutine 17 gp=0xc000082380 m=nil [GOMAXPROCS updater (idle)]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc000054f70 sp=0xc000054f50 pc=0x1005e9210
+runtime.goparkunlock(...)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:466
+runtime.updateMaxProcsGoroutine()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:6720 +0xf4 fp=0xc000054fd0 sp=0xc000054f70 pc=0x1005c2ac4
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc000054fd0 sp=0xc000054fd0 pc=0x1005f0da4
+created by runtime.defaultGOMAXPROCSUpdateEnable in goroutine 1
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:6708 +0x48
+
+goroutine 18 gp=0xc000082540 m=nil [finalizer wait]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc00010cd80 sp=0xc00010cd60 pc=0x1005e9210
+runtime.runFinalizers()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mfinal.go:210 +0x124 fp=0xc00010cfd0 sp=0xc00010cd80 pc=0x100590144
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc00010cfd0 sp=0xc00010cfd0 pc=0x1005f0da4
+created by runtime.createfing in goroutine 1
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mfinal.go:172 +0x78
+
+goroutine 19 gp=0xc000082a80 m=nil [sync.WaitGroup.Wait]:
+runtime.gopark(0x1008bbde0?, 0x1005f1ff8?, 0xe0?, 0xa1?, 0x1005f37b8?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc000068b90 sp=0xc000068b70 pc=0x1005e9210
+runtime.goparkunlock(...)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:466
+runtime.semacquire1(0xc0000101d8, 0x0, 0x1, 0x0, 0x19)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/sema.go:192 +0x204 fp=0xc000068be0 sp=0xc000068b90 pc=0x1005c9804
+sync.runtime_SemacquireWaitGroup(0xc0000101d0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/sema.go:114 +0x38 fp=0xc000068c20 sp=0xc000068be0 pc=0x1005ea968
+sync.(*WaitGroup).Wait(0xc0000101d0)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/sync/waitgroup.go:206 +0xc0 fp=0xc000068c60 sp=0xc000068c20 pc=0x1005fa010
+github.com/xDarkicex/liteLRU.TestConcurrentLatency(0xc0000828c0?)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:76 +0x6f8 fp=0xc000068ec0 sp=0xc000068c60 pc=0x1006dcd58
+testing.tRunner(0xc0000828c0, 0x1007881b8)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/testing/testing.go:1934 +0x168 fp=0xc000068fa0 sp=0xc000068ec0 pc=0x100678158
+testing.(*T).Run.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/testing/testing.go:1997 +0x40 fp=0xc000068fd0 sp=0xc000068fa0 pc=0x1006796b0
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc000068fd0 sp=0xc000068fd0 pc=0x1005f0da4
+created by testing.(*T).Run in goroutine 1
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/testing/testing.go:1997 +0x6e4
+
+goroutine 20 gp=0xc000082c40 m=nil [GC worker (idle)]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc00010bf10 sp=0xc00010bef0 pc=0x1005e9210
+runtime.gcBgMarkWorker(0xc000090230)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1463 +0xe0 fp=0xc00010bfb0 sp=0xc00010bf10 pc=0x100593720
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x28 fp=0xc00010bfd0 sp=0xc00010bfb0 pc=0x100593608
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc00010bfd0 sp=0xc00010bfd0 pc=0x1005f0da4
+created by runtime.gcBgMarkStartWorkers in goroutine 19
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x140
+
+goroutine 21 gp=0xc000082e00 m=nil [GC worker (idle)]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc00010af10 sp=0xc00010aef0 pc=0x1005e9210
+runtime.gcBgMarkWorker(0xc000090230)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1463 +0xe0 fp=0xc00010afb0 sp=0xc00010af10 pc=0x100593720
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x28 fp=0xc00010afd0 sp=0xc00010afb0 pc=0x100593608
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc00010afd0 sp=0xc00010afd0 pc=0x1005f0da4
+created by runtime.gcBgMarkStartWorkers in goroutine 19
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x140
+
+goroutine 22 gp=0xc000082fc0 m=nil [GC worker (idle)]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc000109f10 sp=0xc000109ef0 pc=0x1005e9210
+runtime.gcBgMarkWorker(0xc000090230)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1463 +0xe0 fp=0xc000109fb0 sp=0xc000109f10 pc=0x100593720
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x28 fp=0xc000109fd0 sp=0xc000109fb0 pc=0x100593608
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc000109fd0 sp=0xc000109fd0 pc=0x1005f0da4
+created by runtime.gcBgMarkStartWorkers in goroutine 19
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x140
+
+goroutine 23 gp=0xc000083180 m=nil [GC worker (idle)]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc000108f10 sp=0xc000108ef0 pc=0x1005e9210
+runtime.gcBgMarkWorker(0xc000090230)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1463 +0xe0 fp=0xc000108fb0 sp=0xc000108f10 pc=0x100593720
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x28 fp=0xc000108fd0 sp=0xc000108fb0 pc=0x100593608
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc000108fd0 sp=0xc000108fd0 pc=0x1005f0da4
+created by runtime.gcBgMarkStartWorkers in goroutine 19
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x140
+
+goroutine 24 gp=0xc000083340 m=nil [GC worker (idle)]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc0001e5f10 sp=0xc0001e5ef0 pc=0x1005e9210
+runtime.gcBgMarkWorker(0xc000090230)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1463 +0xe0 fp=0xc0001e5fb0 sp=0xc0001e5f10 pc=0x100593720
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x28 fp=0xc0001e5fd0 sp=0xc0001e5fb0 pc=0x100593608
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc0001e5fd0 sp=0xc0001e5fd0 pc=0x1005f0da4
+created by runtime.gcBgMarkStartWorkers in goroutine 19
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x140
+
+goroutine 25 gp=0xc000083500 m=nil [GC worker (idle)]:
+runtime.gopark(0xa3353990b1db2?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc0001e4f10 sp=0xc0001e4ef0 pc=0x1005e9210
+runtime.gcBgMarkWorker(0xc000090230)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1463 +0xe0 fp=0xc0001e4fb0 sp=0xc0001e4f10 pc=0x100593720
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x28 fp=0xc0001e4fd0 sp=0xc0001e4fb0 pc=0x100593608
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc0001e4fd0 sp=0xc0001e4fd0 pc=0x1005f0da4
+created by runtime.gcBgMarkStartWorkers in goroutine 19
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x140
+
+goroutine 26 gp=0xc0000836c0 m=nil [GC worker (idle)]:
+runtime.gopark(0xa3353990b219a?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc0001e3f10 sp=0xc0001e3ef0 pc=0x1005e9210
+runtime.gcBgMarkWorker(0xc000090230)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1463 +0xe0 fp=0xc0001e3fb0 sp=0xc0001e3f10 pc=0x100593720
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x28 fp=0xc0001e3fd0 sp=0xc0001e3fb0 pc=0x100593608
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc0001e3fd0 sp=0xc0001e3fd0 pc=0x1005f0da4
+created by runtime.gcBgMarkStartWorkers in goroutine 19
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x140
+
+goroutine 27 gp=0xc000083880 m=nil [GC worker (idle)]:
+runtime.gopark(0xa3353990b507a?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/proc.go:460 +0xc0 fp=0xc0001e2f10 sp=0xc0001e2ef0 pc=0x1005e9210
+runtime.gcBgMarkWorker(0xc000090230)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1463 +0xe0 fp=0xc0001e2fb0 sp=0xc0001e2f10 pc=0x100593720
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x28 fp=0xc0001e2fd0 sp=0xc0001e2fb0 pc=0x100593608
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc0001e2fd0 sp=0xc0001e2fd0 pc=0x1005f0da4
+created by runtime.gcBgMarkStartWorkers in goroutine 19
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/mgc.go:1373 +0x140
+
+goroutine 28 gp=0xc0000036c0 m=nil [runnable]:
+github.com/xDarkicex/memory.(*HashMap).Put(0xc0000fb308, 0x966d10d877bfbd23, 0xc0000eb320)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:41 +0x144 fp=0xc0001ded50 sp=0xc0001ded50 pc=0x1006d7e44
+github.com/xDarkicex/liteLRU.(*LRUCache).Add(0xc0000fc608, {0x1006f3eb9, 0x3}, {0xc0000a5ce0, 0x11}, 0x100788268, {0x0, 0x0, 0x0?})
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/liteLRU.go:362 +0x444 fp=0xc0001dee30 sp=0xc0001ded50 pc=0x1006dbe34
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.func2(0x0)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:64 +0x288 fp=0xc0001defa0 sp=0xc0001dee30 pc=0x1006dd888
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.gowrap1()
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:69 +0x44 fp=0xc0001defd0 sp=0xc0001defa0 pc=0x1006dd5c4
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc0001defd0 sp=0xc0001defd0 pc=0x1005f0da4
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 29 gp=0xc000003880 m=4 mp=0xc00005b008 [running]:
+	goroutine running on other thread; stack unavailable
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 30 gp=0xc000003a40 m=nil [runnable]:
+time.Now()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/time/time.go:1343 +0x168 fp=0xc00006ae30 sp=0xc00006ae30 pc=0x1006164f8
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.func2(0x2)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:59 +0x22c fp=0xc00006afa0 sp=0xc00006ae30 pc=0x1006dd82c
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.gowrap1()
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:69 +0x44 fp=0xc00006afd0 sp=0xc00006afa0 pc=0x1006dd5c4
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc00006afd0 sp=0xc00006afd0 pc=0x1005f0da4
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 31 gp=0xc000003c00 m=5 mp=0xc000110008 [running]:
+	goroutine running on other thread; stack unavailable
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 32 gp=0xc000003dc0 m=9 mp=0xc000e40008 [running]:
+	goroutine running on other thread; stack unavailable
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 33 gp=0xc000112380 m=nil [runnable]:
+runtime.asyncPreempt2()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/preempt.go:308 +0x3c fp=0xc00010db50 sp=0xc00010db30 pc=0x1005b287c
+runtime.asyncPreempt()
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/preempt_arm64.s:47 +0x9c fp=0xc00010dd40 sp=0xc00010db50 pc=0x1005f196c
+sync/atomic.(*Uint64).Load(0xc0001cf240)
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/sync/atomic/type.go:181 +0xc fp=0xc00010dd50 sp=0xc00010dd50 pc=0x1005f729c
+github.com/xDarkicex/liteLRU.(*LRUCache).Add(0xc0000fc608, {0x1006f3eb9, 0x3}, {0xc0000923f0, 0x10}, 0x100788268, {0x0, 0x0, 0x0?})
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/liteLRU.go:311 +0x17c fp=0xc00010de30 sp=0xc00010dd50 pc=0x1006dbb6c
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.func2(0x5)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:64 +0x288 fp=0xc00010dfa0 sp=0xc00010de30 pc=0x1006dd888
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.gowrap1()
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:69 +0x44 fp=0xc00010dfd0 sp=0xc00010dfa0 pc=0x1006dd5c4
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc00010dfd0 sp=0xc00010dfd0 pc=0x1005f0da4
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 35 gp=0xc000112700 m=8 mp=0xc000080808 [running]:
+	goroutine running on other thread; stack unavailable
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 29 gp=0xc000003880 m=4 mp=0xc00005b008 [running]:
+runtime.throw({0x1007009e4?, 0x1006d8c6c?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/panic.go:1094 +0x34 fp=0xc000067c20 sp=0xc000067bf0 pc=0x1005e90f4
+runtime.checkptrArithmetic(0x67c68?, {0x0, 0x0, 0x20?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/checkptr.go:69 +0xa8 fp=0xc000067c50 sp=0xc000067c20 pc=0x100582248
+github.com/xDarkicex/memory.(*HashMap).getInner(0xc0000fb318?, 0xc00009a660, 0xa43f5ee71f646d63)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:394 +0x294 fp=0xc000067d10 sp=0xc000067c50 pc=0x1006d8c94
+github.com/xDarkicex/memory.(*HashMap).Get(0xc0000fb308, 0xa43f5ee71f646d63)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:370 +0x11c fp=0xc000067d70 sp=0xc000067d10 pc=0x1006d89cc
+github.com/xDarkicex/liteLRU.(*LRUCache).Get(0xc0000fc608, {0x1006f3fa0, 0x4}, {0xc00019e4b0, 0x11})
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/liteLRU.go:382 +0xe0 fp=0xc000067e30 sp=0xc000067d70 pc=0x1006dc0e0
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.func2(0x1)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:62 +0x25c fp=0xc000067fa0 sp=0xc000067e30 pc=0x1006dd85c
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.gowrap1()
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:69 +0x44 fp=0xc000067fd0 sp=0xc000067fa0 pc=0x1006dd5c4
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc000067fd0 sp=0xc000067fd0 pc=0x1005f0da4
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 35 gp=0xc000112700 m=8 mp=0xc000080808 [running]:
+runtime.throw({0x1007009e4?, 0x1006d8c6c?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/panic.go:1094 +0x34 fp=0xc0001f2c20 sp=0xc0001f2bf0 pc=0x1005e90f4
+runtime.checkptrArithmetic(0x1f2c68?, {0x0, 0x0, 0x20?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/checkptr.go:69 +0xa8 fp=0xc0001f2c50 sp=0xc0001f2c20 pc=0x100582248
+github.com/xDarkicex/memory.(*HashMap).getInner(0xc0000fb318?, 0xc00009a660, 0x2c804581cba9715a)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:394 +0x294 fp=0xc0001f2d10 sp=0xc0001f2c50 pc=0x1006d8c94
+github.com/xDarkicex/memory.(*HashMap).Get(0xc0000fb308, 0x2c804581cba9715a)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:370 +0x11c fp=0xc0001f2d70 sp=0xc0001f2d10 pc=0x1006d89cc
+github.com/xDarkicex/liteLRU.(*LRUCache).Get(0xc0000fc608, {0x1006f414d, 0x5}, {0xc000193050, 0x11})
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/liteLRU.go:382 +0xe0 fp=0xc0001f2e30 sp=0xc0001f2d70 pc=0x1006dc0e0
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.func2(0x7)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:62 +0x25c fp=0xc0001f2fa0 sp=0xc0001f2e30 pc=0x1006dd85c
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.gowrap1()
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:69 +0x44 fp=0xc0001f2fd0 sp=0xc0001f2fa0 pc=0x1006dd5c4
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc0001f2fd0 sp=0xc0001f2fd0 pc=0x1005f0da4
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 31 gp=0xc000003c00 m=5 mp=0xc000110008 [running]:
+runtime.throw({0x1007009e4?, 0x1006d8c6c?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/panic.go:1094 +0x34 fp=0xc00006bc20 sp=0xc00006bbf0 pc=0x1005e90f4
+runtime.checkptrArithmetic(0x6bc68?, {0x0, 0x0, 0x20?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/checkptr.go:69 +0xa8 fp=0xc00006bc50 sp=0xc00006bc20 pc=0x100582248
+github.com/xDarkicex/memory.(*HashMap).getInner(0xc0000fb318?, 0xc00009a660, 0xc8cb0a5c187f6ba)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:394 +0x294 fp=0xc00006bd10 sp=0xc00006bc50 pc=0x1006d8c94
+github.com/xDarkicex/memory.(*HashMap).Get(0xc0000fb308, 0xc8cb0a5c187f6ba)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:370 +0x11c fp=0xc00006bd70 sp=0xc00006bd10 pc=0x1006d89cc
+github.com/xDarkicex/liteLRU.(*LRUCache).Get(0xc0000fc608, {0x1006f3eb6, 0x3}, {0xc000193590, 0x11})
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/liteLRU.go:382 +0xe0 fp=0xc00006be30 sp=0xc00006bd70 pc=0x1006dc0e0
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.func2(0x3)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:62 +0x25c fp=0xc00006bfa0 sp=0xc00006be30 pc=0x1006dd85c
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.gowrap1()
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:69 +0x44 fp=0xc00006bfd0 sp=0xc00006bfa0 pc=0x1006dd5c4
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc00006bfd0 sp=0xc00006bfd0 pc=0x1005f0da4
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+
+goroutine 32 gp=0xc000003dc0 m=9 mp=0xc000e40008 [running]:
+runtime.throw({0x1007009e4?, 0x1006d8c6c?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/panic.go:1094 +0x34 fp=0xc00010ec20 sp=0xc00010ebf0 pc=0x1005e90f4
+runtime.checkptrArithmetic(0x10ec68?, {0x0, 0x0, 0x20?})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/checkptr.go:69 +0xa8 fp=0xc00010ec50 sp=0xc00010ec20 pc=0x100582248
+github.com/xDarkicex/memory.(*HashMap).getInner(0xc0000fb318?, 0xc00009a660, 0x8db5e7d872cc0c72)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:394 +0x294 fp=0xc00010ed10 sp=0xc00010ec50 pc=0x1006d8c94
+github.com/xDarkicex/memory.(*HashMap).Get(0xc0000fb308, 0x8db5e7d872cc0c72)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/memory/hashmap_ops.go:370 +0x11c fp=0xc00010ed70 sp=0xc00010ed10 pc=0x1006d89cc
+github.com/xDarkicex/liteLRU.(*LRUCache).Get(0xc0000fc608, {0x1006f3eb9, 0x3}, {0xc000193cc8, 0x11})
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/liteLRU.go:382 +0xe0 fp=0xc00010ee30 sp=0xc00010ed70 pc=0x1006dc0e0
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.func2(0x4)
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:62 +0x25c fp=0xc00010efa0 sp=0xc00010ee30 pc=0x1006dd85c
+github.com/xDarkicex/liteLRU.TestConcurrentLatency.gowrap1()
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:69 +0x44 fp=0xc00010efd0 sp=0xc00010efa0 pc=0x1006dd5c4
+runtime.goexit({})
+	/opt/homebrew/Cellar/go/1.25.7/libexec/src/runtime/asm_arm64.s:1268 +0x4 fp=0xc00010efd0 sp=0xc00010efd0 pc=0x1005f0da4
+created by github.com/xDarkicex/liteLRU.TestConcurrentLatency in goroutine 19
+	/Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU/latency_test.go:38 +0x410
+FAIL	github.com/xDarkicex/liteLRU	0.400s
+FAIL
