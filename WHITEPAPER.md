@@ -158,7 +158,15 @@ This replaces an $O(N)$ sequential scan over $N$ atomic loads with two 64-bit re
 If $C_k = 0$, it indicates all valid slots in the current chunk have been recently accessed. The algorithm deterministically falls back to a second-chance pass: it atomically clears the `accessed` bitmask ($A_k \leftarrow 0$) for the chunk and seamlessly advances to the next contiguous chunk. 
 
 **Writer Progress and Claim Protocol.** 
-To safely claim the selected bit $i$ for eviction, the writer executes an atomic Compare-And-Swap (CAS) on a `writing` bitmask for the chunk. If two concurrent writers compute the same `CTZ(C_k)` candidate index, only one will succeed in the CAS. The loser immediately retries the chunk, naturally falling through to the next available zero bit. To guarantee progress and bound the worst-case scenario where a chunk is highly contended or fully occupied, the eviction search places a hard upper bound of $N_k$ chunk scans (one full ring traversal) before aborting, though in practice the clearing of access bits ensures an eviction candidate surfaces rapidly.
+To safely claim the selected bit $i$ for eviction, we define a third state bitmask for the chunk: $W_k \in \{0,1\}^{64}$, where bit $i = 1$ if and only if a writer currently owns slot $i$ for mutation. 
+
+The eviction search process executes as follows:
+1. Extract candidate index $i = \text{CTZ}(C_k)$.
+2. Execute an atomic Compare-And-Swap (CAS) to set $W_k[i] \leftarrow 1$.
+3. If the CAS fails (another writer claimed it), restart at step 1 for the same chunk.
+4. If $W_k[i] = 1$ is successfully claimed, proceed to step 1 of the concurrent Hash Map Consistency protocol defined in §6.
+
+To guarantee progress and bound the worst-case scenario where a chunk is highly contended or fully occupied, the eviction search places a hard upper bound of $N_k$ chunk scans (one full ring traversal). If the scan bound is exhausted, the `Add` operation safely aborts, returning an error to the caller (e.g., forcing a fallback to the origin server without caching). In practice, the clearing of access bits ensures an eviction candidate surfaces rapidly.
 
 ### 5.4 Eliminating the Global Clock Hand
 
@@ -176,12 +184,12 @@ A **Sequence Lock** (Seqlock) [[14]](#ref-seqlock) achieves this. Each slot $i$ 
 
 **Read Protocol:** A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, the slot is being written; report a miss. Otherwise, read the data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, the slot was concurrently modified; report a miss. Finally, check if the bitmask is valid: if $V_k[i] = 0$, report a miss. Otherwise, the read is consistent.
 
-**Concurrent Hash Map Consistency.** Since `liteLRU` relies on an open-addressed hash map for indexing, eviction requires a strict ordering to prevent races where a reader observes a valid hash pointer but reads torn data. The writer protocol is:
+**Concurrent Hash Map Consistency.** Since `liteLRU` relies on an open-addressed hash map for indexing, eviction requires a strict ordering to prevent races where a reader observes a valid hash pointer but reads torn data. Following the successful claim of $W_k[i]$, the writer protocol is:
 1. Atomically invalidate the slot bitmask ($V_k[i] \leftarrow 0$).
 2. Delete the old hash entry from the map (tombstoning).
 3. Under Seqlock, write the new route data to the SoA arrays.
 4. Insert the new hash entry pointing to the fixed slot index.
-5. Atomically validate the slot bitmask ($V_k[i] \leftarrow 1$).
+5. Atomically validate the slot bitmask ($V_k[i] \leftarrow 1$) and release the claim ($W_k[i] \leftarrow 0$).
 
 **Theorem (Wait-Free Reads).** The `Get` operation is wait-free: it always completes in a bounded number of steps, regardless of concurrent writer behavior.
 
@@ -234,19 +242,21 @@ Our custom latency test bypasses `pb.Next()` entirely. Each goroutine operates a
 
 ### 9.1 Baseline Comparison
 
-To substantiate the benefits of `liteLRU`'s bitmask and padding architectures, we benchmarked it against a standard Mutex-protected doubly-linked list LRU and the production-grade `dgraph-io/ristretto` cache. The benchmark utilized 8 concurrent workers processing 1.6M requests under identical 80/20 Get/Add Zipfian-aligned hit rates (70%).
+To substantiate the benefits of `liteLRU`'s bitmask and padding architectures, we benchmarked it against a standard Mutex-protected doubly-linked list LRU and the production-grade `dgraph-io/ristretto` cache. The benchmark utilized 8 concurrent workers processing 1.6M requests under an identical 80/20 Get/Add Zipfian-aligned distribution. All three caches reported measured hit rates of $\approx$70\%.
 
-| Cache Implementation      | Ops/sec    | Scaling |
-|---------------------------|-----------:|--------:|
-| `liteLRU` (Bitmask CLOCK) | 31,625,240 | 1.00x   |
-| `ristretto` (BP-Wrapper)  | 13,758,346 | 0.43x   |
-| `Mutex LRU` (Naive)       |  5,900,272 | 0.18x   |
+| Cache Implementation      | Ops/sec    | Relative throughput |
+|---------------------------|-----------:|--------------------:|
+| `liteLRU` (Bitmask CLOCK) | 31,625,240 | 1.00x               |
+| `ristretto` (BP-Wrapper)  | 13,758,346 | 0.43x               |
+| `Mutex LRU` (Naive)       |  5,900,272 | 0.18x               |
 
 `liteLRU` demonstrates a >5x throughput advantage over the naive Mutex LRU, and >2.2x over the highly optimized `ristretto` concurrent cache.
 
 ### 9.2 Throughput Scaling
 
-Using the un-synchronized worker methodology:
+To evaluate multi-core scaling behavior and latency distributions, we ran a heavily instrumented variant of the workload. *Note: In this test, every cache operation is wrapped in a `time.Now()` measurement call to construct latency percentiles. The inherent ~40ns cost of `time.Now()` per operation severely bottlenecks raw throughput, reducing the 8-core maximum from the uninstrumented 31.6M ops/sec (in §9.1) to ~17M ops/sec.*
+
+Using the latency-instrumented worker methodology:
 
 | Cores | Ops/sec       | Scaling Factor |
 |------:|--------------|----------------|
@@ -270,7 +280,7 @@ Measured with an inherent ~40ns `time.Now()` overhead per sample:
 
 The max is dominated by OS scheduling jitter on at least one of the 8 goroutines, not cache mechanics.
 
-### 9.4 x86_64 Performance Parity
+### 9.4 x86_64 Smoke Test
 
 To verify behavioral consistency across architectures, we evaluated `liteLRU` on an x86_64 Docker container instance. Due to the differing memory models and MESI topologies between Intel/AMD and Apple Silicon, absolute latency numbers differ, but the lock-free scaling properties hold.
 
@@ -342,3 +352,6 @@ We have presented the hardware-grounded derivation of each principal design deci
 
 <a name="ref-seqlock"></a>
 [14] Lameter, C. "Effective Synchronization on Linux/NUMA Systems." *Gelato Conference*, 2005. https://lameter.com/gelato2005.pdf
+
+<a name="ref-memc3"></a>
+[15] Fan, B., Andersen, D. G., and Kaminsky, M. "MemC3: Compact and Concurrent MemCache with Dumber Caching and Smarter Hashing." *USENIX NSDI*, 2013. https://www.cs.cmu.edu/~dga/papers/memc3-nsdi2013-abstract.html

@@ -204,7 +204,17 @@ This replaces an $\mathcal{O}(N)$ sequential scan over $N$ atomic loads with two
 If $C_k = 0$, it indicates all valid slots in the current chunk have been recently accessed. The algorithm deterministically falls back to a second-chance pass: it atomically clears the accessed bitmask ($A_k \leftarrow 0$) for the chunk and seamlessly advances to the next contiguous chunk. 
 
 \textbf{Writer Progress and Claim Protocol.}
-To safely claim the selected bit $i$ for eviction, the writer executes an atomic Compare-And-Swap (CAS) on a \texttt{writing} bitmask for the chunk. If two concurrent writers compute the same $\text{CTZ}(C_k)$ candidate index, only one will succeed in the CAS. The loser immediately retries the chunk, naturally falling through to the next available zero bit. To guarantee progress and bound the worst-case scenario where a chunk is highly contended or fully occupied, the eviction search places a hard upper bound of $N_k$ chunk scans (one full ring traversal) before aborting, though in practice the clearing of access bits ensures an eviction candidate surfaces rapidly.
+To safely claim the selected bit $i$ for eviction, we define a third state bitmask for the chunk: $W_k \in \{0,1\}^{64}$, where bit $i = 1$ if and only if a writer currently owns slot $i$ for mutation. 
+
+The eviction search process executes as follows:
+\begin{enumerate}
+    \item Extract candidate index $i = \text{CTZ}(C_k)$.
+    \item Execute an atomic Compare-And-Swap (CAS) to set $W_k[i] \leftarrow 1$.
+    \item If the CAS fails (another writer claimed it), restart at step 1 for the same chunk.
+    \item If $W_k[i] = 1$ is successfully claimed, proceed to step 1 of the concurrent Hash Map Consistency protocol defined in \S 6.
+\end{enumerate}
+
+To guarantee progress and bound the worst-case scenario where a chunk is highly contended or fully occupied, the eviction search places a hard upper bound of $N_k$ chunk scans (one full ring traversal). If the scan bound is exhausted, the \texttt{Add} operation safely aborts, returning an error to the caller (e.g., forcing a fallback to the origin server without caching). In practice, the clearing of access bits ensures an eviction candidate surfaces rapidly.
 
 \subsection{Eliminating the Global Clock Hand}
 
@@ -218,13 +228,13 @@ We require that \texttt{Get} operations never block on an ongoing \texttt{Add}, 
 
 \textbf{Read Protocol:} A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, the slot is being written; report a miss immediately. Read the data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, a concurrent write occurred; report a miss. Finally, check if the bitmask is valid: if $V_k[i] = 0$, report a miss. Otherwise, the read is consistent.
 
-\textbf{Concurrent Hash Map Consistency.} Since \texttt{liteLRU} relies on an open-addressed hash map for indexing, eviction requires a strict ordering to prevent races where a reader observes a valid hash pointer but reads torn data. The writer protocol is:
+\textbf{Concurrent Hash Map Consistency.} Since \texttt{liteLRU} relies on an open-addressed hash map for indexing, eviction requires a strict ordering to prevent races where a reader observes a valid hash pointer but reads torn data. Following the successful claim of $W_k[i]$, the writer protocol is:
 \begin{enumerate}
     \item Atomically invalidate the slot bitmask ($V_k[i] \leftarrow 0$).
     \item Delete the old hash entry from the map (tombstoning).
     \item Under Seqlock, write the new route data to the SoA arrays.
     \item Insert the new hash entry pointing to the fixed slot index.
-    \item Atomically validate the slot bitmask ($V_k[i] \leftarrow 1$).
+    \item Atomically validate the slot bitmask ($V_k[i] \leftarrow 1$) and release the claim ($W_k[i] \leftarrow 0$).
 \end{enumerate}
 
 \textbf{Theorem (Wait-Free Reads).} \textit{The \texttt{Get} operation is wait-free: it completes in a bounded number of steps regardless of concurrent writer behavior.}
@@ -274,13 +284,13 @@ Our custom latency evaluation bypasses \texttt{pb.Next()} entirely. Each gorouti
 
 \subsection{Baseline Comparison}
 
-To substantiate the benefits of \texttt{liteLRU}'s bitmask and padding architectures, we benchmarked it against a standard Mutex-protected doubly-linked list LRU and the production-grade \texttt{dgraph-io/ristretto} cache. The benchmark utilized 8 concurrent workers processing 1.6M requests under identical 80/20 Get/Add Zipfian-aligned hit rates (70\%).
+To substantiate the benefits of \texttt{liteLRU}'s bitmask and padding architectures, we benchmarked it against a standard Mutex-protected doubly-linked list LRU and the production-grade \texttt{dgraph-io/ristretto} cache. The benchmark utilized 8 concurrent workers processing 1.6M requests under an identical 80/20 Get/Add Zipfian-aligned distribution. All three caches reported measured hit rates of $\approx$70\%.
 
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}lrc@{}}
 \toprule
-\textbf{Cache Implementation} & \textbf{Ops/sec} & \textbf{Scaling Factor} \\ \midrule
+\textbf{Cache Implementation} & \textbf{Ops/sec} & \textbf{Relative throughput} \\ \midrule
 \texttt{liteLRU} (Bitmask CLOCK) & 31,625,240       & 1.00$\times$            \\
 \texttt{ristretto} (BP-Wrapper)  & 13,758,346       & 0.43$\times$            \\
 \texttt{Mutex LRU} (Naive)       & 5,900,272        & 0.18$\times$            \\ \bottomrule
@@ -292,6 +302,9 @@ To substantiate the benefits of \texttt{liteLRU}'s bitmask and padding architect
 
 \subsection{Throughput Scaling}
 
+To evaluate multi-core scaling behavior and latency distributions, we ran a heavily instrumented variant of the workload. \textit{Note: In this test, every cache operation is wrapped in a \texttt{time.Now()} measurement call to construct latency percentiles. The inherent $\sim$40~ns cost of \texttt{time.Now()} per operation severely bottlenecks raw throughput, reducing the 8-core maximum from the uninstrumented 31.6M ops/sec (in \S 9.1) to $\sim$17M ops/sec.}
+
+Using the latency-instrumented worker methodology:
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}rrc@{}}
@@ -324,7 +337,7 @@ Max                 & $\sim$6.3~ms      & ---                                   
 
 The observed maximum latency is dominated by OS goroutine scheduling jitter, not cache mechanics.
 
-\subsection{x86\_64 Performance Parity}
+\subsection{x86\_64 Smoke Test}
 
 To verify behavioral consistency across architectures, we evaluated \texttt{liteLRU} on an x86\_64 Docker container instance. Due to the differing memory models and MESI topologies between Intel/AMD and Apple Silicon, absolute latency numbers differ, but the lock-free scaling properties hold.
 
