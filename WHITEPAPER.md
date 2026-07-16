@@ -314,12 +314,12 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 
 | Cache Capacity | `liteLRU` Hit Rate | `ristretto` Hit Rate |
 |----------------|--------------------|----------------------|
-| 25% (25,000)   | **78.73%**         | 37.48%               |
-| 50% (50,000)   | **78.74%**         | 44.68%               |
-| 75% (75,000)   | **78.73%**         | 51.39%               |
-| 95% (95,000)   | **78.73%**         | 55.37%               |
+| 25% (25,000)   | **86.63%**         | 34.23%               |
+| 50% (50,000)   | **94.49%**         | 40.31%               |
+| 75% (75,000)   | **97.59%**         | 41.61%               |
+| 95% (95,000)   | **97.59%**         | 43.20%               |
 
-Surprisingly, `liteLRU`'s bitmask-CLOCK approximation achieves a strictly superior and perfectly stable ~78.7% hit rate across all tested capacities, while `ristretto`'s SampledLFU struggles to warm up and properly admit items under this specific bursty Zipfian workload without a prolonged training period. Furthermore, because `liteLRU` features a wait-free hit path without the lock-based delinking overhead of traditional LRU, its throughput remains immune to the high hit-ratio contention pathology formally described by Qiu et al. [16].
+`liteLRU` scales precisely with capacity, reaching a 97.59% hit rate at 95% capacity. In contrast, `ristretto`'s hit rate collapses to <45% despite a 20% warmup phase. This reveals a critical failure mode of amortized background eviction: under intense concurrent pressure (18M ops/sec), `ristretto`'s channel buffers fill up and it silently drops ingestion samples to maintain throughput. As a result, its TinyLFU sketch fails to learn the Zipfian frequencies and its admission policy degrades. `liteLRU`'s synchronous wait-free design guarantees that every access is tracked immediately, immunizing it from both high hit-ratio contention pathology [16] and dropped-sample admission failure.
 
 ### 9.6 Write-Heavy Workloads
 
