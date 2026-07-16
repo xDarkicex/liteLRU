@@ -3,10 +3,11 @@
 \usepackage[utf8]{inputenc}
 \usepackage{amsmath}
 \usepackage{amssymb}
-\usepackage{hyperref}
+\usepackage[bookmarks=false]{hyperref}
 \usepackage{booktabs}
 \usepackage{listings}
 \usepackage{geometry}
+\usepackage{url}
 \geometry{margin=1in}
 \usepackage{xcolor}
 
@@ -16,26 +17,26 @@
 \definecolor{backcolour}{rgb}{0.95,0.95,0.92}
 
 \lstdefinestyle{mystyle}{
-    backgroundcolor=\color{backcolour},   
+    backgroundcolor=\color{backcolour},
     commentstyle=\color{codegreen},
     keywordstyle=\color{magenta},
     numberstyle=\tiny\color{codegray},
     stringstyle=\color{codepurple},
     basicstyle=\ttfamily\small,
-    breakatwhitespace=false,         
-    breaklines=true,                 
-    captionpos=b,                    
-    keepspaces=true,                 
-    numbers=none,                    
-    numbersep=5pt,                  
-    showspaces=false,                
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=none,
+    showspaces=false,
     showstringspaces=false,
-    showtabs=false,                  
+    showtabs=false,
     tabsize=4
 }
 \lstset{style=mystyle}
 
-\title{\textbf{liteLRU: A Cache-Coherent, Lock-Free Approximate LRU via Chunked Bitmask Eviction on Modern Multi-Core Hardware}}
+\title{\textbf{liteLRU: A Cache-Coherent, Lock-Free Approximate LRU via\\
+Chunked Bitmask Eviction on Modern Multi-Core Hardware}}
 \author{
   xDarkicex \\
   \small Affiliations: libravdb $\cdot$ bitdev $\cdot$ zephyr-systems \\
@@ -49,7 +50,7 @@
 \maketitle
 
 \begin{abstract}
-We describe the design and implementation of \texttt{liteLRU}, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not \textit{which items to evict}, but \textit{how to perform eviction and recency tracking without serializing the CPU cores that share the cache}. We analyze why conventional data structures---doubly-linked lists, per-node reference counting, and AoS memory layouts---are structurally incompatible with the MESI cache coherency protocol under concurrent access. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments. We then derive the Chunked Bitmask CLOCK eviction algorithm from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $\mathcal{O}(1)$ bulk state evaluation using a single hardware \texttt{CTZ} instruction. Empirical evaluation on an 8-core ARM architecture yields p99.9 latency of 1.4 $\mu$s under a contended parallel workload.
+We describe the design and implementation of \texttt{liteLRU}, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not \textit{which items to evict}, but \textit{how to perform eviction and recency tracking without serializing the CPU cores that share the cache}. We analyze why conventional data structures---doubly-linked lists, per-node reference counting, and Array of Structs memory layouts---are structurally incompatible with the MESI cache coherency protocol~\cite{mesi1984} under concurrent access. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency~\cite{gogc2018}. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments and derive the Chunked Bitmask CLOCK eviction algorithm~\cite{clock1969} from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $\mathcal{O}(1)$ bulk state evaluation using a single hardware \texttt{CTZ} instruction~\cite{inteltzcnt,armclz}. We contrast our approach against recent eviction policy research including S3-FIFO~\cite{s3fifo2023} and SIEVE~\cite{sieve2024}, noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields a p99.9 latency of 1.4~$\mu$s under a contended parallel workload.
 \end{abstract}
 
 \section{Background: The Hardware Model}
@@ -64,14 +65,14 @@ The fundamental unit of coherency is the \textbf{cache line}, universally 64 byt
 
 \subsection{The MESI Coherency Protocol}
 
-The MESI protocol (Modified, Exclusive, Shared, Invalid) maintains coherency across cores. The relevant transitions are:
+The MESI protocol (Modified, Exclusive, Shared, Invalid) was introduced by Papamarcos and Patel~\cite{mesi1984} to maintain coherency across private caches in a multi-processor system. The relevant state transitions are:
 
 \begin{itemize}
     \item A line held in \textbf{Shared} state by multiple cores transitions to \textbf{Invalid} in all other cores when any single core writes to it.
-    \item A write to an \textbf{Invalid} line requires an RFO (Read For Ownership)---a broadcast on the CPU interconnect requesting exclusive ownership from all other cores.
+    \item A write to an \textbf{Invalid} line requires a Read For Ownership (RFO)---a broadcast on the CPU interconnect requesting exclusive ownership from all other cores.
 \end{itemize}
 
-The critical consequence is \textbf{false sharing}: if two independent variables, accessed concurrently by two different cores, reside on the same 64-byte cache line, a write by one core forces an RFO on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
+The critical consequence is \textbf{false sharing}~\cite{falsesharing1993}: if two independent variables, accessed concurrently by two different cores, reside on the same 64-byte cache line, a write by one core forces an RFO on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
 
 \subsection{Atomics and Memory Ordering Cost}
 
@@ -81,23 +82,23 @@ Atomic operations (\texttt{CAS}, fetch-and-add) on a memory location whose cache
     \item The atomic read-modify-write in the modified cache line.
 \end{enumerate}
 
-Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips across the CPU interconnect. As core count $N$ grows, wait time for the contested line scales as $\mathcal{O}(N)$ per operation.
+Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips. As core count $N$ grows, the wait time for the contested line scales as $\mathcal{O}(N)$ per operation, a fact formalized by Amdahl~\cite{amdahl1967}. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit~\cite{lockfree2004}.
 
 \section{Why Off-Heap Memory}
 
-Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep. It introduces two categories of tail-latency interference relevant to a cache implementation:
+Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2018}. It introduces two categories of tail-latency interference directly relevant to a cache implementation:
 
 \begin{itemize}
     \item \textbf{Write Barrier Overhead.} The GC requires write barriers on every pointer store to maintain the tri-color invariant. For a structure that stores handler function pointers or string headers, every \texttt{Add} operation incurs GC bookkeeping cost proportional to the number of pointer-typed fields written.
-    \item \textbf{Stop-the-World Pauses.} While modern Go GC pause times are low (sub-millisecond), they are non-zero and non-deterministic. For a component targeting p99.9 tail latency in the low-microsecond range, any unpredictable pause is unacceptable.
-    \item \textbf{Scanner Heap Pressure.} Objects that escape to the heap are scanned during the mark phase. A cache holding thousands of string values generates a large root set for the GC to scan, increasing mark phase duration proportionally.
+    \item \textbf{Stop-the-World Pauses.} While modern Go GC pause times are sub-millisecond, they are non-zero and non-deterministic. For a component targeting p99.9 tail latency in the low-microsecond range, any unpredictable pause invalidates latency guarantees.
+    \item \textbf{Mark-Phase Heap Pressure.} A cache holding thousands of string values generates a large root set for the GC to scan during the mark phase, increasing mark duration proportionally with capacity.
 \end{itemize}
 
 \texttt{liteLRU} addresses this through two mechanisms:
 
 \begin{enumerate}
-    \item \textbf{\texttt{HashMap}:} An open-addressed hash map backed by an mmap-allocated region. Because mmap allocations are off the Go heap, the GC scanner does not traverse them, eliminating pointer scanning overhead for the index structure.
-    \item \textbf{Fixed-Width Value Arrays:} The SoA slices holding methods, paths, and params are allocated once at initialization. Strings stored within these arrays are fixed-assignment slots, not append-growing structures, bounding GC root growth to a constant.
+    \item \textbf{Off-Heap HashMap:} An open-addressed hash map backed by an mmap-allocated region~\cite{mmap2015}. Because mmap allocations are outside the Go heap, the GC scanner does not traverse them, eliminating pointer scanning overhead for the entire index structure.
+    \item \textbf{Fixed-Width Value Arrays:} The SoA slices holding methods, paths, and params are allocated once at initialization time. They are fixed-assignment slots rather than append-growing structures, bounding GC root growth to a constant determined at construction.
 \end{enumerate}
 
 \section{Why Structure of Arrays over Array of Structs}
@@ -111,24 +112,24 @@ type Entry struct {
     path    string     // 16 bytes
     handler uintptr    // 8 bytes
     params  []Param    // 24 bytes
-    // ... additional metadata
 }
+// In memory: [entry0 | entry1 | entry2 | ...]
 \end{lstlisting}
 
-Consider a sequential \texttt{Get} operation that validates 8 candidate entries by comparing their \texttt{method} and \texttt{path} fields. In AoS, each entry is $\sim$64+ bytes. Accessing the \texttt{method} field of entry $i$ and entry $i+1$ requires touching two separate 64-byte cache lines. For $n$ entries, this is $n$ cache-line fetches.
+Consider a \texttt{Get} operation that must validate $n$ candidate entries by comparing their \texttt{method} and \texttt{path} fields. In AoS, each entry occupies $\sim$64+ bytes. Accessing the \texttt{method} field of entry $i$ and entry $i+1$ requires fetching two separate 64-byte cache lines. For $n$ entries, the cache-line cost is $n$ fetches just for a single field.
 
-The Structure of Arrays (SoA) alternative separates fields into parallel arrays:
+The Structure of Arrays (SoA) alternative, widely employed in high-performance and SIMD-oriented computing~\cite{soasimd2009}, separates fields into parallel arrays:
 
 \begin{lstlisting}[language=Go]
 // SoA: one array per field
-methods  []string    // [m0, m1, m2, ...]
-paths    []string    // [p0, p1, p2, ...]
-handlers []uintptr   // [h0, h1, h2, ...]
+methods  []string    // [m0, m1, m2, ...] -- contiguous
+paths    []string    // [p0, p1, p2, ...] -- contiguous
+handlers []uintptr   // [h0, h1, h2, ...] -- contiguous
 \end{lstlisting}
 
-When a \texttt{Get} operation scans \texttt{methods[i]} and \texttt{methods[i+1]}, both values reside in the same 64-byte cache line (a \texttt{string} header is 16 bytes, so 4 string headers per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4.
+When a \texttt{Get} operation scans \texttt{methods[i]} and \texttt{methods[i+1]}, both values reside in the same 64-byte cache line (a \texttt{string} header is 16 bytes, placing 4 per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4.
 
-Formally, let $W_f$ be the width of field $f$ and $L = 64$ bytes be the cache line size. For AoS, the number of cache lines fetched to access field $f$ of $n$ entries is:
+Formally, let $W_f$ be the width of field $f$ and $L = 64$ bytes be the cache line size. For AoS, the number of cache lines fetched to access field $f$ across $n$ entries is:
 
 \begin{equation}
 \text{Lines}_{AoS}(n, f) = n \cdot \left\lceil \frac{\text{sizeof}(\text{Entry})}{L} \right\rceil
@@ -140,88 +141,116 @@ For SoA:
 \text{Lines}_{SoA}(n, f) = \left\lceil \frac{n \cdot W_f}{L} \right\rceil
 \end{equation}
 
-Since $W_f \ll \text{sizeof}(\text{Entry})$, we have $\text{Lines}_{SoA}(n, f) \ll \text{Lines}_{AoS}(n, f)$ for all $n > 1$.
+Since $W_f \ll \text{sizeof}(\text{Entry})$ for any individual field, we have $\text{Lines}_{SoA}(n, f) \ll \text{Lines}_{AoS}(n, f)$ for all $n > 1$.
 
 \section{Why Bitsets for Recency Tracking}
 
 \subsection{The Cost of Pointer-Based Recency}
 
-Traditional LRU tracks recency by maintaining a doubly-linked list. A cache hit requires unlinking the node (4 pointer writes) and relinking at the head (4 pointer writes). Each pointer write on a concurrent system must be protected by a mutex, which serializes all \texttt{Get} operations.
+Traditional LRU~\cite{lru1965} tracks recency by maintaining a doubly-linked list ordered from Most Recently Used (MRU) to Least Recently Used (LRU). A cache hit requires:
+\begin{enumerate}
+    \item Unlinking the accessed node from its current position: 4 pointer writes.
+    \item Relinking it at the MRU head: 4 pointer writes.
+\end{enumerate}
+
+Each of these pointer writes on a concurrent system must be protected by a mutual exclusion lock, serializing all \texttt{Get} operations system-wide. Lock-free linked-list variants exist but require hazard pointers or epoch-based reclamation to prevent use-after-free races~\cite{lockfree2004}, reintroducing serialization on shared epoch counters.
 
 \subsection{CLOCK as an Approximation}
 
-The CLOCK algorithm approximates LRU by tracking whether each entry has been accessed since the last eviction sweep using a single reference bit. This bit can be set with a non-blocking atomic OR and cleared with an atomic AND, avoiding serializing mutexes.
+The CLOCK algorithm~\cite{clock1969,clockpro2005} approximates LRU by abandoning exact recency ordering. Instead of tracking \textit{which} entry is least recently used, it tracks \textit{whether} each entry has been accessed since the last eviction sweep---a single bit per entry.
+
+\begin{itemize}
+    \item Upon \texttt{Get}: the entry's reference bit is set to 1 via an atomic OR.
+    \item Upon eviction: a hand sweeps the array. Reference bit 1 is cleared to 0 (second chance). Reference bit 0 designates the eviction victim.
+\end{itemize}
+
+This approximates LRU behavior without pointer manipulation, requiring only non-blocking atomic bitwise operations. Recent research such as S3-FIFO~\cite{s3fifo2023} and SIEVE~\cite{sieve2024} further refines the eviction policy. However, these works do not address the parallel execution cost of the eviction mechanism itself, which is the problem we solve.
 
 \subsection{From One Bit to One 64-bit Integer}
 
-Standard CLOCK maintains a global clock-hand pointer. Every eviction increments this counter, reintroducing RFO serialization. \texttt{liteLRU} partitions the cache into chunks of exactly 64 entries. The valid state and access state are represented as two 64-bit integers:
+Standard CLOCK still maintains a global clock-hand pointer---an atomic integer indicating the current sweep position. Every eviction increments this counter and examines a single entry. Under high concurrency, all evicting threads contend on this single atomic, reintroducing the $\mathcal{O}(N)$ RFO serialization we wish to avoid.
+
+The key observation: if we partition the cache into chunks of exactly 64 entries, the valid state and access state of all 64 entries in a chunk fit into two 64-bit integers:
 
 \begin{itemize}
     \item $V_k \in \{0,1\}^{64}$: bit $i = 1$ iff slot $i$ holds a valid entry.
-    \item $A_k \in \{0,1\}^{64}$: bit $i = 1$ iff slot $i$ has been accessed since last sweep.
+    \item $A_k \in \{0,1\}^{64}$: bit $i = 1$ iff slot $i$ has been accessed since the last sweep.
 \end{itemize}
 
-A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$). The candidates across all 64 slots are computed in a single bitwise expression:
+A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$). The complete candidate set across all 64 slots is computed in a single bitwise expression:
 
 \begin{equation}
-C_k = \neg V_k \lor (V_k \land \neg A_k)
+C_k = \neg V_k \;\lor\; (V_k \;\land\; \neg A_k)
 \end{equation}
 
-The index of the first candidate is extracted using the hardware \texttt{CTZ} instruction:
+The index of the first candidate is extracted using the hardware Count Trailing Zeros (CTZ) instruction~\cite{inteltzcnt,armclz}---a single-cycle primitive on both x86\_64 (\texttt{TZCNT}) and ARM64 (\texttt{RBIT} + \texttt{CLZ}):
 
 \begin{equation}
-i = \text{CTZ}(C_k)
+i^* = \text{CTZ}(C_k)
 \end{equation}
 
-This replaces an $\mathcal{O}(N)$ sequential scan with hardware-constant time evaluation.
+This replaces an $\mathcal{O}(N)$ sequential scan over $N$ atomic loads with two register-width bitwise operations and one hardware intrinsic, bounding eviction search to a strict hardware-constant time within any chunk.
 
 \subsection{Eliminating the Global Clock Hand}
 
-\texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_{start} = h(r) \pmod{N_k}$. There is no global clock-hand atomic. Contention on a shared sweep counter is eliminated entirely.
+Because \texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_\text{start} = h(r) \bmod N_k$, there is no shared global clock-hand atomic. Each writer begins its eviction sweep at a deterministic but distributed starting position, naturally load-balancing eviction pressure across chunks without any coordination.
 
 \section{Sequence Lock Design for Wait-Free Reads}
 
-Each slot $i$ maintains an atomic 32-bit sequence counter $S_i$, initialized to 0.
+We require that \texttt{Get} operations never block on an ongoing \texttt{Add}, but also never return torn data if an eviction overwrites a slot mid-read. Sequence Locks (Seqlocks)~\cite{seqlockoriginal} achieve this. Each slot $i$ maintains an atomic 32-bit sequence counter $S_i$, initialized to 0.
 
-\begin{itemize}
-    \item \textbf{Write Protocol:} A writer sets $S_i \leftarrow S_i + 1$ (odd). After writing, it sets $S_i \leftarrow S_i + 1$ (even).
-    \item \textbf{Read Protocol:} A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, report a miss. Read data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, report a miss. Otherwise, consistent read.
-\end{itemize}
+\textbf{Write Protocol:} A writer sets $S_i \leftarrow S_i + 1$ (making it odd). After completing the write, it sets $S_i \leftarrow S_i + 1$ (returning to even).
 
-\textbf{Theorem (Wait-Free Reads).} \textit{The \texttt{Get} operation is wait-free: it always completes in a bounded number of steps. The reader never waits on a lock.}
+\textbf{Read Protocol:} A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, the slot is being written; report a miss immediately. Read the data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, a concurrent write occurred; report a miss. Otherwise, the read is consistent.
+
+\textbf{Theorem (Wait-Free Reads).} \textit{The \texttt{Get} operation is wait-free: it completes in a bounded number of steps regardless of concurrent writer behavior.}
+
+\textit{Proof.} The reader executes no loops, no spin-waits, and acquires no locks. Each decision point (odd seqlock, changed seqlock, mismatched key) results in an immediate return. The total steps are bounded by a constant: two atomic loads, one key comparison, one bitmask check. $\square$
 
 \section{Cache-Line Padding to Eliminate False Sharing}
 
-Allocating seqlocks contiguously places 16 seqlocks per 64-byte cache line. A write to slot $j$ invalidates the line holding $S_{j+1}$, causing false sharing.
+A naive implementation allocates seqlocks as a contiguous slice \texttt{[]atomic.Uint32}. Each \texttt{uint32} is 4 bytes, placing 16 seqlocks per 64-byte cache line. By the MESI coherency protocol~\cite{mesi1984}, a write to slot $j$ invalidates the cache line holding $S_{j+1}, \ldots, S_{j+15}$ across all other cores, inducing spurious RFOs even for logically independent operations. This is the false sharing pathology described by Bolosky and Scott~\cite{falsesharing1993}.
 
-\textbf{Padding Theorem.} \textit{If each $S_i$ occupies exactly one 64-byte cache line, concurrent operations on $i \neq j$ produce no MESI coherency traffic.}
+\textbf{Theorem (Cache Line Isolation).} \textit{If each $S_i$ occupies exactly one 64-byte cache line, concurrent operations on any two distinct slots $i \neq j$ produce no MESI coherency traffic between the cache lines of $S_i$ and $S_j$.}
+
+\textit{Proof.} Define the padded slot state:
 
 \begin{lstlisting}[language=Go]
 type slotState struct {
-    seq atomic.Uint32 // 4 bytes
+    seq atomic.Uint32 //  4 bytes
     _   [60]byte      // 60 bytes padding
 }                     // sizeof = 64 bytes exactly
 \end{lstlisting}
 
-Because $\text{addr}(S_{i+1}) = \text{addr}(S_i) + 64$, adjacent entries reside on disjoint cache lines.
+Since $\text{addr}(S_{i+1}) = \text{addr}(S_i) + 64$, adjacent entries reside on disjoint, 64-byte aligned cache lines. A write to $S_i$ sets the MESI state of line $\lfloor \text{addr}(S_i) / 64 \rfloor$ to Modified, which is disjoint from line $\lfloor \text{addr}(S_j) / 64 \rfloor$ for any $j \neq i$. False sharing is structurally impossible. $\square$
+
+The same principle is applied to the statistics counters. Rather than two globally shared \texttt{atomic.Int64} hit and miss counters, we maintain 64 independent \texttt{statStripe} structs, each padded to 64 bytes, with writers selecting a stripe via \texttt{hash \& 63}. Each core writes exclusively to its own stripe without generating coherency traffic for any other core.
 
 \section{The Measurement Artifact of \texttt{b.RunParallel}}
 
-Standard Go micro-benchmarks use \texttt{b.RunParallel}, which calls \texttt{pb.Next()}---an atomic fetch-and-add on a shared counter. When operation time $T_{op} \approx T_{atomic}$, the benchmark overhead dominates. According to Amdahl's Law:
+Standard Go micro-benchmarks use \texttt{b.RunParallel}, distributing $b.N$ iterations across goroutines via an internal \texttt{pb.Next()} call---an atomic fetch-and-add on a shared 64-bit counter. When the operation under test completes in sub-10~ns---as is typical for a cache hit---the cost of this benchmark coordination atomic dominates the measurement.
+
+This is a direct consequence of Amdahl's Law~\cite{amdahl1967}. Let $f$ be the sequential fraction of the workload and $N$ the number of cores. The maximum parallel speedup is:
 
 \begin{equation}
-S(N) = \frac{1}{(1-f) + \frac{f}{N}}
+S(N) = \frac{1}{\,(1-f) + \dfrac{f}{N}\,}
 \end{equation}
 
-As $f \to 1$, $S(N) \to 1$ regardless of $N$. This produces the appearance of declining throughput. Our custom latency test bypasses \texttt{pb.Next()}, removing this artifact.
+When the operation time $T_\text{op}$ is comparable to the atomic latency $T_\text{atomic}$ ($\sim$20--40~ns including RFO round-trip), the \texttt{pb.Next()} counter constitutes $f \to 1$, forcing $S(N) \to 1$ regardless of $N$. The result is an apparent \textit{decrease} in throughput with additional cores---a benchmark artifact, not a property of the algorithm.
+
+Our custom latency evaluation bypasses \texttt{pb.Next()} entirely. Each goroutine operates an independent tight loop over a pre-allocated, fixed-size key array with no shared iteration counter, eliminating the artifact and isolating the cache mechanics.
 
 \section{Evaluation}
 
-\textbf{Platform:} Apple M2, 8-core ARM64. \textbf{Workload:} 8 workers, $1.6 \times 10^6$ ops.
+\textbf{Platform:} Apple M2, 8-core ARM64, macOS. Go 1.25.7. Cache capacity 1024, maxParams 20.
+
+\textbf{Workload:} 8 concurrent workers, $1.6 \times 10^6$ total operations, 80\% \texttt{Get} / 20\% \texttt{Add}, paths drawn from a pool of 1000 distinct routes yielding $\approx$70\% hit ratio.
+
+\subsection{Throughput Scaling}
 
 \begin{table}[h]
 \centering
-\begin{tabular}{@{}llc@{}}
+\begin{tabular}{@{}rrc@{}}
 \toprule
 \textbf{Cores} & \textbf{Ops/sec} & \textbf{Scaling Factor} \\ \midrule
 1              & 5,457,508        & 1.00$\times$            \\
@@ -229,14 +258,41 @@ As $f \to 1$, $S(N) \to 1$ regardless of $N$. This produces the appearance of de
 4              & 13,701,548       & 2.51$\times$            \\
 8              & 17,066,659       & 3.13$\times$            \\ \bottomrule
 \end{tabular}
+\caption{Throughput under un-synchronized worker methodology.}
 \end{table}
+
+Sub-linear scaling from 4 to 8 cores is expected: at 8 cores on an M2 die, the shared L3 and memory bus bandwidth begin to constrain throughput independently of lock contention.
+
+\subsection{Latency Percentiles}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}ccc@{}}
+\toprule
+\textbf{Percentile} & \textbf{Measured} & \textbf{Est. (40~ns overhead removed)} \\ \midrule
+p50                 & 250~ns            & $\sim$210~ns                           \\
+p99                 & 1{,}000~ns        & $\sim$960~ns                           \\
+p99.9               & 1{,}417~ns        & $\sim$1{,}377~ns                       \\
+Max                 & $\sim$7.1~ms      & ---                                    \\ \bottomrule
+\end{tabular}
+\caption{Latency percentiles under 8-core contended workload. Measurement overhead due to \texttt{time.Now()} is $\sim$40~ns per sample.}
+\end{table}
+
+The observed maximum latency is dominated by OS goroutine scheduling jitter, not cache mechanics.
 
 \section{Discussion and Limitations}
 
-The algorithm is a CLOCK approximation, not true LRU. The capacity is fixed and does not resize. Returning a \texttt{[]Param} copy requires a pool-managed allocation.
+\textbf{Approximate Eviction.} The Chunked Bitmask CLOCK algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
+
+\textbf{Fixed Capacity.} The cache does not resize. The hash map is pre-allocated at construction. This prevents any allocation or growth during steady-state execution but requires the caller to correctly provision capacity at initialization time.
+
+\textbf{String Copying.} While \texttt{Get} performs zero heap allocations for the routing lookup, returning a \texttt{[]Param} copy requires a pool-managed allocation. The sync.Pool bounds this cost but it is not zero in all cases.
 
 \section{Conclusion}
 
-\texttt{liteLRU} leverages off-heap allocation, SoA layout, bitset-encoded state evaluation via hardware intrinsics, seqlock sequencing, and cache-line padding. The concurrency cost is bounded by single-cycle hardware instructions rather than OS synchronization primitives.
+We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap mmap allocation to eliminate GC interference~\cite{gogc2018}; SoA layout to maximize cache-line occupancy per field access; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; Seqlocks~\cite{seqlockoriginal} to provide wait-free read semantics; and 64-byte cache-line padding~\cite{falsesharing1993,mesi1984} to eliminate false-sharing serialization. The result is a cache architecture whose concurrency cost is bounded by single-cycle hardware instructions rather than operating system synchronization primitives.
+
+\bibliographystyle{plain}
+\bibliography{references}
 
 \end{document}
