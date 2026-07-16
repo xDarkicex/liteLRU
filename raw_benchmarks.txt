@@ -1,0 +1,65 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/xDarkicex/liteLRU
+cpu: Apple M2
+BenchmarkLRUCache/Add_Size128_HighHitRatio_FewParams           	 2060895	       592.5 ns/op	     137 B/op	       6 allocs/op
+BenchmarkLRUCache/Add_Size128_HighHitRatio_FewParams-2         	 2264114	       508.8 ns/op	     137 B/op	       6 allocs/op
+BenchmarkLRUCache/Add_Size128_HighHitRatio_FewParams-4         	 2382288	       638.9 ns/op	     137 B/op	       6 allocs/op
+BenchmarkLRUCache/Add_Size128_HighHitRatio_FewParams-8         	 2384847	       510.2 ns/op	     137 B/op	       6 allocs/op
+BenchmarkLRUCache/Get_Size128_HighHitRatio_FewParams           	13309603	        93.46 ns/op	       100.0 coverage%	        18.00 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_HighHitRatio_FewParams-2         	12705420	       117.5 ns/op	       100.0 coverage%	        17.99 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_HighHitRatio_FewParams-4         	13195011	        95.25 ns/op	       100.0 coverage%	        18.00 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_HighHitRatio_FewParams-8         	13465544	        89.69 ns/op	       100.0 coverage%	        18.00 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Mixed_Size128_HighHitRatio_FewParams         	 5531653	       217.0 ns/op	         0.4324 hit%	      34 B/op	       1 allocs/op
+BenchmarkLRUCache/Mixed_Size128_HighHitRatio_FewParams-2       	 6035479	       196.2 ns/op	         0.4335 hit%	      34 B/op	       1 allocs/op
+BenchmarkLRUCache/Mixed_Size128_HighHitRatio_FewParams-4       	 6086851	       194.6 ns/op	         0.4277 hit%	      34 B/op	       1 allocs/op
+BenchmarkLRUCache/Mixed_Size128_HighHitRatio_FewParams-8       	 6109160	       197.8 ns/op	         0.4356 hit%	      35 B/op	       1 allocs/op
+BenchmarkLRUCache/Add_Size128_HighHitRatio_ManyParams          	  962061	      1527 ns/op	     576 B/op	      25 allocs/op
+BenchmarkLRUCache/Add_Size128_HighHitRatio_ManyParams-2        	  980772	      1262 ns/op	     576 B/op	      25 allocs/op
+BenchmarkLRUCache/Add_Size128_HighHitRatio_ManyParams-4        	  998394	      1220 ns/op	     576 B/op	      24 allocs/op
+BenchmarkLRUCache/Add_Size128_HighHitRatio_ManyParams-8        	  995319	      1228 ns/op	     576 B/op	      24 allocs/op
+BenchmarkLRUCache/Get_Size128_HighHitRatio_ManyParams          	13218873	        91.03 ns/op	       100.0 coverage%	        18.00 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_HighHitRatio_ManyParams-2        	13407165	        90.65 ns/op	       100.0 coverage%	        17.99 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_HighHitRatio_ManyParams-4        	13241560	        92.20 ns/op	       100.0 coverage%	        17.99 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_HighHitRatio_ManyParams-8        	13111564	       114.6 ns/op	       100.0 coverage%	        18.01 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Mixed_Size128_HighHitRatio_ManyParams        	 2634436	       453.3 ns/op	         0.4322 hit%	     145 B/op	       6 allocs/op
+BenchmarkLRUCache/Mixed_Size128_HighHitRatio_ManyParams-2      	 3038780	       381.3 ns/op	         0.4322 hit%	     145 B/op	       6 allocs/op
+BenchmarkLRUCache/Mixed_Size128_HighHitRatio_ManyParams-4      	 2967874	       383.9 ns/op	         0.4447 hit%	     146 B/op	       6 allocs/op
+BenchmarkLRUCache/Mixed_Size128_HighHitRatio_ManyParams-8      	 3179866	       395.4 ns/op	         0.4243 hit%	     146 B/op	       6 allocs/op
+BenchmarkLRUCache/Add_Size128_LowHitRatio_FewParams            	 2019908	       586.5 ns/op	     137 B/op	       6 allocs/op
+BenchmarkLRUCache/Add_Size128_LowHitRatio_FewParams-2          	 2219623	       686.5 ns/op	     137 B/op	       6 allocs/op
+BenchmarkLRUCache/Add_Size128_LowHitRatio_FewParams-4          	 2211252	       667.0 ns/op	     137 B/op	       6 allocs/op
+BenchmarkLRUCache/Add_Size128_LowHitRatio_FewParams-8          	 1000000	      1270 ns/op	     137 B/op	       6 allocs/op
+BenchmarkLRUCache/Get_Size128_LowHitRatio_FewParams            	14063694	        83.45 ns/op	       100.0 coverage%	         4.006 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_LowHitRatio_FewParams-2          	14598858	        82.74 ns/op	       100.0 coverage%	         4.001 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_LowHitRatio_FewParams-4          	14420736	        82.68 ns/op	       100.0 coverage%	         3.999 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_LowHitRatio_FewParams-8          	14476107	        83.11 ns/op	       100.0 coverage%	         3.991 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Mixed_Size128_LowHitRatio_FewParams          	 5375757	       236.2 ns/op	         0.3149 hit%	      34 B/op	       1 allocs/op
+BenchmarkLRUCache/Mixed_Size128_LowHitRatio_FewParams-2        	 5898492	       218.7 ns/op	         0.3099 hit%	      34 B/op	       1 allocs/op
+BenchmarkLRUCache/Mixed_Size128_LowHitRatio_FewParams-4        	 5659647	       204.2 ns/op	         0.3113 hit%	      34 B/op	       1 allocs/op
+BenchmarkLRUCache/Mixed_Size128_LowHitRatio_FewParams-8        	 5411514	       207.7 ns/op	         0.3186 hit%	      34 B/op	       1 allocs/op
+BenchmarkLRUCache/Add_Size128_LowHitRatio_ManyParams           	  927751	      1563 ns/op	     576 B/op	      25 allocs/op
+BenchmarkLRUCache/Add_Size128_LowHitRatio_ManyParams-2         	  958466	      1462 ns/op	     576 B/op	      24 allocs/op
+BenchmarkLRUCache/Add_Size128_LowHitRatio_ManyParams-4         	  977924	      1244 ns/op	     575 B/op	      24 allocs/op
+BenchmarkLRUCache/Add_Size128_LowHitRatio_ManyParams-8         	  967760	      1219 ns/op	     575 B/op	      24 allocs/op
+BenchmarkLRUCache/Get_Size128_LowHitRatio_ManyParams           	14589339	        82.86 ns/op	       100.0 coverage%	         4.001 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_LowHitRatio_ManyParams-2         	14563268	        89.05 ns/op	       100.0 coverage%	         4.003 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_LowHitRatio_ManyParams-4         	14709764	        81.69 ns/op	       100.0 coverage%	         3.996 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_LowHitRatio_ManyParams-8         	14778711	        82.00 ns/op	       100.0 coverage%	         4.001 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Mixed_Size128_LowHitRatio_ManyParams         	 2645175	       447.1 ns/op	         0.3182 hit%	     145 B/op	       6 allocs/op
+BenchmarkLRUCache/Mixed_Size128_LowHitRatio_ManyParams-2       	 3169050	       377.2 ns/op	         0.3093 hit%	     145 B/op	       6 allocs/op
+BenchmarkLRUCache/Mixed_Size128_LowHitRatio_ManyParams-4       	 3140455	       378.3 ns/op	         0.3208 hit%	     145 B/op	       6 allocs/op
+BenchmarkLRUCache/Mixed_Size128_LowHitRatio_ManyParams-8       	 3152517	       375.2 ns/op	         0.3167 hit%	     145 B/op	       6 allocs/op
+BenchmarkLRUCache/Add_Size128_MixedParams                      	 1000000	      1267 ns/op	     288 B/op	      13 allocs/op
+BenchmarkLRUCache/Add_Size128_MixedParams-2                    	 1583600	       756.4 ns/op	     288 B/op	      13 allocs/op
+BenchmarkLRUCache/Add_Size128_MixedParams-4                    	 1587812	       745.5 ns/op	     288 B/op	      13 allocs/op
+BenchmarkLRUCache/Add_Size128_MixedParams-8                    	 1591174	       770.5 ns/op	     287 B/op	      12 allocs/op
+BenchmarkLRUCache/Get_Size128_MixedParams                      	12716044	        96.50 ns/op	       100.0 coverage%	        12.00 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_MixedParams-2                    	12473028	        94.39 ns/op	       100.0 coverage%	        12.01 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_MixedParams-4                    	12762115	        93.87 ns/op	       100.0 coverage%	        12.01 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Get_Size128_MixedParams-8                    	12951712	        93.76 ns/op	       100.0 coverage%	        11.99 hit%	       0 B/op	       0 allocs/op
+BenchmarkLRUCache/Mixed_Size128_MixedParams                    	 3952128	       302.2 ns/op	         0.3288 hit%	      72 B/op	       3 allocs/op
+BenchmarkLRUCache/Mixed_Size128_MixedParams-2                  	 4462126	       263.5 ns/op	         0.3321 hit%	      72 B/op	       3 allocs/op
+BenchmarkLRUCache/Mixed_Size128_MixedParams-4                  	 4520752	       262.5 ns/op	         0.3335 hit%	      72 B/op	       3 allocs/op
+BenchmarkLRUCache/Mixed_Size128_MixedParams-8                  	 4588858	       262.3 ns/op	         0.3468 hit%	      72 B/op	       3 allocs/op
+BenchmarkLRUCache/Add_Size512_HighHitRatio_FewParams           	

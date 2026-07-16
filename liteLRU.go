@@ -1,60 +1,78 @@
 // Package liteLRU implements a high-performance LRU (Least Recently Used) cache
 // designed for HTTP routing. It provides thread-safe operations, efficient memory
-// management through object pooling, and optimized string handling.
+// management through object pooling, and a fully lock-free architecture.
 package liteLRU
 
 import (
 	"fmt"
+	"math/bits"
 	"sync"
 	"sync/atomic"
+	"unsafe"
+
+	"github.com/xDarkicex/memory"
 )
 
 // Param represents a key-value parameter in a cache entry.
-// Typically used for route parameters in HTTP request handlers.
 type Param struct {
-	Key   string // Parameter name
-	Value string // Parameter value
+	Key   string
+	Value string
 }
 
 // HandlerFunc represents a handler function to be executed when a cached route is matched.
-// In a routing context, this would be the function called when a route is accessed.
 type HandlerFunc func()
 
-// routeCacheKey uniquely identifies an entry in the LRU cache.
-// It combines HTTP method and path to form a composite key.
-type routeCacheKey struct {
-	method string // HTTP method (GET, POST, etc.)
-	path   string // Request path
+// hashRoute mixes the method and path into a fast 64-bit non-cryptographic hash (FNV-1a variant).
+func hashRoute(method, path string) uint64 {
+	hash := uint64(14695981039346656037)
+	for i := 0; i < len(method); i++ {
+		hash ^= uint64(method[i])
+		hash *= 1099511628211
+	}
+	hash ^= uint64('/')
+	hash *= 1099511628211
+	for i := 0; i < len(path); i++ {
+		hash ^= uint64(path[i])
+		hash *= 1099511628211
+	}
+	return hash
 }
 
-// entry represents a single item in the LRU cache.
-// It contains the cached data and pointers for the doubly-linked list.
-type entry struct {
-	key     routeCacheKey // The cache key (method + path)
-	handler HandlerFunc   // The handler function for this route
-	params  []Param       // Route parameters
-	prev    int           // Index of the previous entry in the doubly-linked list
-	next    int           // Index of the next entry in the doubly-linked list
+// chunk represents a group of 64 slots with bitmasks for O(1) eviction logic.
+// Padded to 64 bytes to prevent false sharing between CPU cache lines.
+type chunk struct {
+	valid    atomic.Uint64
+	accessed atomic.Uint64
+	writing  atomic.Uint64
+	_        [40]byte
 }
 
-// LRUCache implements a thread-safe least recently used cache with fixed capacity.
-// It uses an array-based doubly-linked list for O(1) LRU operations and maintains
-// hit/miss statistics for performance monitoring.
+// LRUCache implements an ultra-low latency lock-free cache with fixed capacity.
+// It uses a Chunked Bitmask CLOCK algorithm for O(1) eviction.
 type LRUCache struct {
-	capacity  int                   // Maximum number of entries the cache can hold
-	mutex     sync.RWMutex          // Read-write mutex for thread safety
-	entries   []entry               // Array of cache entries
-	indices   map[routeCacheKey]int // Map from key to index in entries
-	head      int                   // Index of the most recently used entry
-	tail      int                   // Index of the least recently used entry
-	hits      int64                 // Number of cache hits (atomic counter)
-	misses    int64                 // Number of cache misses (atomic counter)
-	maxParams int                   // Configurable max parameters per entry
+	capacity  uint32
+	maxParams int
+
+	// Lock-free HashMap maps a route hash to an SoA index + 1
+	indexMap *memory.HashMap
+
+	// Structure of Arrays (SoA) for fast contiguous memory access
+	methods  []string
+	paths    []string
+	handlers []HandlerFunc
+	params   [][]Param
+
+	// Concurrency control
+	states []atomic.Uint32 // seqlocks (1 per slot) to prevent read-tearing
+	chunks []chunk         // bitmasks (64 slots per chunk)
+
+	clockGroup atomic.Uint32 // sweeps across chunks for eviction
+	numGroups  uint32
+
+	hits   atomic.Int64
+	misses atomic.Int64
 }
 
-// nextPowerOfTwo rounds up to the next power of two.
-// This improves performance by aligning with hash table implementation details.
-// For example: 10 becomes 16, 120 becomes 128, etc.
 func nextPowerOfTwo(n int) int {
 	if n <= 0 {
 		return 1
@@ -69,19 +87,14 @@ func nextPowerOfTwo(n int) int {
 	return n
 }
 
-// Define multiple sync.Pools for different parameter slice sizes.
-// This reduces GC pressure by reusing parameter slices based on their capacity.
 var paramSlicePools = [5]sync.Pool{
-	{New: func() interface{} { return make([]Param, 0, 4) }},  // Capacity 4
-	{New: func() interface{} { return make([]Param, 0, 8) }},  // Capacity 8
-	{New: func() interface{} { return make([]Param, 0, 16) }}, // Capacity 16
-	{New: func() interface{} { return make([]Param, 0, 32) }}, // Capacity 32
-	{New: func() interface{} { return make([]Param, 0, 64) }}, // Capacity 64
+	{New: func() interface{} { return make([]Param, 0, 4) }},
+	{New: func() interface{} { return make([]Param, 0, 8) }},
+	{New: func() interface{} { return make([]Param, 0, 16) }},
+	{New: func() interface{} { return make([]Param, 0, 32) }},
+	{New: func() interface{} { return make([]Param, 0, 64) }},
 }
 
-// getParamSlice retrieves a parameter slice from the appropriate pool based on paramCount.
-// This function optimizes memory usage by selecting a pool with an appropriate capacity
-// for the requested number of parameters.
 func getParamSlice(paramCount int) []Param {
 	if paramCount <= 4 {
 		return paramSlicePools[0].Get().([]Param)[:0]
@@ -96,9 +109,6 @@ func getParamSlice(paramCount int) []Param {
 	}
 }
 
-// putParamSlice returns a parameter slice to the appropriate pool based on its capacity.
-// This function recycles parameter slices to reduce garbage collection overhead.
-// Slices with capacities that don't match a pool are left for the garbage collector.
 func putParamSlice(s []Param) {
 	cap := cap(s)
 	if cap == 4 {
@@ -112,279 +122,286 @@ func putParamSlice(s []Param) {
 	} else if cap == 64 {
 		paramSlicePools[4].Put(s)
 	}
-	// Slices with unexpected capacities are discarded (handled by GC)
 }
 
-// Simple string interning for method and path.
-// This reduces memory usage by storing only one copy of each unique string.
-var stringInterner = struct {
-	sync.RWMutex
-	m map[string]string
-}{
-	m: make(map[string]string, 16), // Preallocate for common HTTP methods
-}
-
-// internString returns a single canonical instance of the given string.
-// If the string has been seen before, the stored version is returned.
-// Otherwise, the input string becomes the canonical version.
-// This reduces memory usage when the same strings are frequently used.
-func internString(s string) string {
-	stringInterner.RLock()
-	if interned, ok := stringInterner.m[s]; ok {
-		stringInterner.RUnlock()
-		return interned
-	}
-	stringInterner.RUnlock()
-	stringInterner.Lock()
-	defer stringInterner.Unlock()
-	if interned, ok := stringInterner.m[s]; ok {
-		return interned
-	}
-	stringInterner.m[s] = s // Store the string itself as the canonical copy
-	return s
-}
-
-// NewLRUCache creates a new LRU cache with the specified capacity and maxParams.
-// The capacity determines how many entries can be stored before eviction begins.
-// The maxParams parameter configures the maximum number of parameters per entry.
-// The function applies reasonable defaults and bounds if invalid values are provided.
+// NewLRUCache creates a new fully lock-free LRU cache.
 func NewLRUCache(capacity, maxParams int) *LRUCache {
-	// Set defaults if invalid values provided
 	if capacity <= 0 {
-		capacity = 1024 // Default size
+		capacity = 1024
 	}
-
-	// Set a reasonable upper limit to prevent unexpected issues
 	if capacity > 16384 {
 		capacity = 16384
 	}
-
-	// Round capacity to next power of two for better performance
 	capacity = nextPowerOfTwo(capacity)
+	if capacity < 64 {
+		capacity = 64
+	}
 
 	if maxParams <= 0 {
-		maxParams = 10 // Default max parameters
+		maxParams = 10
 	}
+
+	hm, err := memory.NewHashMap(memory.HashMapConfig{
+		Capacity: uint64(capacity * 2), // oversized to minimize collisions
+	})
+	if err != nil {
+		panic(fmt.Sprintf("liteLRU: failed to initialize off-heap memory map: %v", err))
+	}
+
+	numGroups := uint32(capacity / 64)
 
 	c := &LRUCache{
-		capacity:  capacity,
+		capacity:  uint32(capacity),
 		maxParams: maxParams,
-		entries:   make([]entry, capacity),
-		indices:   make(map[routeCacheKey]int, capacity*2), // Oversize to avoid rehashing
-		head:      0,
-		tail:      capacity - 1,
-	}
-
-	// Initialize the circular doubly-linked list
-	for i := 0; i < capacity; i++ {
-		c.entries[i].next = (i + 1) % capacity
-		c.entries[i].prev = (i - 1 + capacity) % capacity
+		indexMap:  hm,
+		methods:   make([]string, capacity),
+		paths:     make([]string, capacity),
+		handlers:  make([]HandlerFunc, capacity),
+		params:    make([][]Param, capacity),
+		states:    make([]atomic.Uint32, capacity),
+		chunks:    make([]chunk, numGroups),
+		numGroups: numGroups,
 	}
 
 	return c
 }
 
-// Add adds a new entry to the cache or updates an existing one.
-// If the key already exists, the entry is updated and moved to the front of the LRU list.
-// If the key doesn't exist, the least recently used entry is replaced with the new entry.
-// This method is thread-safe and optimizes memory usage through string interning and slice pooling.
-func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param) {
-	// Intern strings to reduce allocations
-	method = internString(method)
-	path = internString(path)
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	key := routeCacheKey{method: method, path: path}
+// findVictim uses bitwise operations to instantly find an eviction victim in O(1) time.
+func (c *LRUCache) findVictim() uint32 {
+	for {
+		groupIdx := c.clockGroup.Add(1) - 1
+		group := groupIdx % c.numGroups
+		chk := &c.chunks[group]
 
-	// Check if the key already exists
-	if idx, exists := c.indices[key]; exists {
-		entry := &c.entries[idx]
-		entry.handler = handler
+		for {
+			validBits := chk.valid.Load()
+			accessedBits := chk.accessed.Load()
+			writingBits := chk.writing.Load()
 
-		// Reuse params slice if capacity is sufficient
-		if cap(entry.params) >= len(params) {
-			entry.params = entry.params[:len(params)]
-			copy(entry.params, params)
-		} else {
-			if entry.params != nil {
-				putParamSlice(entry.params)
+			// Candidates: not valid (empty), or valid but not accessed
+			candidates := ^validBits | (validBits & ^accessedBits)
+			// Exclude currently writing slots
+			candidates &= ^writingBits
+
+			if candidates != 0 {
+				bit := uint32(bits.TrailingZeros64(candidates))
+
+				// Attempt to claim this bit for writing
+				if chk.writing.CompareAndSwap(writingBits, writingBits|(1<<bit)) {
+					return group*64 + bit
+				}
+				continue // CAS failed, retry this chunk
 			}
 
-			newParams := getParamSlice(len(params))
-			copy(newParams, params)
-			entry.params = newParams
+			// No candidates available in this chunk.
+			// Clear the accessed bits to give them a second chance.
+			chk.accessed.Store(0)
+			break // move to the next chunk group
 		}
+	}
+}
 
-		c.moveToFront(idx)
-		return
+// Add adds a new entry to the cache or updates an existing one.
+func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param) {
+	hash := hashRoute(method, path)
+
+	// O(1) Bitwise victim selection
+	victimIdx := c.findVictim()
+	group := victimIdx / 64
+	bit := victimIdx % 64
+	chk := &c.chunks[group]
+
+	// We own the writing bit. Set seqlock to odd.
+	seq := c.states[victimIdx].Load()
+	c.states[victimIdx].Store(seq + 1) // odd
+
+	// If it was valid previously, cleanly delete the old hash from indexMap
+	// to allow memory.HashMap to safely recycle the tombstone and prevent resizes!
+	validBits := chk.valid.Load()
+	if (validBits & (1 << bit)) != 0 {
+		oldHash := hashRoute(c.methods[victimIdx], c.paths[victimIdx])
+		if ptr, found := c.indexMap.Get(oldHash); found && uint32(uintptr(ptr))-1 == victimIdx {
+			c.indexMap.Delete(oldHash)
+		}
 	}
 
-	// New entry: reuse the tail slot
-	idx := c.tail
-	entry := &c.entries[idx]
-	oldKey := entry.key
+	// Write new data safely under seqlock
+	c.methods[victimIdx] = method
+	c.paths[victimIdx] = path
+	c.handlers[victimIdx] = handler
 
-	if oldKey.method != "" || oldKey.path != "" {
-		delete(c.indices, oldKey)
+	oldParams := c.params[victimIdx]
+	var newParams []Param
+	if len(params) > 0 {
+		if cap(oldParams) >= len(params) {
+			newParams = oldParams[:len(params)]
+			copy(newParams, params)
+		} else {
+			if oldParams != nil {
+				putParamSlice(oldParams)
+			}
+			newParams = getParamSlice(len(params))
+			copy(newParams, params)
+		}
+	} else {
+		if oldParams != nil {
+			putParamSlice(oldParams)
+		}
+		newParams = nil
+	}
+	c.params[victimIdx] = newParams
+
+	// Mark as accessed
+	for {
+		acc := chk.accessed.Load()
+		if chk.accessed.CompareAndSwap(acc, acc|(1<<bit)) {
+			break
+		}
 	}
 
-	if entry.params != nil {
-		putParamSlice(entry.params)
+	// Mark as valid
+	for {
+		v := chk.valid.Load()
+		if chk.valid.CompareAndSwap(v, v|(1<<bit)) {
+			break
+		}
 	}
 
-	// Update the existing key struct instead of creating a new one
-	entry.key.method = method
-	entry.key.path = path
-	entry.handler = handler
+	// Insert into lock-free map (using index+1 so 0 is never stored as a valid pointer)
+	c.indexMap.Put(hash, unsafe.Pointer(uintptr(victimIdx+1)))
 
-	// Allocate and copy params
-	newParams := getParamSlice(len(params))
-	copy(newParams, params)
-	entry.params = newParams
+	// Finish write: seq becomes even
+	c.states[victimIdx].Store(seq + 2)
 
-	c.indices[entry.key] = idx
-	c.moveToFront(idx)
+	// Release writing bit
+	for {
+		w := chk.writing.Load()
+		if chk.writing.CompareAndSwap(w, w & ^(1<<bit)) {
+			break
+		}
+	}
 }
 
 // Get retrieves an entry from the cache.
-// It returns the handler function, parameters, and a boolean indicating whether the entry was found.
-// If the entry is found, it's moved to the front of the LRU list.
-// This method is thread-safe and includes panic recovery for robustness.
+// 100% lock-free, zero allocation, utilizing seqlocks and O(1) bitmask lookups.
 func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("Recovered from panic in Get: %v\n", r)
-			return
-		}
-	}()
-
-	// Intern strings for consistency
-	method = internString(method)
-	path = internString(path)
-	key := routeCacheKey{method: method, path: path}
-
-	c.mutex.RLock()
-	idx, exists := c.indices[key]
-	if !exists {
-		atomic.AddInt64(&c.misses, 1)
-		c.mutex.RUnlock()
+	hash := hashRoute(method, path)
+	ptr, found := c.indexMap.Get(hash)
+	if !found {
+		c.misses.Add(1)
 		return nil, nil, false
 	}
 
-	entry := &c.entries[idx]
-	handler := entry.handler
+	idx := uint32(uintptr(ptr)) - 1
+	group := idx / 64
+	bit := idx % 64
+	chk := &c.chunks[group]
 
-	var params []Param
-	if len(entry.params) > 0 {
-		params = getParamSlice(len(entry.params))
-		copy(params, entry.params)
-	} else {
-		params = nil
+	// Verify the slot is valid
+	validBits := chk.valid.Load()
+	if (validBits & (1 << bit)) == 0 {
+		c.misses.Add(1)
+		return nil, nil, false
 	}
 
-	c.mutex.RUnlock()
+	// Start read seqlock
+	seq1 := c.states[idx].Load()
+	if seq1%2 != 0 {
+		c.misses.Add(1)
+		return nil, nil, false
+	}
 
-	c.mutex.Lock()
-	c.moveToFront(idx)
-	c.mutex.Unlock()
+	// Validate method/path against concurrent evictions and collisions
+	if c.methods[idx] != method || c.paths[idx] != path {
+		c.misses.Add(1)
+		return nil, nil, false
+	}
 
-	atomic.AddInt64(&c.hits, 1)
-	return handler, params, true
-}
+	// Safely read data
+	handler := c.handlers[idx]
+	params := c.params[idx]
 
-// moveToFront moves an entry to the front of the list (most recently used).
-// This maintains the LRU ordering of the cache entries.
-// The method includes bounds checking and panic recovery for robustness.
-func (c *LRUCache) moveToFront(idx int) {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("Recovered from panic in moveToFront: %v\n", r)
+	var copiedParams []Param
+	if len(params) > 0 {
+		copiedParams = getParamSlice(len(params))
+		copy(copiedParams, params)
+	}
+
+	// Validate read seqlock
+	seq2 := c.states[idx].Load()
+	if seq1 != seq2 {
+		// Slot was modified while we were reading!
+		if copiedParams != nil {
+			putParamSlice(copiedParams)
 		}
-	}()
-
-	// Already at front, nothing to do
-	if idx == c.head {
-		return
+		c.misses.Add(1)
+		return nil, nil, false
 	}
 
-	// Safety check for invalid index
-	if idx < 0 || idx >= c.capacity {
-		fmt.Printf("Warning: Attempted to move invalid index %d in LRU cache with capacity %d\n", idx, c.capacity)
-		return
+	// Mark as accessed for CLOCK via CAS loop
+	for {
+		acc := chk.accessed.Load()
+		if (acc & (1 << bit)) != 0 {
+			break // already accessed
+		}
+		if chk.accessed.CompareAndSwap(acc, acc|(1<<bit)) {
+			break
+		}
 	}
 
-	// Remove from current position
-	entry := &c.entries[idx]
-	prevIdx := entry.prev
-	nextIdx := entry.next
-	c.entries[prevIdx].next = nextIdx
-	c.entries[nextIdx].prev = prevIdx
-
-	// Update tail if we moved the tail
-	if idx == c.tail {
-		c.tail = prevIdx
-	}
-
-	// Insert at front
-	oldHead := c.head
-	oldHeadPrev := c.entries[oldHead].prev
-
-	entry.next = oldHead
-	entry.prev = oldHeadPrev
-	c.entries[oldHead].prev = idx
-	c.entries[oldHeadPrev].next = idx
-
-	// Update head
-	c.head = idx
+	c.hits.Add(1)
+	return handler, copiedParams, true
 }
 
-// Clear removes all entries from the cache and returns param slices to pools.
-// It resets the cache to its initial state while properly cleaning up resources.
-// This method is thread-safe and includes panic recovery for robustness.
+// Clear gracefully removes all entries from the cache lock-free.
 func (c *LRUCache) Clear() {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("Recovered from panic in Clear: %v\n", r)
+	hm, _ := memory.NewHashMap(memory.HashMapConfig{
+		Capacity: uint64(c.capacity * 2),
+	})
+	c.indexMap = hm
+
+	for group := uint32(0); group < c.numGroups; group++ {
+		chk := &c.chunks[group]
+		
+		for {
+			w := chk.writing.Load()
+			// Claim all non-writing slots
+			toClaim := ^w
+			if chk.writing.CompareAndSwap(w, w|toClaim) {
+				break
+			}
 		}
-	}()
 
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
+		// Clear valid and accessed
+		chk.valid.Store(0)
+		chk.accessed.Store(0)
 
-	for i := range c.entries {
-		if c.entries[i].params != nil {
-			putParamSlice(c.entries[i].params)
-			c.entries[i].params = nil
+		for bit := uint32(0); bit < 64; bit++ {
+			idx := group*64 + bit
+			if c.params[idx] != nil {
+				putParamSlice(c.params[idx])
+				c.params[idx] = nil
+			}
+			c.methods[idx] = ""
+			c.paths[idx] = ""
+			c.handlers[idx] = nil
+			c.states[idx].Store(0)
 		}
 
-		c.entries[i].key = routeCacheKey{}
-		c.entries[i].handler = nil
+		chk.writing.Store(0)
 	}
 
-	c.indices = make(map[routeCacheKey]int, c.capacity*2)
-	c.head = 0
-	c.tail = c.capacity - 1
-
-	// Re-initialize the linked list
-	for i := 0; i < c.capacity; i++ {
-		c.entries[i].next = (i + 1) % c.capacity
-		c.entries[i].prev = (i - 1 + c.capacity) % c.capacity
-	}
-
-	atomic.StoreInt64(&c.hits, 0)
-	atomic.StoreInt64(&c.misses, 0)
+	c.hits.Store(0)
+	c.misses.Store(0)
 }
 
 // Stats returns cache hit/miss statistics.
-// It provides the number of cache hits, misses, and the hit ratio.
-// These values are useful for monitoring and tuning cache performance.
 func (c *LRUCache) Stats() (hits, misses int64, ratio float64) {
-	hits = atomic.LoadInt64(&c.hits)
-	misses = atomic.LoadInt64(&c.misses)
+	hits = c.hits.Load()
+	misses = c.misses.Load()
 	total := hits + misses
 	if total > 0 {
 		ratio = float64(hits) / float64(total)
 	}
-
 	return
 }

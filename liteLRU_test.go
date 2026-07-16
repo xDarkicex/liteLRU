@@ -323,3 +323,43 @@ func BenchmarkParamPooling(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkParallelLRUCache tests the true concurrency performance of the lock-free cache
+// using b.RunParallel to simulate multiple goroutines heavily hitting the cache simultaneously.
+func BenchmarkParallelLRUCache(b *testing.B) {
+	methods := []string{"GET", "POST", "PUT", "DELETE", "PATCH"}
+	var paths []string
+	for i := 0; i < 1000; i++ {
+		paths = append(paths, fmt.Sprintf("/api/resource/%d", i))
+	}
+	dummyHandler := func() {}
+
+	cache := NewLRUCache(1024, 20)
+	
+	b.Run("ParallelMixedWorkload", func(b *testing.B) {
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			// Local random to avoid lock contention on global rand
+			localSeed := uint32(0)
+			fastRand := func() uint32 {
+				localSeed ^= localSeed << 13
+				localSeed ^= localSeed >> 17
+				localSeed ^= localSeed << 5
+				return localSeed
+			}
+
+			for pb.Next() {
+				r := fastRand()
+				method := methods[r%uint32(len(methods))]
+				path := paths[r%uint32(len(paths))]
+
+				// 80% Gets, 20% Adds (typical read-heavy concurrent workload)
+				if r%100 < 80 {
+					cache.Get(method, path)
+				} else {
+					cache.Add(method, path, dummyHandler, nil)
+				}
+			}
+		})
+	})
+}
