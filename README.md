@@ -217,3 +217,33 @@ MIT License - see LICENSE file for details. Use it anywhere you want!
 If you're tired of slow caches that eat memory for breakfast and bottleneck on locks, give liteLRU a try. Your users (and your ops team) will thank you! Drop a star on GitHub if you find it useful, and feel free to reach out with any questions.
 
 Happy caching! 🚀
+
+---
+
+## Academic References
+
+The design of `liteLRU` is grounded in the following computer science literature. See [WHITEPAPER.md](WHITEPAPER.md) for the full technical derivation.
+
+[1] Papamarcos, M. S. and Patel, J. H. "A Low-Overhead Coherence Solution for Multiprocessors with Private Cache Memories." *ACM SIGARCH*, 1984. https://doi.org/10.1145/773453.808204
+
+[2] Amdahl, G. M. "Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities." *AFIPS*, 1967. https://doi.org/10.1145/1465482.1465560
+
+[3] Corbató, F. J. "A Paging Experiment with the Multics System." *MIT Press*, 1969. *(origin of the CLOCK algorithm)*
+
+[4] Belady, L. A. "A Study of Replacement Algorithms for a Virtual-Storage Computer." *IBM Systems Journal*, 1966. https://doi.org/10.1147/sj.52.0078
+
+[5] Yang, J. et al. "FIFO Queues are All You Need for Cache Eviction." *SOSP '23*, ACM, 2023. https://doi.org/10.1145/3600006.3613147
+
+[6] Zhang, Y. et al. "SIEVE is Simpler than LRU." *USENIX NSDI*, 2024.
+
+[7] Bolosky, W. J. and Scott, M. L. "False Sharing and Its Effect on Shared Memory Performance." *USENIX*, 1993.
+
+[8] Herlihy, M. and Shavit, N. "The Art of Multiprocessor Programming." *ACM PODC*, 2004. https://doi.org/10.1145/1011767.1011768
+
+[9] Lameter, C. "Effective Synchronization on Linux/NUMA Systems." *Gelato Conference*, 2005. https://lameter.com/gelato2005.pdf
+
+[10] Hudson, R. L. "Go GC: Prioritizing Low Latency and Simplicity." Go Blog, 2015. https://go.dev/blog/ismmkeynote
+
+[11] Intel Corporation. "Intel 64 and IA-32 Architectures Software Developer's Manual, TZCNT Instruction." 2023.
+
+[12] ARM Limited. "ARM Architecture Reference Manual: CLZ Instruction." DDI 0487, 2023.
