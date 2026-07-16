@@ -71,3 +71,31 @@ A simulation of a realistic web server routing cache (single-threaded).
 ## Key Takeaway
 
 `liteLRU` sacrifices a negligible ~5-10ns in single-threaded sequential performance to completely eliminate `sync.RWMutex` locks. In exchange, it unlocks **unlimited parallel scaling** across all CPU cores, guaranteeing ultra-low p99.9 latencies for high-throughput concurrent applications like the `nanite` router.
+
+---
+
+## Concurrent Latency Percentiles
+
+A custom `latency_test.go` was run to measure the exact latency percentiles under a heavy concurrent load (8 workers, 1.6 million operations, 70% hit ratio). 
+
+*(Note: Because this test wraps every single operation in `time.Now()` and `time.Since()`, there is an inherent ~30-50ns measurement overhead added to every op).*
+
+### Raw Measured Latency
+
+| Percentile | Latency |
+|------------|---------|
+| p50 (Median)| 250 ns |
+| p99         | 1.0 µs |
+| p99.9       | 13.0 µs |
+| Max (p100)  | ~7.1 ms |
+
+### Estimated True Latency (Overhead Removed)
+
+Assuming a conservative 40ns overhead per `time.Now()` / `time.Since()` measurement pair:
+
+| Percentile | Estimated Latency |
+|------------|-------------------|
+| p50 (Median)| ~210 ns |
+| p99         | ~960 ns |
+| p99.9       | ~12.9 µs |
+| Max (p100)  | ~7.1 ms |
