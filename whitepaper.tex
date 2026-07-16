@@ -288,14 +288,14 @@ To substantiate the benefits of \texttt{liteLRU}'s bitmask and padding architect
 
 \begin{table}[h]
 \centering
-\begin{tabular}{@{}lrc@{}}
+\begin{tabular}{@{}lrcc@{}}
 \toprule
-\textbf{Cache Implementation} & \textbf{Ops/sec} & \textbf{Relative throughput} \\ \midrule
-\texttt{liteLRU} (Bitmask CLOCK) & 31,625,240       & 1.00$\times$            \\
-\texttt{ristretto} (BP-Wrapper)  & 13,758,346       & 0.43$\times$            \\
-\texttt{Mutex LRU} (Naive)       & 5,900,272        & 0.18$\times$            \\ \bottomrule
+\textbf{Cache Implementation} & \textbf{Ops/sec} & \textbf{p50 Latency} & \textbf{p99 Latency} \\ \midrule
+\texttt{liteLRU} (Bitmask CLOCK) & 31,604,548       & 583~ns            & 1.83~$\mu$s \\
+\texttt{ristretto} (BP-Wrapper)  & 10,557,365       & 292~ns            & 64.83~$\mu$s \\
+\texttt{Mutex LRU} (Naive)       & 3,955,855        & 458~ns            & 50.58~$\mu$s \\ \bottomrule
 \end{tabular}
-\caption{Baseline throughput comparison against production caches.}
+\caption{Baseline throughput and latency comparison against production caches. Latency percentiles were sampled at a 1\% rate to preserve realistic throughput levels.}
 \end{table}
 
 \texttt{liteLRU} demonstrates a $>$5$\times$ throughput advantage over the naive Mutex LRU, and $>$2.2$\times$ over the highly optimized \texttt{ristretto} concurrent cache.
@@ -336,6 +336,30 @@ Max                 & $\sim$6.3~ms      & ---                                   
 \end{table}
 
 The observed maximum latency is dominated by OS goroutine scheduling jitter, not cache mechanics.
+
+\subsection{Ablation Study}
+
+To mathematically validate the architectural decisions behind \texttt{liteLRU}, we benchmarked the full implementation against three stripped-down variants under the identical 8-core 80/20 workload:
+\begin{itemize}
+    \item \textbf{No Padding}: Removed the 64-byte padding from seqlocks and stripe counters, inducing false sharing.
+    \item \textbf{No Bitmask}: Replaced the O(1) \texttt{CTZ} intrinsic with a naive 64-iteration \texttt{for} loop.
+    \item \textbf{No Mmap}: Replaced the off-heap lock-free hash map with a standard Go \texttt{map} protected by a \texttt{sync.RWMutex}.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrc@{}}
+\toprule
+\textbf{Variant} & \textbf{Ops/sec} & \textbf{Throughput Loss} \\ \midrule
+\texttt{liteLRU} (Full)          & 32,024,792 & --- \\
+No Bitmask (Linear Scan)         & 29,034,906 & -9\% \\
+No Padding (False Share)         & 19,407,171 & -39\% \\
+No Mmap (Go Map + Mutex)         & 4,280,582  & -87\% \\ \bottomrule
+\end{tabular}
+\caption{Ablation study throughput comparisons.}
+\end{table}
+
+The ablation proves that while the bitmask hardware acceleration provides a measurable 9\% optimization, the true structural requirements for scaling are the cache-line isolation (-39\% without it) and the off-heap lock-free memory (-87\% without it).
 
 \subsection{x86\_64 Smoke Test}
 

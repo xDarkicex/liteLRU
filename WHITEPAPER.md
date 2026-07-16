@@ -244,11 +244,13 @@ Our custom latency test bypasses `pb.Next()` entirely. Each goroutine operates a
 
 To substantiate the benefits of `liteLRU`'s bitmask and padding architectures, we benchmarked it against a standard Mutex-protected doubly-linked list LRU and the production-grade `dgraph-io/ristretto` cache. The benchmark utilized 8 concurrent workers processing 1.6M requests under an identical 80/20 Get/Add Zipfian-aligned distribution. All three caches reported measured hit rates of $\approx$70\%.
 
-| Cache Implementation      | Ops/sec    | Relative throughput |
-|---------------------------|-----------:|--------------------:|
-| `liteLRU` (Bitmask CLOCK) | 31,625,240 | 1.00x               |
-| `ristretto` (BP-Wrapper)  | 13,758,346 | 0.43x               |
-| `Mutex LRU` (Naive)       |  5,900,272 | 0.18x               |
+| Cache Implementation      | Ops/sec    | p50 Latency | p99 Latency |
+|---------------------------|-----------:|------------:|------------:|
+| `liteLRU` (Bitmask CLOCK) | 31,604,548 | 583 ns      | 1.83 µs     |
+| `ristretto` (BP-Wrapper)  | 10,557,365 | 292 ns      | 64.83 µs    |
+| `Mutex LRU` (Naive)       |  3,955,855 | 458 ns      | 50.58 µs    |
+
+*Note: Latency percentiles were sampled at a 1% rate to preserve realistic throughput levels during measurement.*
 
 `liteLRU` demonstrates a >5x throughput advantage over the naive Mutex LRU, and >2.2x over the highly optimized `ristretto` concurrent cache.
 
@@ -280,7 +282,23 @@ Measured with an inherent ~40ns `time.Now()` overhead per sample:
 
 The max is dominated by OS scheduling jitter on at least one of the 8 goroutines, not cache mechanics.
 
-### 9.4 x86_64 Smoke Test
+### 9.4 Ablation Study
+
+To mathematically validate the architectural decisions behind `liteLRU`, we benchmarked the full implementation against three stripped-down variants under the identical 8-core 80/20 workload:
+- **No Padding**: Removed the 64-byte padding from seqlocks and stripe counters, inducing false sharing.
+- **No Bitmask**: Replaced the O(1) `CTZ` intrinsic with a naive 64-iteration `for` loop.
+- **No Mmap**: Replaced the off-heap lock-free hash map with a standard Go `map` protected by a `sync.RWMutex`.
+
+| Variant                   | Ops/sec    | Throughput Loss |
+|---------------------------|-----------:|----------------:|
+| `liteLRU` (Full)          | 32,024,792 | —               |
+| No Bitmask (Linear Scan)  | 29,034,906 | -9%             |
+| No Padding (False Share)  | 19,407,171 | -39%            |
+| No Mmap (Go Map + Mutex)  |  4,280,582 | -87%            |
+
+The ablation proves that while the bitmask hardware acceleration provides a measurable 9% optimization, the true structural requirements for scaling are the cache-line isolation (-39% without it) and the off-heap lock-free memory (-87% without it).
+
+### 9.5 x86_64 Smoke Test
 
 To verify behavioral consistency across architectures, we evaluated `liteLRU` on an x86_64 Docker container instance. Due to the differing memory models and MESI topologies between Intel/AMD and Apple Silicon, absolute latency numbers differ, but the lock-free scaling properties hold.
 
