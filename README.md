@@ -114,16 +114,16 @@ Here is a quick teaser of our `RunParallel` performance running across multiple 
 
 *(Yes, that is ~30ns per operation for a fully thread-safe, LRU-evicting cache!)*
 
-### Concurrent Latency Percentiles
+### Concurrent Latency Percentiles (Clean Environment)
 
 We also run a heavy concurrent latency test (8 workers, 1.6M ops). *(Note: Because this test wraps every single operation in `time.Now()` and `time.Since()`, there is an inherent ~30-50ns measurement overhead added to every op).*
 
 **Estimated True Latency (Overhead Removed):**
 - **p50 (Median)**: ~210 ns
 - **p99**: ~960 ns
-- **p99.9**: ~12.9 µs
+- **p99.9**: **~1.37 µs** 
 
-Check out [BENCHMARK.md](BENCHMARK.md) for the full raw metrics!
+Check out [BENCHMARK.md](BENCHMARK.md) for the full raw metrics and a deep dive into why Go's `b.RunParallel` obscures true scaling!
 
 ## So How Does It Work?
 
