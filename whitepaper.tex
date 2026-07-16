@@ -98,7 +98,7 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2
 
 \begin{enumerate}
     \item \textbf{Off-Heap HashMap:} An open-addressed hash map backed by an mmap-allocated region~\cite{mmap2015}. Because mmap allocations are outside the Go heap, the GC scanner does not traverse them, eliminating pointer scanning overhead for the entire index structure.
-    \item \textbf{Fixed-Width Value Arrays:} The SoA slices holding methods, paths, and params are allocated once at initialization time. They are fixed-assignment slots rather than append-growing structures, bounding GC root growth to a constant determined at construction.
+    \item \textbf{Fixed-Width Value Arrays:} The SoA slices holding methods, paths, and params are allocated once at initialization time. They are fixed-assignment slots rather than append-growing structures, bounding GC root growth to a constant determined at construction. It should be explicitly noted that while the hash map indices and slice headers are removed from the GC root set, the underlying byte payloads of Go \texttt{string} variables stored in these arrays remain on the Go heap and are subject to GC scanning.
 \end{enumerate}
 
 \section{Related Work}
@@ -190,10 +190,10 @@ The key observation: if we partition the cache into chunks of exactly 64 entries
 A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$). The complete candidate set across all 64 slots is computed in a single bitwise expression:
 
 \begin{equation}
-C_k = \neg V_k \;\lor\; (V_k \;\land\; \neg A_k)
+C_k = \neg (V_k \;\land\; A_k)
 \end{equation}
 
-The index of the first candidate is extracted using the hardware Count Trailing Zeros (CTZ) instruction~\cite{inteltzcnt,armclz}---a single-cycle primitive on both x86\_64 (\texttt{TZCNT}) and ARM64 (\texttt{RBIT} + \texttt{CLZ}):
+The index of the first candidate is extracted using the hardware Count Trailing Zeros (CTZ) instruction~\cite{inteltzcnt,armclz}. It is crucial to handle platform-specific zero behavior: on x86\_64, \texttt{TZCNT} returns 64 when the input is zero, whereas on ARM64, \texttt{RBIT} + \texttt{CLZ} requires an explicit branch or zero-check. When a non-zero candidate mask exists:
 
 \begin{equation}
 i^* = \text{CTZ}(C_k)
@@ -201,7 +201,10 @@ i^* = \text{CTZ}(C_k)
 
 This replaces an $\mathcal{O}(N)$ sequential scan over $N$ atomic loads with two register-width bitwise operations and one hardware intrinsic, bounding eviction search to a strict hardware-constant time within any chunk.
 
-If $C_k = 0$, it indicates all valid slots in the current chunk have been recently accessed. The algorithm deterministically falls back to a second-chance pass: it atomically clears the accessed bitmask ($A_k \leftarrow 0$) for the chunk and seamlessly advances to the next contiguous chunk. This guarantees progress and bounds the worst-case scan length.
+If $C_k = 0$, it indicates all valid slots in the current chunk have been recently accessed. The algorithm deterministically falls back to a second-chance pass: it atomically clears the accessed bitmask ($A_k \leftarrow 0$) for the chunk and seamlessly advances to the next contiguous chunk. 
+
+\textbf{Writer Progress and Claim Protocol.}
+To safely claim the selected bit $i$ for eviction, the writer executes an atomic Compare-And-Swap (CAS) on a \texttt{writing} bitmask for the chunk. If two concurrent writers compute the same $\text{CTZ}(C_k)$ candidate index, only one will succeed in the CAS. The loser immediately retries the chunk, naturally falling through to the next available zero bit. To guarantee progress and bound the worst-case scenario where a chunk is highly contended or fully occupied, the eviction search places a hard upper bound of $N_k$ chunk scans (one full ring traversal) before aborting, though in practice the clearing of access bits ensures an eviction candidate surfaces rapidly.
 
 \subsection{Eliminating the Global Clock Hand}
 
@@ -213,7 +216,7 @@ We require that \texttt{Get} operations never block on an ongoing \texttt{Add}, 
 
 \textbf{Write Protocol:} A writer sets $S_i \leftarrow S_i + 1$ (making it odd). After completing the write, it sets $S_i \leftarrow S_i + 1$ (returning to even).
 
-\textbf{Read Protocol:} A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, the slot is being written; report a miss immediately. Read the data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, a concurrent write occurred; report a miss. Otherwise, the read is consistent.
+\textbf{Read Protocol:} A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, the slot is being written; report a miss immediately. Read the data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, a concurrent write occurred; report a miss. Finally, check if the bitmask is valid: if $V_k[i] = 0$, report a miss. Otherwise, the read is consistent.
 
 \textbf{Concurrent Hash Map Consistency.} Since \texttt{liteLRU} relies on an open-addressed hash map for indexing, eviction requires a strict ordering to prevent races where a reader observes a valid hash pointer but reads torn data. The writer protocol is:
 \begin{enumerate}
@@ -259,7 +262,7 @@ This is a direct consequence of Amdahl's Law~\cite{amdahl1967}. Let $f$ be the s
 S(N) = \frac{1}{\,(1-f) + \dfrac{f}{N}\,}
 \end{equation}
 
-When the operation time $T_\text{op}$ is comparable to the atomic latency $T_\text{atomic}$ ($\sim$20--40~ns including RFO round-trip), the \texttt{pb.Next()} counter constitutes $f \to 1$, forcing $S(N) \to 1$ regardless of $N$. The result is an apparent \textit{decrease} in throughput with additional cores---a benchmark artifact, not a property of the algorithm.
+When the operation time $T_\text{op}$ is comparable to the atomic latency $T_\text{atomic}$ ($\sim$20--40~ns including RFO round-trip), the contention on the central \texttt{pb.Next()} counter dominates. Using Amdahl's framework for parallel scaling~\cite{amdahl1967}, this acts as an enforced sequential bottleneck, forcing $S(N) \to 1$ regardless of $N$. The result is an apparent \textit{decrease} in throughput with additional cores---a benchmark artifact, not a property of the algorithm.
 
 Our custom latency evaluation bypasses \texttt{pb.Next()} entirely. Each goroutine operates an independent tight loop over a pre-allocated, fixed-size key array with no shared iteration counter, eliminating the artifact and isolating the cache mechanics.
 
@@ -268,6 +271,24 @@ Our custom latency evaluation bypasses \texttt{pb.Next()} entirely. Each gorouti
 \textbf{Platform:} Apple M2, 8-core ARM64, macOS. Go 1.25.7. Cache capacity 1024, maxParams 20.
 
 \textbf{Workload:} 8 concurrent workers, $1.6 \times 10^6$ total operations, 80\% \texttt{Get} / 20\% \texttt{Add}, paths drawn from a pool of 1000 distinct routes yielding $\approx$70\% hit ratio.
+
+\subsection{Baseline Comparison}
+
+To substantiate the benefits of \texttt{liteLRU}'s bitmask and padding architectures, we benchmarked it against a standard Mutex-protected doubly-linked list LRU and the production-grade \texttt{dgraph-io/ristretto} cache. The benchmark utilized 8 concurrent workers processing 1.6M requests under identical 80/20 Get/Add Zipfian-aligned hit rates (70\%).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrc@{}}
+\toprule
+\textbf{Cache Implementation} & \textbf{Ops/sec} & \textbf{Scaling Factor} \\ \midrule
+\texttt{liteLRU} (Bitmask CLOCK) & 31,625,240       & 1.00$\times$            \\
+\texttt{ristretto} (BP-Wrapper)  & 13,758,346       & 0.43$\times$            \\
+\texttt{Mutex LRU} (Naive)       & 5,900,272        & 0.18$\times$            \\ \bottomrule
+\end{tabular}
+\caption{Baseline throughput comparison against production caches.}
+\end{table}
+
+\texttt{liteLRU} demonstrates a $>$5$\times$ throughput advantage over the naive Mutex LRU, and $>$2.2$\times$ over the highly optimized \texttt{ristretto} concurrent cache.
 
 \subsection{Throughput Scaling}
 
@@ -321,7 +342,7 @@ x86\_64               & 8              & 13{,}155{,}469                  \\ \bot
 
 \textbf{Memory Overhead.} The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths), which is acceptable for caches holding megabytes of data but potentially wasteful for caches scaling into the billions of extremely small elements.
 
-\textbf{Hit Rate vs. True LRU.} The Chunked Bitmask algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. We defer comprehensive hit-rate evaluations (e.g., against \texttt{ristretto} under Zipfian distributions) to future work. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
+\textbf{Hit Rate vs. True LRU.} The Chunked Bitmask algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. Although our 80/20 benchmark achieved comparable hit rates across all evaluated caches, we defer comprehensive hit-rate evaluations across broader Zipfian distributions to future work. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
 
 \textbf{Fixed Capacity.} The cache does not resize. The hash map is pre-allocated at construction. This prevents any allocation or growth during steady-state execution but requires the caller to correctly provision capacity at initialization time.
 
