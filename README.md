@@ -234,9 +234,9 @@ The design of `liteLRU` is grounded in the following computer science literature
 
 [5] Yang, J. et al. "FIFO Queues are All You Need for Cache Eviction." *SOSP '23*, ACM, 2023. https://doi.org/10.1145/3600006.3613147
 
-[6] Zhang, Y. et al. "SIEVE is Simpler than LRU." *USENIX NSDI*, 2024.
+[6] Zhang, Y. et al. "SIEVE is Simpler than LRU." *USENIX NSDI*, 2024. https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo
 
-[7] Bolosky, W. J. and Scott, M. L. "False Sharing and Its Effect on Shared Memory Performance." *USENIX*, 1993.
+[7] Bolosky, W. J. and Scott, M. L. "False Sharing and Its Effect on Shared Memory Performance." *USENIX*, 1993. https://dl.acm.org/doi/10.5555/1295415.1295418
 
 [8] Herlihy, M. and Shavit, N. "The Art of Multiprocessor Programming." *ACM PODC*, 2004. https://doi.org/10.1145/1011767.1011768
 
@@ -244,6 +244,6 @@ The design of `liteLRU` is grounded in the following computer science literature
 
 [10] Hudson, R. L. "Go GC: Prioritizing Low Latency and Simplicity." Go Blog, 2015. https://go.dev/blog/ismmkeynote
 
-[11] Intel Corporation. "Intel 64 and IA-32 Architectures Software Developer's Manual, TZCNT Instruction." 2023.
+[11] Intel Corporation. "Intel 64 and IA-32 Architectures Software Developer's Manual, TZCNT Instruction." 2023. https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
 
-[12] ARM Limited. "ARM Architecture Reference Manual: CLZ Instruction." DDI 0487, 2023.
+[12] ARM Limited. "ARM Architecture Reference Manual: CLZ Instruction." DDI 0487, 2023. https://developer.arm.com/documentation/ddi0487/latest/

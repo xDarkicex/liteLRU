@@ -268,21 +268,21 @@ We have presented the hardware-grounded derivation of each principal design deci
 [5] Yang, J., Zhang, Y., Qiu, Z., Yue, Y., and Rashmi, K. V. "FIFO Queues are All You Need for Cache Eviction." *Proceedings of the 29th Symposium on Operating Systems Principles (SOSP '23)*, ACM, 2023. https://doi.org/10.1145/3600006.3613147
 
 <a name="ref-sieve"></a>
-[6] Zhang, Y., Yang, J., Yue, Y., Vigfusson, Y., and Rashmi, K. V. "SIEVE is Simpler than LRU: An Efficient Turn-Key Eviction Algorithm for Web Caches." *Proceedings of the 21st USENIX NSDI*, 2024.
+[6] Zhang, Y., Yang, J., Yue, Y., Vigfusson, Y., and Rashmi, K. V. "SIEVE is Simpler than LRU: An Efficient Turn-Key Eviction Algorithm for Web Caches." *Proceedings of the 21st USENIX NSDI*, 2024. https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo
 
 <a name="ref-soa"></a>
-[7] Sung, I., Bilgic, K., Dursun, A., Narumi, T., and Seinfeld, J. "A Scalable Data Format for High-Performance Molecular Dynamics." *ACM/IEEE Supercomputing Conference (SC)*, 2009.
+[7] Sung, I., Bilgic, K., Dursun, A., Narumi, T., and Seinfeld, J. "A Scalable Data Format for High-Performance Molecular Dynamics." *ACM/IEEE Supercomputing Conference (SC)*, 2009. https://dl.acm.org/doi/10.1145/1654059.1654101
 
 <a name="ref-falsesharing"></a>
-[8] Bolosky, W. J. and Scott, M. L. "False Sharing and Its Effect on Shared Memory Performance." *USENIX Conference on Experiences with Distributed and Multiprocessor Systems*, 1993.
+[8] Bolosky, W. J. and Scott, M. L. "False Sharing and Its Effect on Shared Memory Performance." *USENIX Conference on Experiences with Distributed and Multiprocessor Systems*, 1993. https://dl.acm.org/doi/10.5555/1295415.1295418
 
 <a name="ref-gogc"></a>
 [9] Hudson, R. L. "Go GC: Prioritizing Low Latency and Simplicity." Go Blog / GoSF Meetup, 2015. https://go.dev/blog/ismmkeynote
 
 <a name="ref-tzcnt"></a>
-[10] Intel Corporation. "Intel 64 and IA-32 Architectures Software Developer's Manual, Vol. 2: Instruction Set Reference, TZCNT Instruction." No. 325383-078US, 2023.
+[10] Intel Corporation. "Intel 64 and IA-32 Architectures Software Developer's Manual, Vol. 2: Instruction Set Reference, TZCNT Instruction." No. 325383-078US, 2023. https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
 
-[11] ARM Limited. "ARM Architecture Reference Manual: CLZ Instruction." No. DDI 0487, 2023.
+[11] ARM Limited. "ARM Architecture Reference Manual: CLZ Instruction." No. DDI 0487, 2023. https://developer.arm.com/documentation/ddi0487/latest/
 
 <a name="ref-lockfree"></a>
 [12] Herlihy, M. and Shavit, N. "The Art of Multiprocessor Programming." *ACM PODC*, 2004. https://doi.org/10.1145/1011767.1011768
