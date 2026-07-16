@@ -12,7 +12,7 @@
 
 ## Abstract
 
-We describe the design and implementation of `liteLRU`, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not *which items to evict*, but *how to perform eviction and recency tracking without serializing the CPU cores that share the cache*. We analyze why conventional data structures — doubly-linked lists, per-node reference counting, and AoS memory layouts — are structurally incompatible with the MESI cache coherency protocol [[1]](#ref-mesi) under concurrent access. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency [[9]](#ref-gogc). We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments [[7]](#ref-soa). We then derive the Chunked Bitmask CLOCK eviction algorithm [[3]](#ref-clock) from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $O(1)$ bulk state evaluation using a single hardware `CTZ` instruction [[10,11]](#ref-tzcnt). The resulting mechanism yields wait-free reads and contention-bounded writes. We contrast our approach against recent eviction policy research including S3-FIFO [[5]](#ref-s3fifo) and SIEVE [[6]](#ref-sieve), noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields p99.9 latency of ~1.5 µs under a contended parallel workload.
+We describe the design and implementation of `liteLRU`, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not *which items to evict*, but *how to perform eviction and recency tracking without serializing the CPU cores that share the cache*. We analyze why conventional data structures — doubly-linked lists, per-node reference counting, and AoS memory layouts — are structurally incompatible with the MESI cache coherency protocol [[1]](#ref-mesi) under concurrent access. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency [[9]](#ref-gogc). We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments [[7]](#ref-soa). We then derive the Chunked Bitmask CLOCK eviction algorithm [[3]](#ref-clock) from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $O(1)$ bulk state evaluation using a single hardware `CTZ` instruction [[10,11]](#ref-tzcnt). The resulting mechanism yields wait-free reads and contention-bounded writes. We contrast our approach against recent eviction policy research including S3-FIFO [[5]](#ref-s3fifo) and SIEVE [[6]](#ref-sieve), noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields p99.9 latency of ~1.5 µs under the fully instrumented scaling workload (see §9.3).
 
 ---
 
@@ -250,9 +250,9 @@ To substantiate the benefits of `liteLRU`'s bitmask and padding architectures, w
 | `ristretto` (BP-Wrapper)  | 10,557,365 | 292 ns      | 64.83 µs    |
 | `Mutex LRU` (Naive)       |  3,955,855 | 458 ns      | 50.58 µs    |
 
-*Note: Latency percentiles were sampled at a 1% rate to preserve realistic throughput levels during measurement.*
+*Note: Latency percentiles in this table were sampled at a 1% rate to preserve realistic throughput levels during measurement. This 1% sampling interval (and the different API harness) captures a slightly different distribution and higher median than the fully instrumented microbenchmark in §9.3.*
 
-`liteLRU` demonstrates a >5x throughput advantage over the naive Mutex LRU, and >2.2x over the highly optimized `ristretto` concurrent cache.
+`liteLRU` demonstrates an $\approx$8x throughput advantage over the naive Mutex LRU, and a $\approx$3.0x throughput advantage over the highly optimized `ristretto` concurrent cache. Furthermore, `liteLRU` trades a slightly higher median latency (583 ns vs 292 ns) for a much tighter tail (p99 1.83 µs vs 64.8 µs). This is an expected and highly competitive tradeoff: `ristretto` absorbs common-path operations into background buffers for a fast median, but suffers severe tail latency during concurrent buffer flushes. `liteLRU` instead performs synchronous, bounded writes.
 
 ### 9.2 Throughput Scaling
 
@@ -287,16 +287,16 @@ The max is dominated by OS scheduling jitter on at least one of the 8 goroutines
 To mathematically validate the architectural decisions behind `liteLRU`, we benchmarked the full implementation against three stripped-down variants under the identical 8-core 80/20 workload:
 - **No Padding**: Removed the 64-byte padding from seqlocks and stripe counters, inducing false sharing.
 - **No Bitmask**: Replaced the O(1) `CTZ` intrinsic with a naive 64-iteration `for` loop.
-- **No Mmap**: Replaced the off-heap lock-free hash map with a standard Go `map` protected by a `sync.RWMutex`.
+- **No Lock-Free Index**: Replaced the off-heap lock-free hash map with a standard Go `map` protected by a `sync.RWMutex`.
 
 | Variant                   | Ops/sec    | Throughput Loss |
 |---------------------------|-----------:|----------------:|
 | `liteLRU` (Full)          | 32,024,792 | —               |
 | No Bitmask (Linear Scan)  | 29,034,906 | -9%             |
 | No Padding (False Share)  | 19,407,171 | -39%            |
-| No Mmap (Go Map + Mutex)  |  4,280,582 | -87%            |
+| No Lock-Free (Map+Mutex)  |  4,280,582 | -87%            |
 
-The ablation proves that while the bitmask hardware acceleration provides a measurable 9% optimization, the true structural requirements for scaling are the cache-line isolation (-39% without it) and the off-heap lock-free memory (-87% without it).
+The ablation supports the conclusion that while the bitmask hardware acceleration provides a measurable 9% optimization, the true structural requirements for scaling are the cache-line isolation (-39% without it) and the lock-free memory indexing (-87% without it, though this confounds both the mutex overhead and the Go map overhead).
 
 ### 9.5 x86_64 Smoke Test
 
