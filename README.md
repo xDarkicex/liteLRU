@@ -56,7 +56,7 @@ func main() {
     }
     
     // How's our cache performing?
-    hits, misses, ratio := cache.Stats()
+    hits, misses, _, ratio := cache.Stats()
     fmt.Printf("Hit ratio: %.2f%% - Not bad!\n", ratio*100)
 }
 ```
@@ -96,7 +96,7 @@ handler, params, found := cache.Get(method, path string)
 cache.Clear()
 
 // How's it performing?
-hits, misses, ratio := cache.Stats()
+hits, misses, _, ratio := cache.Stats()
 ```
 
 ## The Numbers Will Blow Your Mind

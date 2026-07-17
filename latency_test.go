@@ -91,7 +91,7 @@ func TestConcurrentLatency(t *testing.T) {
 	p100 := allDurations[totalOps-1]
 	
 	// Atomic hits/misses check
-	hits, misses, ratio := cache.Stats()
+	hits, misses, _, ratio := cache.Stats()
 
 	fmt.Printf("\n--- LATENCY RESULTS ---\n")
 	fmt.Printf("Total Time     : %v\n", totalDuration)

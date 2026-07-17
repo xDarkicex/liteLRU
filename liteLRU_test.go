@@ -152,7 +152,7 @@ func BenchmarkLRUCache(b *testing.B) {
 
 				// Report actual hit/miss ratio for validation
 				// This helps verify that our test is achieving the target hit ratio
-				h, m, ratio := cache.Stats()
+				h, m, _, ratio := cache.Stats()
 				b.ReportMetric(ratio*100, "hit%")
 				b.ReportMetric(float64(h+m)/float64(b.N)*100, "coverage%")
 			})
@@ -229,7 +229,7 @@ func BenchmarkLRUCache(b *testing.B) {
 				}
 
 				// Report the actual hit ratio achieved during the test
-				_, _, ratio := cache.Stats()
+				_, _, _, ratio := cache.Stats()
 				b.ReportMetric(ratio*100, "hit%")
 			})
 		}

@@ -70,7 +70,8 @@ func main() {
 		}
 		wg.Wait()
 		duration := time.Since(start)
-		fmt.Printf("liteLRU   Ops/sec: %d\n", int(float64(numOps)/duration.Seconds()))
+		_, _, drops, _ := lite.Stats()
+		fmt.Printf("liteLRU   Ops/sec: %d (Drops: %d)\n", int(float64(numOps)/duration.Seconds()), drops)
 
 		// Otter
 		otterCache, _ := otter.MustBuilder[string, any](1024).Build()

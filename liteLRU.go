@@ -55,19 +55,20 @@ type chunk struct {
 	_        [32]byte         // pad to 128 bytes total
 }
 
-// slotState holds the seqlock, padded to a full 64-byte cache line
+// slotState holds the seqlock, padded to a full cache line
 // to completely eliminate false-sharing during concurrent writes.
 type slotState struct {
 	seq atomic.Uint32
-	_   [60]byte
+	_   [CacheLineSize - 4]byte
 }
 
-// statStripe shards cache statistics across 64 independent cache lines
+// statStripe shards cache statistics across independent cache lines
 // to prevent global atomic contention during high-throughput parallel access.
 type statStripe struct {
 	hits   atomic.Int64
 	misses atomic.Int64
-	_      [48]byte
+	drops  atomic.Int64
+	_      [CacheLineSize - 24]byte
 }
 
 //go:nosplit
@@ -302,6 +303,7 @@ func (c *LRUCache) findVictim(group uint32) uint32 {
 func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param) {
 	hash := hashRoute(method, path)
 	group := uint32(hash % uint64(c.numGroups))
+	stripeIdx := hash & 63
 	chk := &c.chunks[group]
 
 	sig8 := uint8(hash >> 32)
@@ -327,6 +329,7 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 						// Found it! Try to lock and overwrite.
 						seq := c.states[idx].seq.Load()
 						if seq%2 != 0 || !c.states[idx].seq.CompareAndSwap(seq, seq+1) {
+							c.stats[stripeIdx].drops.Add(1)
 							return // Someone else is updating it, drop our redundant update
 						}
 
@@ -355,6 +358,7 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 	// 2. Not found, we need to evict a victim from this 64-slot set
 	victimIdx := c.findVictim(group)
 	if victimIdx == 0xFFFFFFFF {
+		c.stats[stripeIdx].drops.Add(1)
 		return // Load shedding: chunk is highly contended, skip cache insertion
 	}
 	bit := victimIdx % 64
@@ -541,11 +545,12 @@ func (c *LRUCache) Clear() {
 	}
 }
 
-// Stats returns cache hit/miss statistics.
-func (c *LRUCache) Stats() (hits, misses int64, ratio float64) {
+// Stats returns cache hit/miss/drop statistics.
+func (c *LRUCache) Stats() (hits, misses, drops int64, ratio float64) {
 	for i := 0; i < 64; i++ {
 		hits += c.stats[i].hits.Load()
 		misses += c.stats[i].misses.Load()
+		drops += c.stats[i].drops.Load()
 	}
 	total := hits + misses
 	if total > 0 {

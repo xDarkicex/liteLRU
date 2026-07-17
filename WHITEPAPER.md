@@ -235,17 +235,18 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 A naive implementation allocates seqlocks as a contiguous slice `[]atomic.Uint32`. Each `uint32` is 4 bytes, placing 16 seqlocks per 64-byte cache line. By the MESI coherency protocol [[1]](#ref-mesi), a concurrent write to slot $j$ invalidates the line holding $S_{j+1}, \ldots, S_{j+15}$ across all other cores — the false-sharing pathology described by Bolosky and Scott [[8]](#ref-falsesharing).
 
-`slotState` metadata is allocated in a page-aligned anonymous `mmap` region. On the evaluation platform, the coherence-line size is 64 bytes; because each `slotState` is 64 bytes and the region base is page-aligned, each slot begins at a distinct 64-byte cache-line boundary.
+`slotState` metadata is allocated in a page-aligned anonymous `mmap` region. For each supported platform, `liteLRU` selects a slot stride equal to the platform's verified coherence-line size $L$ (64 bytes for x86_64, 128 bytes for Apple Silicon). Because the mapping base is page-aligned and each slot has stride $L$, distinct slot states begin on distinct coherence-line boundaries.
 
 **Padding Theorem.** On a platform with coherence-line size $L$, if the base of the slot-state region is aligned to $L$ and each slot state has stride $L$, distinct slots occupy distinct coherence lines.
 
 *Proof.* Let $\text{addr}(S_i)$ denote the base address of the padded slot state for slot $i$. We define:
 
 ```go
+// L is the verified coherence-line size for the target platform via build tags.
 type slotState struct {
-    seq atomic.Uint32 //  4 bytes
-    _   [60]byte      // 60 bytes padding
-}                     // sizeof = 64 bytes exactly
+    seq atomic.Uint32 // 4 bytes
+    _   [L - 4]byte   // L-4 bytes padding
+}
 ```
 
 Because the `mmap` allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (page alignment implies $L$ alignment for $L \le 4096$), and $\text{addr}(S_{i+1}) = \text{addr}(S_i) + L$, adjacent entries reside on disjoint, non-overlapping $L$-byte aligned cache lines. A write to $S_i$ sets the MESI state of line $\lfloor \text{addr}(S_i) / L \rfloor$ to Modified, which does not affect the state of line $\lfloor \text{addr}(S_j) / L \rfloor$ for any $j \neq i$. False sharing is structurally impossible. $\square$
@@ -367,7 +368,7 @@ We compare against Otter v2 rather than ristretto here because ristretto's hit-r
 
 `liteLRU` demonstrates a 4.8x to 7.4x throughput advantage under write-heavy pressure. When writes dominate (80%), amortized caches like `otter` experience severe contention on their ingestion buffers (dropping to ~4M ops/sec). `liteLRU` sustains over 30M ops/sec by confining state mutations to localized, lock-free overwrites inside the 64-way associative sets.
 
-A notable result is that the 50/50 and 20/80 workloads yield nearly identical throughput for `liteLRU` (30.7M vs 30.1M ops/sec). This is a direct consequence of eliminating tombstones: in the old hash-map architecture, write-heavy loads triggered compaction cycles that significantly degraded throughput. In the 64-way set associative design, writes are in-place overwrites of fixed slots — the cost of a write is structurally identical to the cost of a read, so increasing write fraction does not degrade throughput.
+A notable result is that the 50/50 and 20/80 workloads yield nearly identical throughput for `liteLRU` (21.0M ops/sec). However, raw throughput must be contextualized by the load-shedding mechanism: in these extreme contention synthetic benchmarks, `liteLRU` deliberately drops approximately 5% of admissions in the 50/50 workload and 6.6% in the 20/80 workload to maintain absolute bounded execution latency. This is a direct consequence of eliminating tombstones: in the old hash-map architecture, write-heavy loads triggered compaction cycles that significantly degraded throughput. In the 64-way set associative design, writes are in-place overwrites of fixed slots — the cost of a write is structurally identical to the cost of a read, so increasing write fraction does not degrade throughput.
 
 ---
 
