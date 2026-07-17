@@ -235,7 +235,9 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 A naive implementation allocates seqlocks as a contiguous slice `[]atomic.Uint32`. Each `uint32` is 4 bytes, placing 16 seqlocks per 64-byte cache line. By the MESI coherency protocol [[1]](#ref-mesi), a concurrent write to slot $j$ invalidates the line holding $S_{j+1}, \ldots, S_{j+15}$ across all other cores — the false-sharing pathology described by Bolosky and Scott [[8]](#ref-falsesharing).
 
-**Padding Theorem.** If each $S_i$ occupies exactly one 64-byte cache line, concurrent operations on any two distinct slots $i \neq j$ produce no MESI coherency traffic between the cache lines of $S_i$ and $S_j$.
+`slotState` metadata is allocated in a page-aligned anonymous `mmap` region. On the evaluation platform, the coherence-line size is 64 bytes; because each `slotState` is 64 bytes and the region base is page-aligned, each slot begins at a distinct 64-byte cache-line boundary.
+
+**Padding Theorem.** On a platform with coherence-line size $L$, if the base of the slot-state region is aligned to $L$ and each slot state has stride $L$, distinct slots occupy distinct coherence lines.
 
 *Proof.* Let $\text{addr}(S_i)$ denote the base address of the padded slot state for slot $i$. We define:
 
@@ -246,7 +248,7 @@ type slotState struct {
 }                     // sizeof = 64 bytes exactly
 ```
 
-Since $\text{addr}(S_{i+1}) = \text{addr}(S_i) + 64$, adjacent entries reside on disjoint, non-overlapping 64-byte aligned cache lines. A write to $S_i$ sets the MESI state of line $\lfloor \text{addr}(S_i) / 64 \rfloor$ to Modified, which does not affect the state of line $\lfloor \text{addr}(S_j) / 64 \rfloor$ for any $j \neq i$. False sharing is structurally impossible. $\square$
+Because the `mmap` allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (page alignment implies $L$ alignment for $L \le 4096$), and $\text{addr}(S_{i+1}) = \text{addr}(S_i) + L$, adjacent entries reside on disjoint, non-overlapping $L$-byte aligned cache lines. A write to $S_i$ sets the MESI state of line $\lfloor \text{addr}(S_i) / L \rfloor$ to Modified, which does not affect the state of line $\lfloor \text{addr}(S_j) / L \rfloor$ for any $j \neq i$. False sharing is structurally impossible. $\square$
 
 It is important to note that the 64-bit bitmasks ($V_k$, $A_k$, $W_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
 
