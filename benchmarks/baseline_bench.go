@@ -50,7 +50,7 @@ func main() {
 	oCache, _ := otter.MustBuilder[string, any](capacity).Build()
 	runBench(ops, numWorkers, func(key string) {
 		oCache.Get(key)
-	}, func(key string, nil) {
+	}, func(key string) {
 		oCache.Set(key, 1)
 	})
 
@@ -59,7 +59,7 @@ func main() {
 	mCache := newMutexLRU(capacity)
 	runBench(ops, numWorkers, func(key string) {
 		mCache.Get(key)
-	}, func(key string, nil) {
+	}, func(key string) {
 		mCache.Add(key, 1)
 	})
 }

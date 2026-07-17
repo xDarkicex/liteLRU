@@ -92,7 +92,7 @@ func main() {
 						otterHits.Add(1)
 					} else {
 						otterMisses.Add(1)
-						otterCache.Set(key, nil, nil)
+						otterCache.Set(key, nil)
 					}
 				}
 				wg.Done()

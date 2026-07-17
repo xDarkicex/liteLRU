@@ -146,24 +146,21 @@ type LRUCache struct {
 	capacity  uint32
 	maxParams int
 
-	// Structure of Arrays (SoA) backed by off-heap mmap memory.
-	// The GC never scans these; no write barriers on Store operations.
+	// Structure of Arrays (SoA) allocated on the Go heap so the GC can safely manage
+	// dynamic strings and slice pointers.
 	methods  []atomicString
 	paths    []atomicString
 	handlers []atomicHandler
 	params   []atomicSlice
 
-	// Concurrency control
+	// Concurrency control structures (no pointers), backed by off-heap mmap memory.
+	// This avoids GC write barriers and scanning overhead during dense bitmask/seqlock operations.
 	states []slotState // padded seqlocks to prevent read-tearing
 	chunks []chunk     // padded bitmasks and SWAR signatures (64 slots per chunk)
 
 	// Raw mmap slabs — held for Munmap on Close()
-	methodsSlab  []byte
-	pathsSlab    []byte
-	handlersSlab []byte
-	paramsSlab   []byte
-	statesSlab   []byte
-	chunksSlab   []byte
+	statesSlab []byte
+	chunksSlab []byte
 
 	numGroups uint32
 	stats     [64]statStripe
@@ -216,37 +213,33 @@ func NewLRUCache(capacity, maxParams int) *LRUCache {
 
 	numGroups := uint32(capacity / 64)
 
-	methods, methodsSlab := mmapSlice[atomicString](capacity)
-	paths, pathsSlab := mmapSlice[atomicString](capacity)
-	handlers, handlersSlab := mmapSlice[atomicHandler](capacity)
-	params, paramsSlab := mmapSlice[atomicSlice](capacity)
+	methods := make([]atomicString, capacity)
+	paths := make([]atomicString, capacity)
+	handlers := make([]atomicHandler, capacity)
+	params := make([]atomicSlice, capacity)
+
 	states, statesSlab := mmapSlice[slotState](capacity)
 	chunks, chunksSlab := mmapSlice[chunk](int(numGroups))
 
 	return &LRUCache{
-		capacity:     uint32(capacity),
-		maxParams:    maxParams,
-		methods:      methods,
-		paths:        paths,
-		handlers:     handlers,
-		params:       params,
-		states:       states,
-		chunks:       chunks,
-		methodsSlab:  methodsSlab,
-		pathsSlab:    pathsSlab,
-		handlersSlab: handlersSlab,
-		paramsSlab:   paramsSlab,
-		statesSlab:   statesSlab,
-		chunksSlab:   chunksSlab,
-		numGroups:    numGroups,
+		capacity:   uint32(capacity),
+		maxParams:  maxParams,
+		methods:    methods,
+		paths:      paths,
+		handlers:   handlers,
+		params:     params,
+		states:     states,
+		chunks:     chunks,
+		statesSlab: statesSlab,
+		chunksSlab: chunksSlab,
+		numGroups:  numGroups,
 	}
 }
 
 // Close releases all off-heap mmap slabs. The cache must not be used after Close.
 func (c *LRUCache) Close() {
 	for _, slab := range [][]byte{
-		c.methodsSlab, c.pathsSlab, c.handlersSlab,
-		c.paramsSlab, c.statesSlab, c.chunksSlab,
+		c.statesSlab, c.chunksSlab,
 	} {
 		if slab != nil {
 			memory.Munmap(slab)

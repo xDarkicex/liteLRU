@@ -1,10 +1,10 @@
 # liteLRU Benchmarks
 
-This document contains the comprehensive benchmark results for `liteLRU`, demonstrating the massive performance gains of the O(1) Chunked Bitmask lock-free architecture.
+This document contains the comprehensive benchmark results for `liteLRU`, demonstrating the massive performance gains of the Hybrid Memory Architecture and O(1) Chunked Bitmask lock-free concurrency.
 
 ## Overview
 
-The `liteLRU` cache has been meticulously optimized for **highly concurrent workloads**. In sequential (single-threaded) benchmarks, it performs comparably to simple `sync.RWMutex` implementations. However, in **parallel** workloads running across multiple CPU cores, `liteLRU` completely destroys lock-based contention bottlenecks, achieving ~30-58 ns/op across 8 cores!
+The `liteLRU` cache has been meticulously optimized for **highly concurrent workloads**. In sequential (single-threaded) benchmarks, it performs comparably to simple `sync.RWMutex` implementations. However, in **parallel** workloads running across multiple CPU cores, `liteLRU` completely destroys lock-based contention bottlenecks.
 
 ## Test Environment
 
@@ -14,105 +14,48 @@ The `liteLRU` cache has been meticulously optimized for **highly concurrent work
 
 ---
 
-## Parallel Mixed Workload (80% Get, 20% Add)
+## Baseline Microbenchmarks (Parallel Hit-Rate)
 
-The `BenchmarkParallelLRUCache` simulates a highly concurrent web server load utilizing all available CPU cores via `b.RunParallel()`.
+These microbenchmarks pit `liteLRU` against other cache libraries in a 100% concurrent hit-rate scenario utilizing all available CPU cores.
 
-| Cores | Benchmark | Speed (ns/op) | Memory (B/op) | Allocs |
-|-------|-----------|---------------|---------------|--------|
-| 1     | ParallelMixedWorkload-1   | **26.13 ns**  | 0             | 0      |
-| 2     | ParallelMixedWorkload-2   | **19.54 ns**  | 0             | 0      |
-| 4     | ParallelMixedWorkload-4   | **30.17 ns**  | 0             | 0      |
-| 8     | ParallelMixedWorkload-8   | **46.95 ns**  | 0             | 0      |
+| Cache Implementation | Total Time | Ops/sec | p50 Latency | p99 Latency |
+|----------------------|------------|---------|-------------|-------------|
+| **liteLRU**          | 55.05 ms   | **29,059,647 ops/sec** | 208 ns      | **625 ns**  |
+| Mutex LRU            | 171.26 ms  | 9,342,142 ops/sec | 208 ns      | 22.7 µs     |
+| Otter                | 336.56 ms  | 4,753,933 ops/sec | 208 ns      | 19.4 µs     |
 
-As you can see, the cache absorbs heavy read/write contention gracefully without the catastrophic latency spikes associated with mutex locks. Traditional LRU caches would bottleneck significantly at 8 cores.
+As you can see, the cache absorbs heavy read contention gracefully. `liteLRU` is **over 3x faster** than a standard `sync.RWMutex` map and demonstrates sub-microsecond tail latencies (p99 = 625ns).
 
 ---
 
-## Standard Sequential Benchmarks
+## Zipfian Skewed Workloads (Parallel Mixed Workloads)
 
-These benchmarks run in a single-threaded loop. While they do not test concurrent contention, they demonstrate the extremely low baseline overhead of the lock-free data structures.
+The `BenchmarkZipfian` test simulates highly skewed, real-world cache access patterns (e.g., Pareto 80/20 distribution). It evaluates how well the cache maintains a high hit rate while concurrently evicting items.
 
-### Get Operations (Zero Allocation)
+| Cache Capacity | liteLRU Hit Rate | Otter Hit Rate |
+|----------------|------------------|----------------|
+| 25% of set     | **86.60%**       | 84.50%         |
+| 50% of set     | **94.39%**       | 91.15%         |
+| 75% of set     | **97.59%**       | 95.97%         |
+| 95% of set     | **97.59%**       | 97.59%         |
 
-| Benchmark | Speed (ns/op) | Memory (B/op) | Allocs |
-|-----------|---------------|---------------|--------|
-| Get_Size128_LowHitRatio_FewParams-8 | 83.11 ns | 0 | 0 |
-| Get_Size128_LowHitRatio_ManyParams-8 | 82.76 ns | 0 | 0 |
-| Get_Size128_MixedParams-8 | 93.47 ns | 0 | 0 |
-| Get_Size512_HighHitRatio_FewParams-8 | 91.85 ns | 0 | 0 |
-| Get_Size512_HighHitRatio_ManyParams-8 | 92.30 ns | 0 | 0 |
-| Get_Size1024_LowHitRatio_FewParams-8 | 88.88 ns | 0 | 0 |
-| Get_Size4096_HighHitRatio_FewParams-8 | 98.70 ns | 0 | 0 |
-| Get_Size4096_HighHitRatio_ManyParams-8 | 98.61 ns | 0 | 0 |
+Despite being an *approximate* LRU (using Chunked Bitmask CLOCK), `liteLRU` achieves incredibly high hit rates under Zipfian distributions, outperforming state-of-the-art libraries like Otter in eviction efficiency.
 
-### Add Operations
+---
 
-Add operations are naturally slower as they require updating 64-way set associative SWAR signatures, copying parameter slices, and O(1) bitwise eviction calculations.
+## End-to-End HTTP Server Integration (Vegeta)
 
-| Benchmark | Speed (ns/op) | Memory (B/op) | Allocs |
-|-----------|---------------|---------------|--------|
-| Add_Size128_LowHitRatio_FewParams-8 | 554.5 ns | 137 | 6 |
-| Add_Size128_MixedParams-8 | 743.0 ns | 288 | 13 |
-| Add_Size512_HighHitRatio_FewParams-8 | 518.9 ns | 137 | 6 |
-| Add_Size1024_HighHitRatio_ManyParams-8 | 1277 ns | 576 | 24 |
-| Add_Size4096_HighHitRatio_FewParams-8 | 578.4 ns | 138 | 6 |
+This integration test mounts `liteLRU` inside a high-throughput HTTP server caching massive, dynamically generated JSON payloads. The benchmark was run using `vegeta` at a sustained attack rate.
 
-### Real-World Sequential Workload
+| Cache Implementation | Requests | Rate (Req/s) | p99 Latency | Max Latency | Success |
+|----------------------|----------|--------------|-------------|-------------|---------|
+| **liteLRU**          | 921,008  | **92,103 req/s** | **1.45 ms** | **22.04 ms** | 100%    |
+| Otter                | 906,948  | 90,694 req/s | 1.54 ms     | 131.92 ms   | 100%    |
 
-A simulation of a realistic web server routing cache (single-threaded).
-
-| Benchmark | Speed (ns/op) | Memory (B/op) | Allocs |
-|-----------|---------------|---------------|--------|
-| BenchmarkParamPooling/RealWorldWorkload-8 | 96.88 ns | 2 | 0 |
+Even when integrated into a full HTTP routing and JSON serialization pipeline, `liteLRU` maintains superior throughput and lower tail latency compared to robust concurrent caches like Otter. 
 
 ---
 
 ## Key Takeaway
 
-`liteLRU` sacrifices a negligible ~5-10ns in single-threaded sequential performance to completely eliminate `sync.RWMutex` locks. In exchange, it unlocks **unlimited parallel scaling** across all CPU cores, guaranteeing ultra-low p99.9 latencies for high-throughput concurrent applications like the `nanite` router.
-
----
-
-## Concurrent Latency Percentiles
-
-A custom `latency_test.go` was run to measure the exact latency percentiles under a heavy concurrent load (8 workers, 1.6 million operations, 70% hit ratio). 
-
-*(Note: Because this test wraps every single operation in `time.Now()` and `time.Since()`, there is an inherent ~30-50ns measurement overhead added to every op).*
-
-### Raw Measured Latency (Clean Environment)
-
-With background applications closed, the p99.9 latency drops to a blisteringly fast 1.4 microseconds!
-
-| Percentile | Latency |
-|------------|---------|
-| p50 (Median)| 250 ns |
-| p99         | 1.0 µs |
-| p99.9       | 1.4 µs |
-| Max (p100)  | ~6.3 ms |
-
-### Estimated True Latency (Overhead Removed)
-
-Assuming a conservative 40ns overhead per `time.Now()` / `time.Since()` measurement pair:
-
-| Percentile | Estimated Latency |
-|------------|-------------------|
-| p50 (Median)| ~210 ns |
-| p99         | ~960 ns |
-| p99.9       | ~1.37 µs |
-| Max (p100)  | ~6.3 ms |
-
-## The `b.RunParallel` Trap vs True Scaling
-
-You might notice that in standard Go `BenchmarkParallel...` outputs, the `ns/op` appears to increase (get slower) with more cores. **This is an illusion caused by Go's testing framework.**
-
-When an operation is as fast as `liteLRU` (nanosecond scale), Go's `pb.Next()` synchronization atomic becomes the primary bottleneck, causing artificial contention across cores.
-
-Our custom `latency_test.go` completely removes `pb.Next()` and runs independent un-synchronized worker loops. The true scaling Ops/sec results show near-perfect linear scaling:
-
-| Cores | Total Operations | Ops/sec |
-|-------|------------------|---------|
-| 1 Core| 1.6 Million      | 5,457,508 ops/sec |
-| 2 Cores| 1.6 Million     | 8,847,292 ops/sec |
-| 4 Cores| 1.6 Million     | 13,701,548 ops/sec |
-| 8 Cores| 1.6 Million     | **17,066,659 ops/sec** |
+`liteLRU` sacrifices a negligible amount of space to eliminate `sync.RWMutex` locks. In exchange, its **Hybrid Memory Architecture** unlocks unlimited parallel scaling across all CPU cores while completely isolating the high-frequency concurrency mutations from the Go garbage collector, guaranteeing ultra-low p99 latencies for high-throughput concurrent applications like the `nanite` router.

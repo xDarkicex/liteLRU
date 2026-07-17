@@ -82,7 +82,7 @@ func main() {
 					if ops[j].isGet {
 						otterCache.Get(ops[j].key)
 					} else {
-						otterCache.Set(ops[j].key, nil, nil)
+						otterCache.Set(ops[j].key, nil)
 					}
 				}
 				wg.Done()

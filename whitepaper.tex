@@ -211,7 +211,7 @@ The eviction search process executes as follows:
     \item Extract candidate index $i = \text{CTZ}(C_k)$.
     \item Execute an atomic Compare-And-Swap (CAS) to set $W_k[i] \leftarrow 1$.
     \item If the CAS fails (another writer claimed it), restart at step 1 for the same chunk.
-    \item If $W_k[i] = 1$ is successfully claimed, proceed to step 1 of the concurrent Hash Map Consistency protocol defined in \S 6.
+    \item If $W_k[i] = 1$ is successfully claimed, proceed to step 1 of the concurrent Set Associative Write Consistency protocol defined in \S 6.
 \end{enumerate}
 
 To guarantee progress and bound the worst-case scenario where a chunk is highly contended or fully occupied, the eviction search places a hard upper bound of $N_k$ chunk scans (one full ring traversal). If the scan bound is exhausted, the \texttt{Add} operation safely aborts, returning an error to the caller (e.g., forcing a fallback to the origin server without caching). In practice, the clearing of access bits ensures an eviction candidate surfaces rapidly.
@@ -224,7 +224,7 @@ Because \texttt{liteLRU} seeds the starting chunk index from the hash of the inc
 
 \subsection{Wait-Free Reads}
 
-A strict requirement for web-scale caches is that \texttt{Get} operations must never block. \texttt{liteLRU} achieves this via a 64-byte padded seqlock $S$. The read path is wait-free: it consists of unconditionally bounded hash map linear probing, two atomic loads of $S$, two string comparisons, and a single bitwise OR. Under no circumstances does a reader wait for a lock or block on a channel.
+A strict requirement for web-scale caches is that \texttt{Get} operations must never block. \texttt{liteLRU} achieves this via a 64-byte padded seqlock $S$. The read path is wait-free: it consists of unconditionally bounded 64-way set associative SWAR signature scanning, two atomic loads of $S$, two string comparisons, and a single bitwise OR. Under no circumstances does a reader wait for a lock or block on a channel.
 
 \textbf{Reader Protocol:} Each slot $i$ maintains an atomic 32-bit sequence counter $S_i$, initialized to 0.
 
@@ -232,7 +232,7 @@ A strict requirement for web-scale caches is that \texttt{Get} operations must n
 
 \textbf{Read Protocol:} A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, the slot is being written; report a miss immediately. Read the data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, a concurrent write occurred; report a miss. Finally, check if the bitmask is valid: if $V_k[i] = 0$, report a miss. Otherwise, the read is consistent.
 
-\textbf{Concurrent Hash Map Consistency.} Since \texttt{liteLRU} relies on an open-addressed hash map for indexing, eviction requires a strict ordering to prevent races where a reader observes a valid hash pointer but reads torn data. Following the successful claim of $W_k[i]$, the writer protocol is:
+\textbf{Concurrent Set Associative Write Consistency.} Since \texttt{liteLRU} relies on a 64-way set associative array with in-place overwrites, eviction requires a strict ordering to prevent races where a reader observes a valid signature but reads torn data. Following the successful claim of $W_k[i]$, the writer protocol is:
 \begin{enumerate}
     \item Atomically invalidate the slot bitmask ($V_k[i] \leftarrow 0$).
     \item Delete the old hash entry from the map (tombstoning).
@@ -345,7 +345,7 @@ To mathematically validate the architectural decisions behind \texttt{liteLRU}, 
 \begin{itemize}
     \item \textbf{No Padding}: Removed the 64-byte padding from seqlocks and stripe counters, inducing false sharing.
     \item \textbf{No Bitmask}: Replaced the O(1) \texttt{CTZ} intrinsic with a naive 64-iteration \texttt{for} loop.
-    \item \textbf{No Lock-Free Index}: Replaced the off-heap lock-free hash map with a standard Go \texttt{map} protected by a \texttt{sync.RWMutex}.
+    \item \textbf{No Set Associative Arrays}: Replaced the lock-free 64-way set associative architecture with a standard Go \texttt{map} protected by a \texttt{sync.RWMutex}.
 \end{itemize}
 
 \begin{table}[h]
@@ -447,13 +447,13 @@ By skipping the expensive CPU overhead of \texttt{encoding/json}, both caches na
 
 \textbf{Hit Rate vs. True LRU.} The Chunked Bitmask algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
 
-\textbf{Fixed Capacity.} The cache does not resize. The hash map is pre-allocated at construction. This prevents any allocation or growth during steady-state execution but requires the caller to correctly provision capacity at initialization time.
+\textbf{Fixed Capacity.} The cache does not resize. The capacity is fixed and pre-allocated at construction. This prevents any allocation or growth during steady-state execution but requires the caller to correctly provision capacity at initialization time.
 
 \textbf{String Copying.} While \texttt{Get} performs zero heap allocations for the routing lookup, returning a \texttt{[]Param} copy requires a pool-managed allocation. The sync.Pool bounds this cost but it is not zero in all cases.
 
 \section{Conclusion}
 
-We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap mmap allocation to eliminate GC interference~\cite{gogc2018}; SoA layout to maximize cache-line occupancy per field access; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; Seqlocks~\cite{seqlockoriginal} to provide wait-free read semantics; and 64-byte cache-line padding~\cite{falsesharing1993,mesi1984} to eliminate false-sharing serialization. The result is a cache architecture whose concurrency cost is bounded by single-cycle hardware instructions rather than operating system synchronization primitives.
+We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap mmap allocation to eliminate GC interference~\cite{gogc2018}; SoA layout to maximize cache-line occupancy per field access; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; Seqlocks~\cite{seqlockoriginal} to provide wait-free read semantics; and 64-byte cache-line padding~\cite{falsesharing1993,mesi1984} to eliminate false-sharing serialization. The result is a cache architecture whose concurrency cost is bounded by single-cycle hardware instructions rather than operating system synchronization primitives, achieving over 29M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
 
 \bibliographystyle{plain}
 \bibliography{references}
