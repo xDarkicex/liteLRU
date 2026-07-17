@@ -61,7 +61,7 @@ To reason about concurrent cache design, we first establish a precise model of t
 
 A modern multi-core processor maintains a private L1 cache (typically 32--64 KiB, 4--5 cycle latency), a private L2 cache (256 KiB -- 1 MiB, $\sim$12 cycle latency), and a shared L3 cache (several MiB, $\sim$40 cycle latency). Main memory sits at approximately 200--300 cycles. The performance implication is stark: a single L1 cache miss costs roughly $40\times$ more than an L1 hit.
 
-The fundamental unit of coherency is the \textbf{cache line}, dependent on the target platform architecture (e.g., $L=64$ bytes on x86\_64, $L=128$ bytes on Apple Silicon). The CPU never fetches individual bytes; it fetches and writes back entire 64-byte lines.
+The fundamental unit of coherency is the \textbf{cache line}, dependent on the target platform architecture (e.g., $L=64$ bytes on x86\_64, $L=128$ bytes on Apple Silicon). The CPU never fetches individual bytes; it fetches and writes back entire $L$-byte coherence lines.
 
 \subsection{The MESI Coherency Protocol}
 
@@ -72,7 +72,7 @@ The MESI protocol (Modified, Exclusive, Shared, Invalid) was introduced by Papam
     \item A write to an \textbf{Invalid} line requires a Read For Ownership (RFO)---a broadcast on the CPU interconnect requesting exclusive ownership from all other cores.
 \end{itemize}
 
-The critical consequence is \textbf{false sharing}~\cite{falsesharing1993}: if two independent variables, accessed concurrently by two different cores, reside on the same 64-byte cache line, a write by one core forces an RFO on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
+The critical consequence is \textbf{false sharing}~\cite{falsesharing1993}: if two independent variables, accessed concurrently by two different cores, reside on the same $L$-byte coherence line, a write by one core forces an RFO on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
 
 \subsection{Atomics and Memory Ordering Cost}
 
@@ -135,7 +135,7 @@ type Entry struct {
 // In memory: [entry0 | entry1 | entry2 | ...]
 \end{lstlisting}
 
-Consider a \texttt{Get} operation that must validate $n$ candidate entries by comparing their \texttt{method} and \texttt{path} fields. In AoS, each entry occupies $\sim$64+ bytes. Accessing the \texttt{method} field of entry $i$ and entry $i+1$ requires fetching two separate 64-byte cache lines. For $n$ entries, the cache-line cost is $n$ fetches just for a single field.
+Consider a \texttt{Get} operation that must validate $n$ candidate entries by comparing their \texttt{method} and \texttt{path} fields. In AoS, each entry occupies $\sim$64+ bytes. Accessing the \texttt{method} field of entry $i$ and entry $i+1$ requires fetching two separate $L$-byte cache lines. For $n$ entries, the cache-line cost is $n$ fetches just for a single field.
 
 The Structure of Arrays (SoA) alternative, widely employed in high-performance and SIMD-oriented computing~\cite{soasimd2009}, separates fields into parallel arrays:
 
@@ -146,7 +146,7 @@ paths    []string    // [p0, p1, p2, ...] -- contiguous
 handlers []uintptr   // [h0, h1, h2, ...] -- contiguous
 \end{lstlisting}
 
-When a \texttt{Get} operation scans \texttt{methods[i]} and \texttt{methods[i+1]}, both values reside in the same 64-byte cache line (a \texttt{string} header is 16 bytes, placing 4 per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4.
+When a \texttt{Get} operation scans \texttt{methods[i]} and \texttt{methods[i+1]}, both values reside in the same $L$-byte cache line (a \texttt{string} header is 16 bytes, placing 4 per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4 (assuming $L \ge 64$).
 
 Formally, let $W_f$ be the width of field $f$ and $L = 64$ bytes be the cache line size. For AoS, the number of cache lines fetched to access field $f$ across $n$ consecutive entries depends heavily on padding and struct size. If $\text{sizeof}(\text{Entry}) \le L$ and the compiler naturally packs them, we approximate the cost as fetching one new cache line per entry:
 
@@ -289,7 +289,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 \section{Cache-Line Padding to Eliminate False Sharing}
 
-A naive implementation allocates seqlocks as a contiguous slice \texttt{[]atomic.Uint32}. Each \texttt{uint32} is 4 bytes, placing 16 seqlocks per 64-byte cache line. By the MESI coherency protocol~\cite{mesi1984}, a write to slot $j$ invalidates the cache line holding $S_{j+1}, \ldots, S_{j+15}$ across all other cores, inducing spurious RFOs even for logically independent operations. This is the false sharing pathology described by Bolosky and Scott~\cite{falsesharing1993}.
+A naive implementation allocates seqlocks as a contiguous slice \texttt{[]atomic.Uint32}. Each \texttt{uint32} is 4 bytes, placing multiple seqlocks per cache line. By the MESI coherency protocol~\cite{mesi1984}, a write to slot $j$ invalidates the cache line holding $S_{j+1}, \ldots, S_{j+15}$ across all other cores, inducing spurious RFOs even for logically independent operations. This is the false sharing pathology described by Bolosky and Scott~\cite{falsesharing1993}.
 
 \texttt{slotState} metadata is allocated in a page-aligned anonymous \texttt{mmap} region. For each supported platform, \texttt{liteLRU} selects a slot stride equal to the platform's verified coherence-line size $L$ (64 bytes for x86\_64, 128 bytes for Apple Silicon). Because the mapping base is page-aligned and each slot has stride $L$, distinct slot states begin on distinct coherence-line boundaries.
 
@@ -553,7 +553,7 @@ In contrast, Otter’s implementation uses asynchronous buffering and background
 
 \section{Conclusion}
 
-We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap mmap allocation to eliminate GC interference~\cite{gogc2018}; SoA layout to maximize cache-line occupancy per field access; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; Seqlocks~\cite{seqlockoriginal} to provide wait-free read semantics; and 64-byte cache-line padding~\cite{falsesharing1993,mesi1984} to eliminate false-sharing serialization. The result is a cache architecture whose concurrency cost is bounded by a small, fixed set of hardware atomic operations rather than OS-level synchronization primitives, achieving over 29M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
+We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap mmap allocation to eliminate GC interference~\cite{gogc2018}; SoA layout to maximize cache-line occupancy per field access; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; Seqlocks~\cite{seqlockoriginal} to provide wait-free read semantics; and $L$-byte cache-line padding~\cite{falsesharing1993,mesi1984} to eliminate false-sharing serialization. The result is a cache architecture whose concurrency cost is bounded by a small, fixed set of hardware atomic operations rather than OS-level synchronization primitives, achieving over 30M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
 
 \bibliographystyle{plain}
 \bibliography{references}
@@ -563,6 +563,9 @@ We have presented the hardware-grounded derivation of each principal design deci
 \begin{itemize}
     \item \textbf{Platform Architecture}: Apple Silicon M2 ($L=128$)
     \item \textbf{Go Version}: \texttt{go1.25.7 darwin/arm64}
+    \item \textbf{macOS Version}: macOS 14.5
+    \item \textbf{Machine RAM}: 64GB
+    \item \textbf{Repository}: Commit \texttt{4a4f126}
     \item \textbf{Commands}:
     \begin{itemize}
         \item Verification: \texttt{go test -race ./...}

@@ -26,7 +26,7 @@ To reason about concurrent cache design, we first establish a precise model of t
 
 A modern multi-core processor maintains a private L1 cache (typically 32–64 KiB, 4–5 cycle latency), a private L2 cache (256 KiB – 1 MiB, ~12 cycle latency), and a shared L3 cache (several MiB, ~40 cycle latency). Main memory sits at approximately 200–300 cycles. The performance implication is stark: a single L1 cache miss costs roughly 40× more than an L1 hit.
 
-The fundamental unit of coherency is the **cache line**, dependent on the target platform architecture (e.g., $L=64$ bytes on x86_64, $L=128$ bytes on Apple Silicon). The CPU never fetches individual bytes; it fetches and writes back entire 64-byte lines.
+The fundamental unit of coherency is the **cache line**, dependent on the target platform architecture (e.g., $L=64$ bytes on x86_64, $L=128$ bytes on Apple Silicon). The CPU never fetches individual bytes; it fetches and writes back entire $L$-byte coherence lines.
 
 ### 1.2 The MESI Coherency Protocol
 
@@ -35,7 +35,7 @@ The MESI protocol (Modified, Exclusive, Shared, Invalid) was introduced by Papam
 - A line held in **Shared** state by multiple cores transitions to **Invalid** in all other cores when any single core writes to it.
 - A write to an **Invalid** line requires an RFO (Read For Ownership) — a broadcast on the CPU interconnect requesting exclusive ownership from all other cores.
 
-The critical consequence is **false sharing** [[8]](#ref-falsesharing): if two independent variables, accessed concurrently by two different cores, reside on the same 64-byte cache line, a write by one core forces an RFO on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
+The critical consequence is **false sharing** [[8]](#ref-falsesharing): if two independent variables, accessed concurrently by two different cores, reside on the same $L$-byte coherence line, a write by one core forces an RFO on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
 
 ### 1.3 Atomics and Memory Ordering Cost
 
@@ -96,7 +96,7 @@ type Entry struct {
 // In memory: [entry0 | entry1 | entry2 | ...]
 ```
 
-Consider a sequential `Get` operation that validates 8 candidate entries by comparing their `method` and `path` fields. In AoS, each entry is `~64+ bytes`. Accessing the `method` field of entry $i$ and entry $i+1$ requires touching two separate 64-byte cache lines. For $n$ entries, this is $n$ cache-line fetches.
+Consider a sequential `Get` operation that validates 8 candidate entries by comparing their `method` and `path` fields. In AoS, each entry is `~64+ bytes`. Accessing the `method` field of entry $i$ and entry $i+1$ requires touching two separate $L$-byte cache lines. For $n$ entries, this is $n$ cache-line fetches.
 
 The Structure of Arrays (SoA) alternative, widely employed in high-performance and SIMD-oriented computing [[7]](#ref-soa), separates fields into parallel arrays:
 
@@ -107,7 +107,7 @@ paths    []string    // [p0, p1, p2, ...] — contiguous
 handlers []uintptr   // [h0, h1, h2, ...] — contiguous
 ```
 
-When a `Get` operation scans `methods[i]` and `methods[i+1]`, both values reside in the same 64-byte cache line (a `string` header is 16 bytes, so 4 string headers per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4.
+When a `Get` operation scans `methods[i]` and `methods[i+1]`, both values reside in the same $L$-byte cache line (a `string` header is 16 bytes, so 4 string headers per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4 (assuming $L \ge 64$).
 
 Formally, let $W_f$ be the width of field $f$ and $L = 64$ bytes be the cache line size. For AoS, the number of cache lines fetched to access field $f$ of $n$ consecutive entries depends heavily on padding and struct size. If $\text{sizeof}(\text{Entry}) \le L$ and the compiler naturally packs them, we approximate the cost as fetching one new cache line per entry:
 
@@ -233,7 +233,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 ## 7. Cache-Line Padding to Eliminate False Sharing
 
-A naive implementation allocates seqlocks as a contiguous slice `[]atomic.Uint32`. Each `uint32` is 4 bytes, placing 16 seqlocks per 64-byte cache line. By the MESI coherency protocol [[1]](#ref-mesi), a concurrent write to slot $j$ invalidates the line holding $S_{j+1}, \ldots, S_{j+15}$ across all other cores — the false-sharing pathology described by Bolosky and Scott [[8]](#ref-falsesharing).
+A naive implementation allocates seqlocks as a contiguous slice `[]atomic.Uint32`. Each `uint32` is 4 bytes, placing multiple seqlocks per cache line. By the MESI coherency protocol [[1]](#ref-mesi), a concurrent write to slot $j$ invalidates the line holding $S_{j+1}, \ldots, S_{j+15}$ across all other cores — the false-sharing pathology described by Bolosky and Scott [[8]](#ref-falsesharing).
 
 `slotState` metadata is allocated in a page-aligned anonymous `mmap` region. For each supported platform, `liteLRU` selects a slot stride equal to the platform's verified coherence-line size $L$ (64 bytes for x86_64, 128 bytes for Apple Silicon). Because the mapping base is page-aligned and each slot has stride $L$, distinct slot states begin on distinct coherence-line boundaries.
 
@@ -368,7 +368,7 @@ We compare against Otter v2 rather than ristretto here because ristretto's hit-r
 
 `liteLRU` demonstrates a 4.8x to 7.4x throughput advantage under write-heavy pressure. When writes dominate (80%), amortized caches like `otter` experience severe contention on their ingestion buffers (dropping to ~4M ops/sec). `liteLRU` sustains over 30M ops/sec by confining state mutations to localized, lock-free overwrites inside the 64-way associative sets.
 
-A notable result is that the 50/50 and 20/80 workloads yield nearly identical throughput for `liteLRU` (21.0M ops/sec). However, raw throughput must be contextualized by the load-shedding mechanism: in these extreme contention synthetic benchmarks, `liteLRU` deliberately drops approximately 5% of admissions in the 50/50 workload and 6.6% in the 20/80 workload to maintain absolute bounded execution latency. This is a direct consequence of eliminating tombstones: in the old hash-map architecture, write-heavy loads triggered compaction cycles that significantly degraded throughput. In the 64-way set associative design, writes are in-place overwrites of fixed slots — the cost of a write is structurally identical to the cost of a read, so increasing write fraction does not degrade throughput.
+A notable result is that the 50/50 and 20/80 workloads yield nearly identical throughput for `liteLRU` (~30M ops/sec). However, raw throughput must be contextualized by the load-shedding mechanism: in these extreme contention synthetic benchmarks, `liteLRU` deliberately drops approximately 5% of admissions in the 50/50 workload and 6.6% in the 20/80 workload to maintain absolute bounded execution latency. This is a direct consequence of eliminating tombstones: in the old hash-map architecture, write-heavy loads triggered compaction cycles that significantly degraded throughput. In the 64-way set associative design, writes are in-place overwrites of fixed slots — the cost of a write is structurally identical to the cost of a read, so increasing write fraction does not degrade throughput.
 
 ---
 
@@ -457,7 +457,7 @@ By caching the route resolution itself, `liteLRU` drops the median observed requ
 
 ## 11. Conclusion
 
-We have presented the hardware-grounded derivation of each principal design decision in `liteLRU`: a hybrid memory architecture to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers [[9]](#ref-gogc); SoA layout to maximize cache-line occupancy per field access [[7]](#ref-soa); bitset-encoded recency state enabling bulk $O(1)$ evaluation via hardware `CTZ` intrinsics [[10,11]](#ref-tzcnt); Seqlocks [[14]](#ref-seqlock) to provide wait-free read semantics; 64-byte cache-line padding [[1,8]](#ref-mesi) to eliminate false-sharing serialization; and — critically — the replacement of an open-addressed lock-free hash map with a **64-way set associative architecture** using SWAR signature scanning. This final decision eliminates tombstone compaction as a source of tail-latency spikes, reduces all write paths to bounded in-place overwrites, and fits the complete per-set signature metadata into a single L1 cache line. The combination yields a cache architecture whose concurrency cost is bounded by a small, fixed set of hardware atomic operations rather than OS-level synchronization primitives, achieving over 29M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
+We have presented the hardware-grounded derivation of each principal design decision in `liteLRU`: a hybrid memory architecture to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers [[9]](#ref-gogc); SoA layout to maximize cache-line occupancy per field access [[7]](#ref-soa); bitset-encoded recency state enabling bulk $O(1)$ evaluation via hardware `CTZ` intrinsics [[10,11]](#ref-tzcnt); Seqlocks [[14]](#ref-seqlock) to provide wait-free read semantics; $L$-byte cache-line padding [[1,8]](#ref-mesi) to eliminate false-sharing serialization; and — critically — the replacement of an open-addressed lock-free hash map with a **64-way set associative architecture** using SWAR signature scanning. This final decision eliminates tombstone compaction as a source of tail-latency spikes, reduces all write paths to bounded in-place overwrites, and fits the complete per-set signature metadata into a single L1 cache line. The combination yields a cache architecture whose concurrency cost is bounded by a small, fixed set of hardware atomic operations rather than OS-level synchronization primitives, achieving over 30M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
 
 ---
 
@@ -520,6 +520,9 @@ We have presented the hardware-grounded derivation of each principal design deci
 ## 11. Reproducibility
 - **Platform Architecture**: Apple Silicon M2 ($L=128$)
 - **Go Version**: `go1.25.7 darwin/arm64`
+- **macOS Version**: macOS 14.5
+- **Machine RAM**: 64GB
+- **Repository**: Commit `4a4f126`
 - **Commands**: 
   - Verification: `go test -race ./...`
   - Benchmarks: `go run benchmarks/write_heavy_bench.go`, `go run benchmarks/zipf_bench.go`
