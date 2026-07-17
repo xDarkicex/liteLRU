@@ -14,7 +14,7 @@
 
 ## Abstract
 
-Concurrent approximate LRU structures often serialize cores on shared metadata. We present `liteLRU`, a fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are wait-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, `liteLRU` isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that `liteLRU` sustains over 30 million operations per second under severe 80% write contention while providing sub-microsecond p99 latency on the cache hot path and contention-bounded write work under synthetic and end-to-end workloads.
+Concurrent approximate LRU structures often serialize cores on shared metadata. We present `liteLRU`, a fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are bounded wait-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, `liteLRU` isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that `liteLRU` sustains over 30 million operations per second under severe 80% write contention while providing sub-microsecond p99 latency on the cache hot path and contention-bounded write work under synthetic and end-to-end workloads.
 
 ---
 
@@ -52,7 +52,7 @@ Under high concurrency, a single globally contested atomic (e.g., a global clock
 In this paper, we make the following contributions to concurrent cache design:
 * **Contention-Bounded Eviction Algorithm:** A 64-way set associative architecture utilizing chunked bitmasks and hardware `CTZ`, eliminating global clock hands and open-addressed maps entirely.
 * **Hybrid Memory Architecture:** Off-heap allocation for lock-free state to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers on the heap.
-* **Padded Seqlocks:** A strict structural layout that yields strictly wait-free reads and eliminates false sharing for per-slot metadata.
+* **Padded Seqlocks:** A strict structural layout that yields bounded wait-free reads and eliminates false sharing for per-slot metadata.
 * **Load-Shedding Eviction Protocol:** A load-shedding protocol that caps write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
 
 ## 2. Hybrid Memory Architecture and GC Isolation
@@ -76,7 +76,7 @@ The problem of concurrent cache design generally branches into two orthogonal do
 
 **Advanced Eviction Policies.** Recent systems like CAR, CLOCK-Pro [[13]](#ref-clockpro), S3-FIFO [[5]](#ref-s3fifo), and SIEVE [[6]](#ref-sieve) demonstrate that scan-resistant eviction policies can outperform strict LRU on web workloads. These policy innovations are generally orthogonal to the mechanism: a SIEVE or S3-FIFO algorithm still requires a concurrent implementation strategy to scale across cores without locking.
 
-**Production Go Caches.** Existing Go caches like `freecache`, `bigcache`, and `ristretto` achieve high throughput via sharding and background eviction goroutines. `liteLRU` takes a different approach: rather than amortizing eviction cost over background threads or coarse-grained shard locks, `liteLRU` eliminates the locking overhead entirely via bitmask mathematics and seqlocks, enabling wait-free synchronous reads and inline contention-bounded writes.
+**Production Go Caches.** Existing Go caches like `freecache`, `bigcache`, and `ristretto` achieve high throughput via sharding and background eviction goroutines. `liteLRU` takes a different approach: rather than amortizing eviction cost over background threads or coarse-grained shard locks, `liteLRU` eliminates the locking overhead entirely via bitmask mathematics and seqlocks, enabling bounded wait-free synchronous reads and inline contention-bounded writes.
 
 ---
 
@@ -195,7 +195,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 2. Scan the 8 SWAR signature words using byte-wise comparison.
 3. For any match at slot $i$, verify the slot is valid in $V_k$.
 4. Load the seqlock $S_{i, \text{start}}$. If odd, skip slot (conflict).
-5. Read the key/value from the SoA arrays.
+5. Read the key/value from the atomic structures in the SoA arrays.
 6. Load the seqlock $S_{i, \text{end}}$. If $S_{i, \text{start}} \neq S_{i, \text{end}}$, skip slot (conflict).
 7. Atomically OR the bit $i$ into $A_k$ to record recency and return hit.
 8. If no slots match cleanly, return miss.
@@ -206,7 +206,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 3. If `findVictim` returns the failure sentinel, drop the admission and return.
 4. Clear the victim's bit in $V_k$.
 5. Increment the seqlock $S_i$ to an odd value.
-6. Write the new key and value into the SoA arrays at the victim slot.
+6. Construct and atomically publish the immutable slot payloads in the SoA arrays.
 7. Update the SWAR signature byte for the new key.
 8. Increment the seqlock $S_i$ to an even value.
 9. Set the victim's bit in $V_k$, clear its bit in $A_k$, and release its bit in $W_k$.
@@ -220,9 +220,8 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 6. If unsuccessful (due to concurrent writers), increment retry counter.
 7. If 10 retries are exhausted, return the `0xFFFFFFFF` failure sentinel.
 
-### 6.3 Correctness Theorems
+**Theorem 1 (Wait-Free Reads).** *Any thread executing `Get` is guaranteed to complete in a bounded number of cache metadata probes (though string comparison cost depends on key length), regardless of the state or execution speed of concurrent writers.*
 
-**Theorem 1 (Wait-Free Reads).** *Any thread executing `Get` is guaranteed to complete in a bounded number of instructions regardless of the state or execution speed of concurrent writers.*
 *Proof:* The read path consists solely of a SWAR signature scan, atomic loads of the $L$-byte padded seqlock $S_i$, a string comparison, and a single bitwise `OR` for the access bit. The padded layout strictly isolates $S_i$, eliminating false-sharing across slots. The read path evaluates at most 8 SWAR word scans, and for each match at most two seqlock loads and one key compare; conflicts skip without retry; if no clean match, return miss. Under no circumstances does a reader spin on a lock or retry.
 
 **Theorem 2 (Bounded Write-Side Work).** *Any thread executing `Add` will terminate in $O(1)$ atomic operations.*
@@ -443,7 +442,7 @@ By caching the route resolution itself, `liteLRU` drops the median observed requ
 
 ## 10. Discussion and Limitations
 
-**Memory Overhead.** The tradeoff for $L$-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires **~133 MB** of heap allocation for the SoA arrays, whereas `otter` requires **~120 MB**. This represents a modest ~11% memory premium in exchange for wait-free concurrency and a **7.36x throughput speedup** under high write load (80% writes).
+**Memory Overhead.** The tradeoff for $L$-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires platform-specific overhead. On x86_64 ($L=64$), it requires 128 bytes of overhead (64 bytes for the seqlock + 64 bytes for the four atomic field wrappers: `atomicString`, `atomicSlice`, and `atomic.Pointer`), totaling **~128 MB** of allocation overhead per million entries. On Apple Silicon ($L=128$), the 128-byte seqlock padding brings the total overhead to 192 bytes per entry (**~192 MB** per million entries before chunk metadata). Both represent a memory premium in exchange for bounded wait-free concurrency, with `otter` requiring **~120 MB**.
 
 **Hit Rate vs. True LRU.** The Chunked Bitmask algorithm is a CLOCK approximation of LRU, not true LRU. In workloads with adversarial access patterns specifically targeting the CLOCK approximation error, hit-rate may degrade relative to a true LRU implementation or advanced policies like SIEVE [6]. The set associative constraint (each key restricted to one 64-slot set) introduces an additional eviction imprecision relative to a fully associative structure; however, §9.6 confirms this does not measurably reduce hit rates under Zipfian distributions. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity.
 
