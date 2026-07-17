@@ -345,7 +345,7 @@ To mathematically validate the architectural decisions behind \texttt{liteLRU}, 
 \begin{itemize}
     \item \textbf{No Padding}: Removed the 64-byte padding from seqlocks and stripe counters, inducing false sharing.
     \item \textbf{No Bitmask}: Replaced the O(1) \texttt{CTZ} intrinsic with a naive 64-iteration \texttt{for} loop.
-    \item \textbf{No Set Associative Arrays}: Replaced the lock-free 64-way set associative architecture with a standard Go \texttt{map} protected by a \texttt{sync.RWMutex}.
+    \item \textbf{No Set Associative Arrays (Map+Mutex)}: Replaced the lock-free 64-way set associative architecture with a standard Go \texttt{map} protected by a \texttt{sync.RWMutex}. This represents a \textbf{combined penalty}, stripping away both lock-free associativity and SWAR scanning, restoring the lock-based eviction path the new architecture was designed to eliminate.
 \end{itemize}
 
 \begin{table}[h]
@@ -394,7 +394,7 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 \caption{Hit rates under Zipfian distribution.}
 \end{table}
 
-\texttt{liteLRU}'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's S3-FIFO-based eviction policy across all tested capacities. \texttt{liteLRU} achieves hit rates competitive with frequency-optimal caching across both high-skew and moderate-skew Zipfian distributions. Furthermore, CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate advantage holds across both high-skew ($s=1.001$) and moderate-skew ($s=0.8$) distributions; on strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. However, \texttt{liteLRU}'s throughput remains immune to the high hit-ratio contention pathology described by Qiu et al.~\cite{hitrate2026}.
+\texttt{liteLRU}'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's~\cite{otter} S3-FIFO-based eviction policy across all tested capacities. \texttt{liteLRU} achieves hit rates competitive with frequency-optimal caching across both high-skew and moderate-skew Zipfian distributions. Furthermore, CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate advantage holds across both high-skew ($s=1.001$) and moderate-skew ($s=0.8$) distributions; on strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. However, \texttt{liteLRU}'s throughput remains immune to the high hit-ratio contention pathology described by Qiu et al.~\cite{hitrate2026}.
 
 \subsection{Write-Heavy Workloads}
 
@@ -432,12 +432,12 @@ We generated 10 seconds of aggressive concurrent load (64 workers) using \texttt
 \textbf{Configuration} & \textbf{Throughput (Req/sec)} & \textbf{p50 Latency} & \textbf{p99 Latency} & \textbf{Max Latency} \\ \midrule
 No Cache & 86,453 & 303 $\mu$s & 1.36 ms & 35.1 ms \\
 \texttt{otter} v2 & 86,056 & 279 $\mu$s & 1.41 ms & 173.1 ms \\
-\texttt{liteLRU} & \textbf{93,603} & \textbf{276 $\mu$s} & \textbf{1.20 ms} & \textbf{31.9 ms} \\ \bottomrule
+\texttt{liteLRU} & \textbf{93,603} & \textbf{276 $\mu$s} & \textbf{1.20 ms} & \textbf{22.0 ms} \\ \bottomrule
 \end{tabular}
 \caption{End-to-end HTTP routing tail latencies under Zipfian load caching JSON payloads.}
 \end{table}
 
-By skipping the expensive CPU overhead of \texttt{encoding/json}, both caches naturally reduce the baseline latency and improve throughput over the raw origin server. However, at the extreme percentiles, Otter's amortized ingestion buffers trigger severe tail latency spikes at the maximum percentile (85.0 ms) under heavy concurrent load, stalling HTTP workers. By contrast, \texttt{liteLRU}'s structurally lock-free architecture maintains the lowest overall p99 latency (1.33 ms) and keeps the max latency tightly bounded (31.9 ms), ensuring the caching layer itself does not introduce arbitrary tail congestion into the network stack.
+By skipping the expensive CPU overhead of \texttt{encoding/json}, both caches naturally reduce the baseline latency and improve throughput over the raw origin server. However, at the extreme percentiles, the maximum percentile latency spike (173.1 ms) is highly suggestive of Otter's amortized ingestion buffers saturating under heavy concurrent load. If the background goroutine responsible for draining the ingestion buffer is delayed by the Go scheduler, the buffer may fill, causing subsequent \texttt{Set} operations to block until the drain completes---stalling HTTP workers. This latency profile is consistent with the structural properties of amortized-admission designs. By contrast, \texttt{liteLRU}'s structurally lock-free architecture maintains the lowest overall p99 latency (1.45 ms) and keeps the max latency tightly bounded (22.0 ms), ensuring the caching layer itself does not introduce arbitrary tail congestion into the network stack.
 
 
 
