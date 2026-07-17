@@ -517,7 +517,7 @@ We have presented the hardware-grounded derivation of each principal design deci
 <a name="ref-otter"></a>
 [18] Otter Authors. "Otter: A high performance concurrent cache in Go." *GitHub*, 2023. https://github.com/maypok86/otter
 
-## 11. Reproducibility
+## 12. Reproducibility
 - **Platform Architecture**: Apple Silicon M2 ($L=128$)
 - **Go Version**: `go1.25.7 darwin/arm64`
 - **macOS Version**: macOS 14.5
