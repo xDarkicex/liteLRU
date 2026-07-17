@@ -26,7 +26,7 @@ To reason about concurrent cache design, we first establish a precise model of t
 
 A modern multi-core processor maintains a private L1 cache (typically 32–64 KiB, 4–5 cycle latency), a private L2 cache (256 KiB – 1 MiB, ~12 cycle latency), and a shared L3 cache (several MiB, ~40 cycle latency). Main memory sits at approximately 200–300 cycles. The performance implication is stark: a single L1 cache miss costs roughly 40× more than an L1 hit.
 
-The fundamental unit of coherency is the **cache line**, universally 64 bytes on x86_64 and ARM64. The CPU never fetches individual bytes; it fetches and writes back entire 64-byte lines.
+The fundamental unit of coherency is the **cache line**, dependent on the target platform architecture (e.g., $L=64$ bytes on x86_64, $L=128$ bytes on Apple Silicon). The CPU never fetches individual bytes; it fetches and writes back entire 64-byte lines.
 
 ### 1.2 The MESI Coherency Protocol
 
@@ -223,7 +223,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 ### 6.3 Correctness Theorems
 
 **Theorem 1 (Wait-Free Reads).** *Any thread executing `Get` is guaranteed to complete in a bounded number of instructions regardless of the state or execution speed of concurrent writers.*
-*Proof:* The read path consists solely of a SWAR signature scan, atomic loads of the 64-byte padded seqlock $S_i$, a string comparison, and a single bitwise `OR` for the access bit. The padded layout strictly isolates $S_i$, eliminating false-sharing across slots. The read path evaluates at most 8 SWAR word scans, and for each match at most two seqlock loads and one key compare; conflicts skip without retry; if no clean match, return miss. Under no circumstances does a reader spin on a lock or retry.
+*Proof:* The read path consists solely of a SWAR signature scan, atomic loads of the $L$-byte padded seqlock $S_i$, a string comparison, and a single bitwise `OR` for the access bit. The padded layout strictly isolates $S_i$, eliminating false-sharing across slots. The read path evaluates at most 8 SWAR word scans, and for each match at most two seqlock loads and one key compare; conflicts skip without retry; if no clean match, return miss. Under no circumstances does a reader spin on a lock or retry.
 
 **Theorem 2 (Bounded Write-Side Work).** *Any thread executing `Add` will terminate in $O(1)$ atomic operations.*
 *Proof:* `findVictim` utilizes the `CTZ` instruction to identify eviction candidates. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, `findVictim` returns a failure sentinel and `Add` drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
@@ -319,7 +319,7 @@ The max is dominated by OS scheduling jitter on at least one of the 8 goroutines
 
 To isolate the contribution of each architectural decision in `liteLRU`'s **64-way set associative SWAR design**, we benchmarked the full implementation against three stripped-down variants under the identical 8-core 80/20 uniform workload. The ablation variants target the three novel mechanisms in the new architecture:
 
-- **No Padding**: Removed the 64-byte padding from seqlocks and stripe counters, inducing false sharing across concurrent accessors.
+- **No Padding**: Removed the target-platform $L$-byte padding from seqlocks and stripe counters, inducing false sharing across concurrent accessors.
 - **No Bitmask / No SWAR**: Replaced the O(1) SWAR signature scan + `CTZ` intrinsic with a naive 64-iteration `for` loop performing full string comparisons on each slot.
 - **No Set Associativity (Map+Mutex)**: Replaced the 64-way set associative slot array with a standard Go `map` protected by a `sync.RWMutex`. This represents a **combined penalty**, stripping away both lock-free associativity and SWAR scanning, restoring the lock-based eviction path the new architecture was designed to eliminate.
 
@@ -443,7 +443,7 @@ By caching the route resolution itself, `liteLRU` drops the median observed requ
 
 ## 10. Discussion and Limitations
 
-**Memory Overhead.** The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires **~133 MB** of heap allocation for the SoA arrays, whereas `otter` requires **~120 MB**. This represents a modest ~11% memory premium in exchange for wait-free concurrency and a **7.36x throughput speedup** under high write load (80% writes).
+**Memory Overhead.** The tradeoff for $L$-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires **~133 MB** of heap allocation for the SoA arrays, whereas `otter` requires **~120 MB**. This represents a modest ~11% memory premium in exchange for wait-free concurrency and a **7.36x throughput speedup** under high write load (80% writes).
 
 **Hit Rate vs. True LRU.** The Chunked Bitmask algorithm is a CLOCK approximation of LRU, not true LRU. In workloads with adversarial access patterns specifically targeting the CLOCK approximation error, hit-rate may degrade relative to a true LRU implementation or advanced policies like SIEVE [6]. The set associative constraint (each key restricted to one 64-slot set) introduces an additional eviction imprecision relative to a fully associative structure; however, §9.6 confirms this does not measurably reduce hit rates under Zipfian distributions. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity.
 
@@ -516,3 +516,10 @@ We have presented the hardware-grounded derivation of each principal design deci
 
 <a name="ref-otter"></a>
 [18] Otter Authors. "Otter: A high performance concurrent cache in Go." *GitHub*, 2023. https://github.com/maypok86/otter
+
+## 11. Reproducibility
+- **Platform Architecture**: Apple Silicon M2 ($L=128$)
+- **Go Version**: `go1.25.7 darwin/arm64`
+- **Commands**: 
+  - Verification: `go test -race ./...`
+  - Benchmarks: `go run benchmarks/write_heavy_bench.go`, `go run benchmarks/zipf_bench.go`

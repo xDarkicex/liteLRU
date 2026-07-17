@@ -61,7 +61,7 @@ To reason about concurrent cache design, we first establish a precise model of t
 
 A modern multi-core processor maintains a private L1 cache (typically 32--64 KiB, 4--5 cycle latency), a private L2 cache (256 KiB -- 1 MiB, $\sim$12 cycle latency), and a shared L3 cache (several MiB, $\sim$40 cycle latency). Main memory sits at approximately 200--300 cycles. The performance implication is stark: a single L1 cache miss costs roughly $40\times$ more than an L1 hit.
 
-The fundamental unit of coherency is the \textbf{cache line}, universally 64 bytes on x86\_64 and ARM64. The CPU never fetches individual bytes; it fetches and writes back entire 64-byte lines.
+The fundamental unit of coherency is the \textbf{cache line}, dependent on the target platform architecture (e.g., $L=64$ bytes on x86\_64, $L=128$ bytes on Apple Silicon). The CPU never fetches individual bytes; it fetches and writes back entire 64-byte lines.
 
 \subsection{The MESI Coherency Protocol}
 
@@ -279,7 +279,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \subsection{Correctness Theorems}
 
 \textbf{Theorem 1 (Wait-Free Reads).} \textit{Any thread executing \texttt{Get} is guaranteed to complete in a bounded number of instructions regardless of the state or execution speed of concurrent writers.}
-\\\textit{Proof:} The read path consists solely of a SWAR signature scan, atomic loads of the 64-byte padded seqlock $S_i$, a string comparison, and a single bitwise \texttt{OR} for the access bit. The padded layout strictly isolates $S_i$, eliminating false-sharing across slots. The read path evaluates at most 8 SWAR word scans, and for each match at most two seqlock loads and one key compare; conflicts skip without retry; if no clean match, return miss. Under no circumstances does a reader spin on a lock or retry.
+\\\textit{Proof:} The read path consists solely of a SWAR signature scan, atomic loads of the $L$-byte padded seqlock $S_i$, a string comparison, and a single bitwise \texttt{OR} for the access bit. The padded layout strictly isolates $S_i$, eliminating false-sharing across slots. The read path evaluates at most 8 SWAR word scans, and for each match at most two seqlock loads and one key compare; conflicts skip without retry; if no clean match, return miss. Under no circumstances does a reader spin on a lock or retry.
 
 \textbf{Theorem 2 (Bounded Write-Side Work).} \textit{Any thread executing \texttt{Add} will terminate in $O(1)$ atomic operations.}
 \\\textit{Proof:} \texttt{findVictim} utilizes the \texttt{CTZ} instruction to identify eviction candidates. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, \texttt{findVictim} returns a failure sentinel and \texttt{Add} drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
@@ -309,7 +309,7 @@ Because the \texttt{mmap} allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (
 
 It is important to note that the 64-bit bitmasks ($V_k$, $A_k$, $W_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
 
-The same principle is applied to the statistics counters. Rather than two globally shared \texttt{atomic.Int64} hit and miss counters, we maintain 64 independent \texttt{statStripe} structs, each padded to 64 bytes, with writers selecting a stripe via \texttt{hash \& 63}. Each core writes exclusively to its own stripe without generating coherency traffic for any other core.
+The same principle is applied to the statistics counters. Rather than two globally shared \texttt{atomic.Int64} hit and miss counters, we maintain 64 independent \texttt{statStripe} structs, each padded to $L$ bytes, with writers selecting a stripe via \texttt{hash \& 63}. Each core writes exclusively to its own stripe without generating coherency traffic for any other core.
 
 \section{Benchmark Methodology and Artifacts}
 
@@ -388,7 +388,7 @@ The observed maximum latency is dominated by OS goroutine scheduling jitter, not
 
 To mathematically validate the architectural decisions behind \texttt{liteLRU}, we benchmarked the full implementation against three stripped-down variants under the identical 8-core 80/20 workload:
 \begin{itemize}
-    \item \textbf{No Padding}: Removed the 64-byte padding from seqlocks and stripe counters, inducing false sharing.
+    \item \textbf{No Padding}: Removed the target-platform $L$-byte padding from seqlocks and stripe counters, inducing false sharing.
     \item \textbf{No Bitmask}: Replaced the O(1) \texttt{CTZ} intrinsic with a naive 64-iteration \texttt{for} loop.
     \item \textbf{No Set Associative Arrays (Map+Mutex)}: Replaced the lock-free 64-way set associative architecture with a standard Go \texttt{map} protected by a \texttt{sync.RWMutex}. This represents a \textbf{combined penalty}, stripping away both lock-free associativity and SWAR scanning, restoring the lock-based eviction path the new architecture was designed to eliminate.
 \end{itemize}
@@ -543,7 +543,7 @@ In contrast, Otter’s implementation uses asynchronous buffering and background
 
 \section{Discussion and Limitations}
 
-\textbf{Memory Overhead.} The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires \textbf{$\sim$133 MB} of heap allocation for the SoA arrays, whereas \texttt{otter} requires \textbf{$\sim$120 MB}. This represents a modest $\sim$11\% memory premium in exchange for wait-free concurrency and an 8.8x throughput speedup under high write load.
+\textbf{Memory Overhead.} The tradeoff for $L$-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires \textbf{$\sim$133 MB} of heap allocation for the SoA arrays, whereas \texttt{otter} requires \textbf{$\sim$120 MB}. This represents a modest $\sim$11\% memory premium in exchange for wait-free concurrency and an 8.8x throughput speedup under high write load.
 
 \textbf{Hit Rate vs. True LRU.} The Chunked Bitmask algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
 
@@ -557,5 +557,17 @@ We have presented the hardware-grounded derivation of each principal design deci
 
 \bibliographystyle{plain}
 \bibliography{references}
+
+
+\section{Reproducibility}
+\begin{itemize}
+    \item \textbf{Platform Architecture}: Apple Silicon M2 ($L=128$)
+    \item \textbf{Go Version}: \texttt{go1.25.7 darwin/arm64}
+    \item \textbf{Commands}:
+    \begin{itemize}
+        \item Verification: \texttt{go test -race ./...}
+        \item Benchmarks: \texttt{go run benchmarks/write\_heavy\_bench.go}, \texttt{go run benchmarks/zipf\_bench.go}
+    \end{itemize}
+\end{itemize}
 
 \end{document}
