@@ -107,7 +107,7 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2
 
 \begin{enumerate}
     \item \textbf{64-Way Set Associativity over Hash Maps:} Lock-free open-addressed hash maps mathematically require \textit{tombstones} during deletion to preserve concurrent probe sequences. When tombstones accumulate, lock-free maps are forced to perform global, cooperative compactions, resulting in large tail latency spikes (often $>$100ms) under heavy eviction load. \texttt{liteLRU} completely eliminates the hash map. Instead, it utilizes a hardware-inspired \textbf{64-way set associative architecture}. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). 
-    \item \textbf{SWAR Signature Scanning:} To instantly find a key within the 64-slot set without traversing arrays of strings, \texttt{liteLRU} maintains a \texttt{uint64} signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. Evictions are restricted to the local 64-slot set, overwriting pointers in place and mathematically eliminating tombstones entirely.
+    \item \textbf{SWAR Signature Scanning:} To instantly find a key within the 64-slot set without traversing arrays of strings, \texttt{liteLRU} maintains a \texttt{uint64} signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. Evictions are restricted to the local 64-slot set, overwriting pointers in place and eliminating tombstones entirely.
 \end{enumerate}
 
 \section{Related Work}
@@ -276,9 +276,13 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
     \item If 10 retries are exhausted, return the \texttt{0xFFFFFFFF} failure sentinel.
 \end{enumerate}
 
+\subsection{Go Memory Model Safety}
+
+Seqlock validation establishes an algorithmic snapshot condition but does not by itself make concurrent accesses to pointer-bearing Go values race-free. \texttt{liteLRU} represents each slot payload as an immutable heap object. Writers fully initialize a payload before publishing its address through \texttt{atomic.Pointer}; readers obtain the payload through an atomic load before dereferencing it. Sequence validation detects concurrent replacement and returns a miss. Thus, implementation safety relies jointly on atomic publication, immutable payloads, and sequence validation.
+
 \subsection{Correctness Theorems}
 
-\textbf{Theorem 1 (Wait-Free Reads).} \textit{Any thread executing \texttt{Get} is guaranteed to complete in a bounded number of cache metadata probes (though string comparison cost depends on key length), regardless of the state or execution speed of concurrent writers.}
+\textbf{Theorem 1 (Bounded-Probe Lock-Free Reads).} \textit{Any thread executing \texttt{Get} is guaranteed to complete in a bounded number of cache metadata probes (though string comparison cost depends on key length), regardless of the state or execution speed of concurrent writers.}
 
 \textit{Proof:} The read path consists solely of a SWAR signature scan, atomic loads of the $L$-byte padded seqlock $S_i$, a string comparison, and a single bitwise \texttt{OR} for the access bit. The padded layout strictly isolates $S_i$, eliminating false-sharing across slots. The read path evaluates at most 8 SWAR word scans, and for each match at most two seqlock loads and one key compare; conflicts skip without retry; if no clean match, return miss. Under no circumstances does a reader spin on a lock or retry.
 
@@ -286,7 +290,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \\\textit{Proof:} \texttt{findVictim} utilizes the \texttt{CTZ} instruction to identify eviction candidates. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, \texttt{findVictim} returns a failure sentinel and \texttt{Add} drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
 
 \textbf{Theorem 3 (Safety Invariant).} \textit{No two writers may simultaneously overwrite the same slot, and readers will never observe torn key/value pairs.}
-\\\textit{Proof:} A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, writing the SoA data, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ is guaranteed to never observe a torn key/value pair for a single slot.
+\\\textit{Proof:} A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, publishing the new immutable payload via an atomic store, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ alongside the atomic payload load is guaranteed to never observe a torn key/value pair for a single slot.
 
 \section{Cache-Line Padding to Eliminate False Sharing}
 
@@ -348,7 +352,7 @@ To substantiate the benefits of \texttt{liteLRU}'s bitmask and padding architect
 \caption{Ablation study throughput comparisons. $^*$The ablation runs use a distinct benchmark harness measuring absolute hardware limits without the 1\% tracking overhead of the latency evaluation, accounting for the higher ops/sec baseline relative to \S 9.1.}
 \end{table}
 
-\texttt{liteLRU} demonstrates an $\approx$3.3x throughput advantage over the naive Mutex LRU, and nearly double the throughput of the highly optimized \texttt{otter} concurrent cache. Furthermore, \texttt{liteLRU} possesses by far the lowest p99 tail latency (625 ns) of all concurrent caches tested, bounded strictly by lock-free atomics rather than buffer flushes. \texttt{otter} absorbs common-path operations into background buffers for a fast median, but suffers severe tail latency (49.8 \textmu s) during concurrent buffer flushes. \texttt{liteLRU} instead performs synchronous, bounded writes into the 64-way set associative slots.
+\texttt{liteLRU} demonstrates an $\approx$3.3x throughput advantage over the naive Mutex LRU, and nearly double the throughput of the highly optimized \texttt{otter} concurrent cache. Furthermore, \texttt{liteLRU} possesses by far the lowest p99 tail latency (625 ns) of all concurrent caches tested, bounded strictly by lock-free atomics rather than buffer flushes. \texttt{otter} absorbs common-path operations into background buffers for a fast median, but exhibits a 49.83 \textmu s p99 latency in this workload. This result is consistent with the tradeoffs of asynchronous buffering and its associated implementation overheads; isolating individual internal causes would require profiling. \texttt{liteLRU} instead performs synchronous, bounded writes into the 64-way set associative slots.
 
 \subsection{Throughput Scaling Under Contention}
 
@@ -483,7 +487,7 @@ No Cache & 86,453 & 303 $\mu$s & 1.36 ms & 35.1 ms \\
 \caption{End-to-end HTTP routing tail latencies under Zipfian load caching JSON payloads.}
 \end{table}
 
-By skipping the expensive CPU overhead of \texttt{encoding/json}, both caches naturally reduce the baseline latency and improve throughput over the raw origin server. However, at the extreme percentiles, the maximum percentile latency spike (173.1 ms) is highly suggestive of Otter's amortized ingestion buffers saturating under heavy concurrent load. If the background goroutine responsible for draining the ingestion buffer is delayed by the Go scheduler, the buffer may fill, causing subsequent \texttt{Set} operations to block until the drain completes---stalling HTTP workers. This latency profile is consistent with the structural properties of amortized-admission designs. By contrast, \texttt{liteLRU}'s structurally lock-free architecture maintains the lowest overall p99 latency (1.45 ms) and keeps the max latency tightly bounded (22.0 ms), ensuring the caching layer itself does not introduce arbitrary tail congestion into the network stack.
+By skipping the expensive CPU overhead of \texttt{encoding/json}, both caches naturally reduce the baseline latency and improve throughput over the raw origin server. However, at the extreme percentiles, the maximum percentile latency spike (173.1 ms) is highly suggestive of Otter's amortized ingestion buffers saturating under heavy concurrent load. If the background goroutine responsible for draining the ingestion buffer is delayed by the Go scheduler, the buffer may fill, causing subsequent \texttt{Set} operations to block until the drain completes---stalling HTTP workers. This latency profile is consistent with the structural properties of amortized-admission designs. By contrast, \texttt{liteLRU}'s structurally lock-free architecture maintains the lowest overall p99 latency (1.45 ms) and results in an observed maximum latency of 22.0 ms in this 10-second run, ensuring the caching layer itself does not introduce arbitrary tail congestion into the network stack.
 
 
 
