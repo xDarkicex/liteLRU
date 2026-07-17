@@ -236,7 +236,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \begin{itemize}
     \item \textbf{Global:} Total capacity $C$ and number of chunks $N = C/64$.
     \item \textbf{Per-Chunk:} A \texttt{chunk} struct containing 64-bit masks $V_k$ (valid bits), $W_k$ (writing bits), $A_k$ (access/recency bits), and an array of 8 \texttt{uint64} SWAR signatures for fast scanning.
-    \item \textbf{Per-Slot:} A \texttt{slotState} padded to 64 bytes containing the seqlock $S_i$, alongside Structure of Arrays (SoA) slices for keys, values, and handlers.
+    \item \textbf{Per-Slot:} A \texttt{slotState} padded to the target platform's $L$-byte coherence stride containing the seqlock $S_i$, alongside Structure of Arrays (SoA) slices for keys, values, and handlers.
 \end{itemize}
 
 \subsection{Pseudocode and Control Flow}

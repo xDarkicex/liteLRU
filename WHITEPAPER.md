@@ -186,7 +186,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 * **Global:** Total capacity $C$ and number of chunks $N = C/64$.
 * **Per-Chunk:** A `chunk` struct containing 64-bit masks $V_k$ (valid bits), $W_k$ (writing bits), $A_k$ (access/recency bits), and an array of 8 `uint64` SWAR signatures for fast scanning.
-* **Per-Slot:** A `slotState` padded to 64 bytes containing the seqlock $S_i$, alongside Structure of Arrays (SoA) slices for keys, values, and handlers.
+* **Per-Slot:** A `slotState` padded to the target platform's $L$-byte coherence stride containing the seqlock $S_i$, alongside Structure of Arrays (SoA) slices for keys, values, and handlers.
 
 ### 6.2 Pseudocode and Control Flow
 
@@ -252,7 +252,7 @@ Because the `mmap` allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (page al
 
 It is important to note that the 64-bit bitmasks ($V_k$, $A_k$, $W_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
 
-The same argument applies to the statistics counters. Aggregating hits and misses into two global `atomic.Int64` values would cause every `Get` on every core to contend on two shared cache lines. We instead shard into 64 independent `statStripe` structs, each padded to 64 bytes, selected by `hash & 63`. Each core writes exclusively to its own stripe with zero coherency interference.
+The same argument applies to the statistics counters. Aggregating hits and misses into two global `atomic.Int64` values would cause every `Get` on every core to contend on two shared cache lines. We instead shard into 64 independent `statStripe` structs, each padded to the target platform's $L$-byte coherence stride, selected by `hash & 63`. Each core writes exclusively to its own stripe with zero coherency interference.
 
 ---
 
