@@ -6,6 +6,7 @@ package liteLRU
 
 import (
 	"math/bits"
+	"runtime"
 	"sync/atomic"
 	"unsafe"
 
@@ -251,6 +252,7 @@ func (c *LRUCache) Close() {
 // within a specific 64-slot set (group).
 func (c *LRUCache) findVictim(group uint32) uint32 {
 	chk := &c.chunks[group]
+	retries := 0
 
 	for {
 		validBits := chk.valid.Load()
@@ -269,6 +271,11 @@ func (c *LRUCache) findVictim(group uint32) uint32 {
 			if chk.writing.CompareAndSwap(writingBits, writingBits|(1<<bit)) {
 				return group*64 + bit
 			}
+			
+			retries++
+			if retries > 10 {
+				return 0xFFFFFFFF // Shed load to guarantee bounded execution
+			}
 			continue // CAS failed, retry
 		}
 
@@ -276,6 +283,18 @@ func (c *LRUCache) findVictim(group uint32) uint32 {
 		// Clear the accessed bits of currently valid items to give them a second chance,
 		// while preserving any concurrent access bits set by readers.
 		chk.accessed.And(^validBits)
+		
+		retries++
+		if retries > 10 {
+			return 0xFFFFFFFF // Shed load to guarantee bounded execution
+		}
+		
+		// If we failed to find a candidate because other threads are currently writing,
+		// yield the processor. This prevents a spin-lock preemption meltdown (priority inversion)
+		// under massive concurrent thundering herds.
+		if writingBits != 0 {
+			runtime.Gosched()
+		}
 	}
 }
 
@@ -335,6 +354,9 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 
 	// 2. Not found, we need to evict a victim from this 64-slot set
 	victimIdx := c.findVictim(group)
+	if victimIdx == 0xFFFFFFFF {
+		return // Load shedding: chunk is highly contended, skip cache insertion
+	}
 	bit := victimIdx % 64
 
 	// We own the writing bit. Set seqlock to odd.

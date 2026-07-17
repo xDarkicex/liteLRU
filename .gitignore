@@ -9,3 +9,4 @@ raw_benchmarks.txt
 .vscode/
 *.bin
 server
+benchmarks/http_server/targets_*.txt

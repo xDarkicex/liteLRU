@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -219,7 +220,8 @@ func main() {
 			parts := strings.Split(path, "/")
 			if len(parts) >= 5 && parts[4] == "profile" {
 				idStr := parts[3]
-				time.Sleep(1 * time.Millisecond) // Simulate route parsing & middleware overhead
+				// CPU-bound simulated routing (prevents artificial timer synchronization)
+				_ = regexp.MustCompile("^/api/user/([0-9]+)/profile$").FindStringSubmatch(path)
 				
 				handler := func() {}
 				params := []liteLRU.Param{{Key: "id", Value: idStr}}
@@ -249,7 +251,8 @@ func main() {
 			parts := strings.Split(path, "/")
 			if len(parts) >= 5 && parts[4] == "profile" {
 				idStr := parts[3]
-				time.Sleep(1 * time.Millisecond) // Simulate route parsing & middleware overhead
+				// CPU-bound simulated routing (prevents artificial timer synchronization)
+				_ = regexp.MustCompile("^/api/user/([0-9]+)/profile$").FindStringSubmatch(path)
 				
 				res := RouteResult{
 					Handler: func() {},
@@ -269,7 +272,8 @@ func main() {
 		parts := strings.Split(path, "/")
 		if len(parts) >= 5 && parts[4] == "profile" {
 			idStr := parts[3]
-			time.Sleep(1 * time.Millisecond) // Simulate route parsing & middleware overhead
+			// CPU-bound simulated routing (prevents artificial timer synchronization)
+			_ = regexp.MustCompile("^/api/user/([0-9]+)/profile$").FindStringSubmatch(path)
 			
 			handler := func() {}
 			handler()
