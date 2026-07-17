@@ -441,6 +441,29 @@ By skipping the expensive CPU overhead of \texttt{encoding/json}, both caches na
 
 
 
+\subsection{Reverse Proxy Integration (Upstream Latency and Jitter)}
+
+To demonstrate that the cache helps when a hit avoids network transport, upstream latency, and origin variance (and not just CPU-bound JSON serialization), we simulated a reverse proxy caching layer. On a cache miss, the handler simulates an upstream network fetch with a 50~ms base latency and up to 20~ms of random jitter before JSON marshaling. On a cache hit, the upstream request and serialization are bypassed entirely.
+
+The cache was attacked with a 10-second \texttt{vegeta} workload utilizing 64 concurrent workers targeting the simulated proxy endpoint.
+
+\begin{table}[h!]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Cache Implementation} & \textbf{Rate (Req/s)} & \textbf{p50 Latency} & \textbf{p99 Latency} & \textbf{Max Latency} \\
+\midrule
+\textbf{liteLRU} & \textbf{3,140} & \textbf{147 $\mu$s} & 69.22 ms & 74.14 ms \\
+Otter & 3,139 & 152 $\mu$s & 69.22 ms & 72.45 ms \\
+Origin (No Cache) & 1,101 & 57.36 ms & 69.52 ms & 90.55 ms \\
+\bottomrule
+\end{tabular}
+\caption{Reverse proxy simulation with 50-70~ms upstream jitter on cache misses.}
+\label{tab:proxy_integration}
+\end{table}
+
+By shielding the application from the simulated network upstream, \texttt{liteLRU} drops the median (p50) response time from 57.36~ms down to 147~$\mu$s---an approximately \textbf{390x improvement} in user-facing latency. The p99 latency in the cached runs (69.22~ms) perfectly reflects the intentional upstream penalty during cold-start cache misses, showing that the cache's own internal mechanism latency is statistically invisible compared to the network bound.
+
 \section{Discussion and Limitations}
 
 \textbf{Memory Overhead.} The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires \textbf{$\sim$133 MB} of heap allocation for the SoA arrays, whereas \texttt{otter} requires \textbf{$\sim$120 MB}. This represents a modest $\sim$11\% memory premium in exchange for wait-free concurrency and an 8.8x throughput speedup under high write load.

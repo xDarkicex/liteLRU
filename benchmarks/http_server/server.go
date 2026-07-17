@@ -132,6 +132,60 @@ func main() {
 		w.Write(b)
 	})
 
+	http.HandleFunc("/proxy/", func(w http.ResponseWriter, r *http.Request) {
+		idStr := strings.TrimPrefix(r.URL.Path, "/proxy/")
+		if idStr == "" {
+			http.Error(w, "missing id", http.StatusBadRequest)
+			return
+		}
+
+		idNum, err := strconv.Atoi(idStr)
+		if err != nil {
+			idNum = 0
+		}
+		
+		payload := payloads[idNum%20]
+
+		if *cacheType == "litelru" {
+			var pbuf [1]liteLRU.Param
+			if _, params, ok := lite.Get("GET", "/proxy/"+idStr, pbuf[:0]); ok && len(params) > 0 {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(params[0].Value))
+				return
+			}
+			// Simulate upstream network latency
+			time.Sleep(50*time.Millisecond + time.Duration(idNum%20)*time.Millisecond)
+			b, _ := json.Marshal(payload)
+			lite.Add("GET", "/proxy/"+idStr, nil, []liteLRU.Param{{Key: "res", Value: string(b)}})
+			
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(b)
+			return
+		}
+
+		if *cacheType == "otter" {
+			if cachedRes, ok := otterCache.Get("/proxy/" + idStr); ok {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(cachedRes))
+				return
+			}
+			// Simulate upstream network latency
+			time.Sleep(50*time.Millisecond + time.Duration(idNum%20)*time.Millisecond)
+			b, _ := json.Marshal(payload)
+			otterCache.Set("/proxy/"+idStr, string(b))
+			
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(b)
+			return
+		}
+
+		// Simulate upstream network latency
+		time.Sleep(50*time.Millisecond + time.Duration(idNum%20)*time.Millisecond)
+		b, _ := json.Marshal(payload)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(b)
+	})
+
 	fmt.Println("Listening on :8099...")
 	log.Fatal(http.ListenAndServe(":8099", nil))
 }

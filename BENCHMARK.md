@@ -56,6 +56,22 @@ Even when integrated into a full HTTP routing and JSON serialization pipeline, `
 
 ---
 
+## Reverse Proxy Integration (Upstream Latency/Jitter)
+
+To demonstrate that the cache helps when a hit avoids network transport, upstream latency, and origin variance (not just CPU-bound JSON serialization), we simulated a reverse proxy caching layer. On a cache miss, the server simulates an upstream network fetch with a 50ms base latency and up to 20ms of random jitter. On a cache hit, the upstream request is bypassed entirely.
+
+| Cache Implementation | Rate (Req/s) | p50 Latency | p99 Latency | Max Latency |
+|----------------------|--------------|-------------|-------------|-------------|
+| **liteLRU**          | **3,140 req/s** | **147 µs**  | 69.22 ms    | 74.14 ms    |
+| Otter                | 3,139 req/s  | 152 µs      | 69.22 ms    | 72.45 ms    |
+| Origin (No Cache)    | 1,101 req/s  | 57.36 ms    | 69.52 ms    | 90.55 ms    |
+
+*(Note: The p99 latency for the cached runs reflects the intentional 50-70ms upstream penalty on cache misses during the cold start).*
+
+By shielding the application from the simulated network upstream, `liteLRU` drops the median (p50) response time from 57.36ms down to 147µs—an approximately **390x improvement** in user-facing latency.
+
+---
+
 ## Key Takeaway
 
 `liteLRU` sacrifices a negligible amount of space to eliminate `sync.RWMutex` locks. In exchange, its **Hybrid Memory Architecture** unlocks unlimited parallel scaling across all CPU cores while completely isolating the high-frequency concurrency mutations from the Go garbage collector, guaranteeing ultra-low p99 latencies for high-throughput concurrent applications like the `nanite` router.

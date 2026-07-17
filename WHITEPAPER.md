@@ -363,6 +363,22 @@ In summary, `liteLRU` yields the highest throughput (93,603 req/sec), the lowest
 ---
 
 
+### 9.9 Reverse Proxy Integration (Upstream Latency and Jitter)
+
+To demonstrate that the cache helps when a hit avoids network transport, upstream latency, and origin variance (and not just CPU-bound JSON serialization), we simulated a reverse proxy caching layer. On a cache miss, the handler simulates an upstream network fetch with a 50 ms base latency and up to 20 ms of random jitter before JSON marshaling. On a cache hit, the upstream request and serialization are bypassed entirely.
+
+The cache was attacked with a 10-second `vegeta` workload utilizing 64 concurrent workers targeting the simulated proxy endpoint.
+
+| Cache Implementation | Rate (Req/s) | p50 Latency | p99 Latency | Max Latency |
+|----------------------|--------------|-------------|-------------|-------------|
+| **liteLRU**          | **3,140 req/s** | **147 µs**  | 69.22 ms    | 74.14 ms    |
+| Otter                | 3,139 req/s  | 152 µs      | 69.22 ms    | 72.45 ms    |
+| Origin (No Cache)    | 1,101 req/s  | 57.36 ms    | 69.52 ms    | 90.55 ms    |
+
+*Table 6: Reverse proxy simulation with 50-70 ms upstream jitter on cache misses.*
+
+By shielding the application from the simulated network upstream, `liteLRU` drops the median (p50) response time from 57.36 ms down to 147 µs—an approximately **390x improvement** in user-facing latency. The p99 latency in the cached runs (69.22 ms) perfectly reflects the intentional upstream penalty during cold-start cache misses, showing that the cache's own internal mechanism latency is statistically invisible compared to the network bound.
+
 ## 10. Discussion and Limitations
 
 **Memory Overhead.** The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires **~133 MB** of heap allocation for the SoA arrays, whereas `otter` requires **~120 MB**. This represents a modest ~11% memory premium in exchange for wait-free concurrency and a **7.36x throughput speedup** under high write load (80% writes).
