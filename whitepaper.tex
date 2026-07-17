@@ -84,13 +84,13 @@ Atomic operations (\texttt{CAS}, fetch-and-add) on a memory location whose cache
 
 Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips. As core count $N$ grows, the wait time for the contested line degrades superlinearly due to RFO round-trip amplification~\cite{dice}, a fact formalized by Amdahl~\cite{amdahl1967}. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit~\cite{lockfree2004}.
 
-\subsubsection*{Contributions}
+\subsection{Contributions}
 In this paper, we make the following contributions to concurrent cache design:
 \begin{itemize}
     \item \textbf{Contention-Bounded Eviction Algorithm:} A 64-way set associative architecture utilizing chunked bitmasks and hardware \texttt{CTZ}, eliminating global clock hands and open-addressed maps entirely.
     \item \textbf{Hybrid Memory Architecture:} Off-heap allocation for lock-free state to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers on the heap.
     \item \textbf{Padded Seqlocks:} A strict structural layout that yields strictly wait-free reads and eliminates false sharing for per-slot metadata.
-    \item \textbf{Load-Shedding Eviction Protocol:} A mathematically bounded write protocol that caps spin-lock retries, converting extreme pathological contention into dropped admission to guarantee $O(1)$ execution.
+    \item \textbf{Load-Shedding Eviction Protocol:} A load-shedding protocol that caps write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
 \end{itemize}
 
 \section{Hybrid Memory Architecture and 64-Way Set Associative SWAR}
@@ -223,11 +223,11 @@ The eviction search process executes as follows:
     \item If $W_k[i] = 1$ is successfully claimed, proceed to step 1 of the concurrent Set Associative Write Consistency protocol defined in \S 6.
 \end{enumerate}
 
-To guarantee O(1) lock-free progress and bound the worst-case scenario where a chunk is pathologically saturated by concurrent writers (e.g., a Thundering Herd), \texttt{liteLRU} employs \textbf{Load-Shedding Eviction}. The \texttt{findVictim} loop attempts to claim a write-lock (\texttt{writing} bit) on an eviction candidate. If it fails to claim any slot after 10 retries, it returns a sentinel failure value (\texttt{0xFFFFFFFF}). The \texttt{Add} operation intercepts this sentinel and safely drops the cache admission. By sacrificing absolute admission under extreme contention, \texttt{liteLRU} mathematically guarantees bounded execution and prevents spin-lock preemption cascades.
+To guarantee O(1) lock-free progress and bound the worst-case scenario where a chunk is pathologically saturated by concurrent writers (e.g., a Thundering Herd), \texttt{liteLRU} employs \textbf{Load-Shedding Eviction}. The \texttt{findVictim} loop attempts to claim a write-lock (\texttt{writing} bit) on an eviction candidate. If it fails to claim any slot after 10 retries, it returns a sentinel failure value (\texttt{0xFFFFFFFF}). The \texttt{Add} operation intercepts this sentinel and safely drops the cache admission. By sacrificing absolute admission under extreme contention, \texttt{liteLRU} bounds write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
 
 \subsection{Eliminating the Global Clock Hand}
 
-Because \texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_\text{start} = h(r) \bmod N_k$, there is no shared global clock-hand atomic. Each writer begins its eviction sweep at a deterministic but distributed starting position, naturally load-balancing eviction pressure across chunks without any coordination. Under pathological skew where many keys hash to the same chunk, the multi-chunk scan fallback described above ensures fairness by overflowing the search into adjacent, potentially less-contended chunks.
+Because \texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_\text{start} = h(r) \bmod N_k$, there is no shared global clock-hand atomic. Each writer begins its eviction sweep at a deterministic but distributed starting position, naturally load-balancing eviction pressure across chunks without any coordination. 
 
 \section{Algorithm and Correctness}
 
@@ -244,10 +244,12 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \begin{enumerate}
     \item Hash the key to find the corresponding chunk $k$.
     \item Scan the 8 SWAR signature words using byte-wise comparison.
-    \item For any match at slot $i$, load the seqlock $S_i$.
+    \item For any match at slot $i$, verify the slot is valid in $V_k$.
+    \item Load the seqlock $S_{i, \text{start}}$. If odd, skip slot (conflict).
     \item Read the key/value from the SoA arrays.
-    \item Verify the seqlock $S_i$ is even and unchanged.
-    \item Atomically OR the bit $i$ into $A_k$ to record recency.
+    \item Load the seqlock $S_{i, \text{end}}$. If $S_{i, \text{start}} \neq S_{i, \text{end}}$, skip slot (conflict).
+    \item Atomically OR the bit $i$ into $A_k$ to record recency and return hit.
+    \item If no slots match cleanly, return miss.
 \end{enumerate}
 
 \textbf{Add(key, value)}
@@ -266,6 +268,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \textbf{findVictim(chunk k)}
 \begin{enumerate}
     \item Retry loop (max 10 iterations).
+    \item Load $V_k, A_k, W_k$. If $C_k = 0$, atomically clear $A_k$ for all valid slots via CAS. Recompute $C_k$ before proceeding.
     \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ((\textasciitilde V\_k \textbar{} \textasciitilde A\_k) \& \textasciitilde W\_k)}.
     \item Attempt to CAS the $W_k$ bitmask to claim the slot.
     \item If successful, return the slot index.
@@ -276,13 +279,13 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \subsection{Correctness Theorems}
 
 \textbf{Theorem 1 (Wait-Free Reads).} \textit{Any thread executing \texttt{Get} is guaranteed to complete in a bounded number of instructions regardless of the state or execution speed of concurrent writers.}
-\\\textit{Proof:} The read path consists solely of a SWAR signature scan, atomic loads of the 64-byte padded seqlock $S_i$, a string comparison, and a single bitwise \texttt{OR} for the access bit. The padded layout strictly isolates $S_i$, mathematically eliminating false-sharing invalidations. Under no circumstances does a reader spin on a lock or wait on a channel; concurrent writes merely cause an optimistic retry of the localized seqlock loop.
+\\\textit{Proof:} The read path consists solely of a SWAR signature scan, atomic loads of the 64-byte padded seqlock $S_i$, a string comparison, and a single bitwise \texttt{OR} for the access bit. The padded layout strictly isolates $S_i$, eliminating false-sharing across slots. The read path evaluates at most 8 SWAR word scans, and for each match at most two seqlock loads and one key compare; conflicts skip without retry; if no clean match, return miss. Under no circumstances does a reader spin on a lock or retry.
 
 \textbf{Theorem 2 (Bounded Write-Side Work).} \textit{Any thread executing \texttt{Add} will terminate in $O(1)$ atomic operations.}
-\\\textit{Proof:} \texttt{findVictim} utilizes the \texttt{CTZ} instruction to identify eviction candidates in a single CPU cycle. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, \texttt{findVictim} returns a failure sentinel and \texttt{Add} drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
+\\\textit{Proof:} \texttt{findVictim} utilizes the \texttt{CTZ} instruction to identify eviction candidates. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, \texttt{findVictim} returns a failure sentinel and \texttt{Add} drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
 
 \textbf{Theorem 3 (Safety Invariant).} \textit{No two writers may simultaneously overwrite the same slot, and readers will never observe torn key/value pairs.}
-\\\textit{Proof:} A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, writing the SoA data, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ is guaranteed a linearizable, untorn read.
+\\\textit{Proof:} A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, writing the SoA data, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ is guaranteed to never observe a torn key/value pair for a single slot.
 
 \section{Cache-Line Padding to Eliminate False Sharing}
 
@@ -531,7 +534,7 @@ By caching the route resolution itself, \texttt{liteLRU} drops the median observ
 
 In this end-to-end simulation, \texttt{liteLRU} outperforms Otter in both peak throughput (by 4\%) and tail latency across all percentiles. The p99 latency drops from 1.73 ms (Otter) to 1.39 ms (\texttt{liteLRU}), and the maximum observed tail latency is halved (18.96 ms vs 37.92 ms).
 
-This performance delta highlights the effectiveness of \texttt{liteLRU}'s \textbf{Load-Shedding Eviction} mechanism. Under pathological concurrent writes (simulating a Thundering Herd on a cache miss), bounded execution takes precedence over absolute cache insertion. If \texttt{liteLRU} detects that a specific 64-slot chunk is saturated by concurrent evicting threads, it dynamically aborts the insertion. This mechanism caps per-attempt write-side work at a fixed constant and converts extreme contention into dropped admission, preventing spin-lock preemption cascades.
+This performance delta highlights the effectiveness of \texttt{liteLRU}'s \textbf{Load-Shedding Eviction} mechanism. Under pathological concurrent writes (simulating a Thundering Herd on a cache miss), bounded execution takes precedence over absolute cache insertion. If \texttt{liteLRU} detects that a specific 64-slot chunk is saturated by concurrent evicting threads, it dynamically aborts the insertion. This mechanism caps per-attempt write-side work at a fixed constant and converts extreme contention into dropped admission, avoiding unbounded spin under multi-miss contention.
 
 In contrast, Otter’s implementation uses asynchronous buffering and background processing, whereas \texttt{liteLRU} performs synchronous inline admission; the higher tail latency (37.92 ms max) observed here is consistent with that architectural tradeoff. Because \texttt{liteLRU} remains strictly synchronous, its evictions run inline on the executing thread without background queues, guaranteeing zero heap allocations for the returned parameter slices while delivering superior end-to-end responsiveness.
 

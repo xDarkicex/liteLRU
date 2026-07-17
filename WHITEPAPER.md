@@ -14,7 +14,7 @@
 
 ## Abstract
 
-Concurrent approximate LRU structures often serialize cores on shared metadata. We present `liteLRU`, a fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are wait-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, `liteLRU` isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that `liteLRU` sustains over 30 million operations per second under severe 80% write contention while providing strictly bounded maximum tail latency ($O(1)$) across synthetic and end-to-end network simulations.
+Concurrent approximate LRU structures often serialize cores on shared metadata. We present `liteLRU`, a fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are wait-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, `liteLRU` isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that `liteLRU` sustains over 30 million operations per second under severe 80% write contention while providing sub-microsecond p99 latency on the cache hot path and contention-bounded write work under synthetic and end-to-end workloads.
 
 ---
 
@@ -47,13 +47,13 @@ Under high concurrency, a single globally contested atomic (e.g., a global clock
 
 ---
 
-### Contributions
+## 1.4 Contributions
 
 In this paper, we make the following contributions to concurrent cache design:
 * **Contention-Bounded Eviction Algorithm:** A 64-way set associative architecture utilizing chunked bitmasks and hardware `CTZ`, eliminating global clock hands and open-addressed maps entirely.
 * **Hybrid Memory Architecture:** Off-heap allocation for lock-free state to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers on the heap.
 * **Padded Seqlocks:** A strict structural layout that yields strictly wait-free reads and eliminates false sharing for per-slot metadata.
-* **Load-Shedding Eviction Protocol:** A mathematically bounded write protocol that caps spin-lock retries, converting extreme pathological contention into dropped admission to guarantee $O(1)$ execution.
+* **Load-Shedding Eviction Protocol:** A load-shedding protocol that caps write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
 
 ## 2. Hybrid Memory Architecture and GC Isolation
 
@@ -170,11 +170,11 @@ The eviction search process executes as follows:
 3. If the CAS fails (another writer claimed it), restart at step 1 for the same chunk.
 4. If $W_k[i] = 1$ is successfully claimed, proceed with the in-place 64-way set associative write protocol defined in §6.
 
-To guarantee O(1) lock-free progress and bound the worst-case scenario where a chunk is pathologically saturated by concurrent writers (e.g., a Thundering Herd), `liteLRU` employs **Load-Shedding Eviction**. The `findVictim` loop attempts to claim a write-lock (`writing` bit) on an eviction candidate. If it fails to claim any slot after 10 retries, it returns a sentinel failure value (`0xFFFFFFFF`). The `Add` operation intercepts this sentinel and safely drops the cache admission. By sacrificing absolute admission under extreme contention, `liteLRU` mathematically guarantees bounded execution and prevents spin-lock preemption cascades.
+To guarantee O(1) lock-free progress and bound the worst-case scenario where a chunk is pathologically saturated by concurrent writers (e.g., a Thundering Herd), `liteLRU` employs **Load-Shedding Eviction**. The `findVictim` loop attempts to claim a write-lock (`writing` bit) on an eviction candidate. If it fails to claim any slot after 10 retries, it returns a sentinel failure value (`0xFFFFFFFF`). The `Add` operation intercepts this sentinel and safely drops the cache admission. By sacrificing absolute admission under extreme contention, `liteLRU` bounds write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
 
 ### 5.4 Eliminating the Global Clock Hand
 
-Because `liteLRU` seeds the starting chunk index from the hash of the incoming route, $k_{start} = h(r) \bmod N_k$, there is no global clock-hand atomic. Each thread begins its eviction sweep at a deterministic but distributed starting position. Contention on a shared sweep counter is eliminated entirely. Under pathological skew where many keys hash to the same chunk, the multi-chunk scan fallback described above ensures fairness by overflowing the search into adjacent, potentially less-contended chunks.
+Because `liteLRU` seeds the starting chunk index from the hash of the incoming route, $k_{start} = h(r) \bmod N_k$, there is no global clock-hand atomic. Each thread begins its eviction sweep at a deterministic but distributed starting position. Contention on a shared sweep counter is eliminated entirely. 
 
 ---
 
@@ -193,10 +193,12 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 **Get(key)**
 1. Hash the key to find the corresponding chunk $k$.
 2. Scan the 8 SWAR signature words using byte-wise comparison.
-3. For any match at slot $i$, load the seqlock $S_i$.
-4. Read the key/value from the SoA arrays.
-5. Verify the seqlock $S_i$ is even and unchanged.
-6. Atomically OR the bit $i$ into $A_k$ to record recency.
+3. For any match at slot $i$, verify the slot is valid in $V_k$.
+4. Load the seqlock $S_{i, \text{start}}$. If odd, skip slot (conflict).
+5. Read the key/value from the SoA arrays.
+6. Load the seqlock $S_{i, \text{end}}$. If $S_{i, \text{start}} \neq S_{i, \text{end}}$, skip slot (conflict).
+7. Atomically OR the bit $i$ into $A_k$ to record recency and return hit.
+8. If no slots match cleanly, return miss.
 
 **Add(key, value)**
 1. Hash the key to find chunk $k$.
@@ -211,22 +213,23 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 **findVictim(chunk k)**
 1. Retry loop (max 10 iterations).
-2. Apply the CLOCK approximation: identify candidate slots using `CTZ((~V_k | ~A_k) & ~W_k)`.
-3. Attempt to CAS the $W_k$ bitmask to claim the slot.
-4. If successful, return the slot index.
-5. If unsuccessful (due to concurrent writers), increment retry counter.
-6. If 10 retries are exhausted, return the `0xFFFFFFFF` failure sentinel.
+2. Load $V_k, A_k, W_k$. If $C_k = 0$, atomically clear $A_k$ for all valid slots via CAS. Recompute $C_k$ before proceeding.
+3. Apply the CLOCK approximation: identify candidate slots using `CTZ((~V_k | ~A_k) & ~W_k)`.
+4. Attempt to CAS the $W_k$ bitmask to claim the slot.
+5. If successful, return the slot index.
+6. If unsuccessful (due to concurrent writers), increment retry counter.
+7. If 10 retries are exhausted, return the `0xFFFFFFFF` failure sentinel.
 
 ### 6.3 Correctness Theorems
 
 **Theorem 1 (Wait-Free Reads).** *Any thread executing `Get` is guaranteed to complete in a bounded number of instructions regardless of the state or execution speed of concurrent writers.*
-*Proof:* The read path consists solely of a SWAR signature scan, atomic loads of the 64-byte padded seqlock $S_i$, a string comparison, and a single bitwise `OR` for the access bit. The padded layout strictly isolates $S_i$, mathematically eliminating false-sharing invalidations. Under no circumstances does a reader spin on a lock or wait on a channel; concurrent writes merely cause an optimistic retry of the localized seqlock loop.
+*Proof:* The read path consists solely of a SWAR signature scan, atomic loads of the 64-byte padded seqlock $S_i$, a string comparison, and a single bitwise `OR` for the access bit. The padded layout strictly isolates $S_i$, eliminating false-sharing across slots. The read path evaluates at most 8 SWAR word scans, and for each match at most two seqlock loads and one key compare; conflicts skip without retry; if no clean match, return miss. Under no circumstances does a reader spin on a lock or retry.
 
 **Theorem 2 (Bounded Write-Side Work).** *Any thread executing `Add` will terminate in $O(1)$ atomic operations.*
-*Proof:* `findVictim` utilizes the `CTZ` instruction to identify eviction candidates in a single CPU cycle. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, `findVictim` returns a failure sentinel and `Add` drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
+*Proof:* `findVictim` utilizes the `CTZ` instruction to identify eviction candidates. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, `findVictim` returns a failure sentinel and `Add` drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
 
 **Theorem 3 (Safety Invariant).** *No two writers may simultaneously overwrite the same slot, and readers will never observe torn key/value pairs.*
-*Proof:* A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, writing the SoA data, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ is guaranteed a linearizable, untorn read.
+*Proof:* A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, writing the SoA data, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ is guaranteed to never observe a torn key/value pair for a single slot.
 
 ## 7. Cache-Line Padding to Eliminate False Sharing
 
@@ -407,7 +410,7 @@ The cache was attacked with a 10-second `vegeta` workload utilizing 64 concurren
 | Otter                | 3,139 req/s  | 152 µs      | 69.22 ms    | 72.45 ms    |
 | Origin (No Cache)    | 1,101 req/s  | 57.36 ms    | 69.52 ms    | 90.55 ms    |
 
-*Table 6: Reverse proxy simulation with 50-70 ms upstream jitter on cache misses.*
+*Table: Reverse proxy simulation with 50-70 ms upstream jitter on cache misses.*
 
 By shielding the application from the simulated network upstream, `liteLRU` drops the median (p50) response time from 57.36 ms down to 147 µs—an approximately **390x improvement** in user-facing latency. The p99 latency in the cached runs (69.22 ms) perfectly reflects the intentional upstream penalty during cold-start cache misses, showing that the cache's own internal mechanism latency is statistically invisible compared to the network bound.
 
@@ -425,11 +428,11 @@ We then present the realistic end-to-end results below, where the un-cached orig
 | Otter                | 91,959 req/s | 269 µs      | 1.73 ms     | 37.92 ms    |
 | Origin (No Cache)    | 78,680 req/s | 381 µs      | 1.93 ms     | 198.69 ms   |
 
-*Table 7: Dynamic router simulation with CPU-bound routing penalty on cache misses.*
+*Table: Dynamic router simulation with CPU-bound routing penalty on cache misses.*
 
 In this end-to-end simulation, `liteLRU` outperforms Otter in both peak throughput (by 4%) and tail latency across all percentiles. The p99 latency drops from 1.73 ms (Otter) to 1.39 ms (`liteLRU`), and the maximum observed tail latency is halved (18.96 ms vs 37.92 ms).
 
-This performance delta highlights the effectiveness of `liteLRU`'s **Load-Shedding Eviction** mechanism. Under pathological concurrent writes (simulating a Thundering Herd on a cache miss), bounded execution takes precedence over absolute cache insertion. If `liteLRU` detects that a specific 64-slot chunk is saturated by concurrent evicting threads, it dynamically aborts the insertion. This mechanism caps per-attempt write-side work at a fixed constant and converts extreme contention into dropped admission, preventing spin-lock preemption cascades.
+This performance delta highlights the effectiveness of `liteLRU`'s **Load-Shedding Eviction** mechanism. Under pathological concurrent writes (simulating a Thundering Herd on a cache miss), bounded execution takes precedence over absolute cache insertion. If `liteLRU` detects that a specific 64-slot chunk is saturated by concurrent evicting threads, it dynamically aborts the insertion. This mechanism caps per-attempt write-side work at a fixed constant and converts extreme contention into dropped admission, avoiding unbounded spin under multi-miss contention.
 
 In contrast, Otter’s implementation uses asynchronous buffering and background processing, whereas `liteLRU` performs synchronous inline admission; the higher tail latency (37.92 ms max) observed here is consistent with that architectural tradeoff. Because `liteLRU` remains strictly synchronous, its evictions run inline on the executing thread without background queues, guaranteeing zero heap allocations for the returned parameter slices while delivering superior end-to-end responsiveness.
 
@@ -443,7 +446,7 @@ By caching the route resolution itself, `liteLRU` drops the median observed requ
 
 **Fixed Capacity.** The cache does not resize. The 64-way set associative slot array is pre-allocated at initialization. This is a deliberate design decision to prevent any allocation or growth operation during steady-state execution, but it requires the caller to provision capacity upfront.
 
-**Extreme Contention Load-Shedding.** To preserve microsecond read latency and bound write times, `liteLRU` limits spin-lock retries to 10 per eviction attempt. Under pathological duplicate-insert contention (e.g., thousands of workers missing on the same URL simultaneously), `liteLRU` will sacrifice some admissions and drop the writes. This load-shedding is mathematically necessary to prevent spin-lock preemption cascades, prioritizing stable HTTP worker latency over guaranteed cache insertion.
+**Extreme Contention Load-Shedding.** To preserve microsecond read latency and bound write times, `liteLRU` limits spin-lock retries to 10 per eviction attempt. Under pathological duplicate-insert contention (e.g., thousands of workers missing on the same URL simultaneously), `liteLRU` will sacrifice some admissions and drop the writes. This load-shedding is a deliberate bound: it prevents unbounded spinning under pathological multi-miss contention, prioritizing stable latency over guaranteed admission.
 
 **Zero-Allocation Param Retrieval.** By accepting a caller-provided stack-allocated buffer (`[]Param`), `liteLRU` guarantees zero heap allocations on cache hits, avoiding the GC overhead that plagues amortized caches returning pointer-backed slice structs.
 
