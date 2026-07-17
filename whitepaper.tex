@@ -485,13 +485,13 @@ Origin (No Cache) & 78,680 & 381 $\mu$s & 1.93 ms & 198.69 ms \\
 \label{tab:router}
 \end{table}
 
-By caching the route resolution itself, \texttt{liteLRU} drops the dynamic routing overhead from 1.11~ms to just 251~$\mu$s, proving that it acts as a tremendously effective layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
+By caching the route resolution itself, \texttt{liteLRU} drops the dynamic routing overhead from 381~$\mu$s to just 253~$\mu$s, proving that it acts as a tremendously effective layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
 
 In this end-to-end simulation, \texttt{liteLRU} outperforms Otter in both peak throughput (by 4\%) and tail latency across all percentiles. The p99 latency drops from 1.73 ms (Otter) to 1.39 ms (\texttt{liteLRU}), and the maximum observed tail latency is halved (18.96 ms vs 37.92 ms).
 
-This performance delta highlights the effectiveness of \texttt{liteLRU}'s \textbf{Load-Shedding Eviction} mechanism. Under pathological concurrent writes (simulating a Thundering Herd on a cache miss), bounded execution takes precedence over absolute cache insertion. If \texttt{liteLRU} detects that a specific 64-slot chunk is saturated by concurrent evicting threads, it dynamically aborts the insertion. This O(1) lock-free load-shedding prevents spin-lock preemption cascades.
+This performance delta highlights the effectiveness of \texttt{liteLRU}'s \textbf{Load-Shedding Eviction} mechanism. Under pathological concurrent writes (simulating a Thundering Herd on a cache miss), bounded execution takes precedence over absolute cache insertion. If \texttt{liteLRU} detects that a specific 64-slot chunk is saturated by concurrent evicting threads, it dynamically aborts the insertion. This mechanism caps per-attempt write-side work at a fixed constant and converts extreme contention into dropped admission, preventing spin-lock preemption cascades.
 
-In contrast, Otter's asynchronous buffering queue absorbs the thundering herd but incurs queue-processing delays, which translates directly into higher tail latency (37.92 ms max) as the background goroutine struggles to compact the queue. Because \texttt{liteLRU} remains strictly synchronous, its evictions run inline on the executing thread without background queues, guaranteeing zero heap allocations for the returned parameter slices while delivering superior end-to-end responsiveness.
+In contrast, Otter's asynchronous buffering queue absorbs the thundering herd but incurs queue-processing delays, which translates directly into higher tail latency (37.92 ms max) because the latency profile is consistent with asynchronous buffering overhead. Because \texttt{liteLRU} remains strictly synchronous, its evictions run inline on the executing thread without background queues, guaranteeing zero heap allocations for the returned parameter slices while delivering superior end-to-end responsiveness.
 
 \section{Discussion and Limitations}
 
@@ -505,7 +505,7 @@ In contrast, Otter's asynchronous buffering queue absorbs the thundering herd bu
 
 \section{Conclusion}
 
-We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap mmap allocation to eliminate GC interference~\cite{gogc2018}; SoA layout to maximize cache-line occupancy per field access; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; Seqlocks~\cite{seqlockoriginal} to provide wait-free read semantics; and 64-byte cache-line padding~\cite{falsesharing1993,mesi1984} to eliminate false-sharing serialization. The result is a cache architecture whose concurrency cost is bounded by single-cycle hardware instructions rather than operating system synchronization primitives, achieving over 29M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
+We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap mmap allocation to eliminate GC interference~\cite{gogc2018}; SoA layout to maximize cache-line occupancy per field access; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; Seqlocks~\cite{seqlockoriginal} to provide wait-free read semantics; and 64-byte cache-line padding~\cite{falsesharing1993,mesi1984} to eliminate false-sharing serialization. The result is a cache architecture whose concurrency cost is bounded by a small, fixed set of hardware atomic operations rather than OS-level synchronization primitives, achieving over 29M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
 
 \bibliographystyle{plain}
 \bibliography{references}
