@@ -47,13 +47,21 @@ Under high concurrency, a single globally contested atomic (e.g., a global clock
 
 ---
 
+## 1.1 Contributions
+
+In this paper, we make the following contributions to concurrent cache design:
+* **Contention-Bounded Eviction Algorithm:** A 64-way set associative architecture utilizing chunked bitmasks and hardware `CTZ`, eliminating global clock hands and open-addressed maps entirely.
+* **Hybrid Memory Architecture:** Off-heap allocation for lock-free state to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers on the heap.
+* **Padded Seqlocks:** A strict structural layout that yields strictly wait-free reads and eliminates false sharing for per-slot metadata.
+* **Load-Shedding Eviction Protocol:** A mathematically bounded write protocol that caps spin-lock retries, converting extreme pathological contention into dropped admission to guarantee $O(1)$ execution.
+
 ## 2. Hybrid Memory Architecture and GC Isolation
 
 **Scanner Heap Pressure.** Objects that escape to the heap are scanned during the mark phase. A cache holding thousands of string values generates a large root set for the GC to scan, increasing mark phase duration proportionally.
 
-`liteLRU` addresses this through two radical architectural mechanisms:
+`liteLRU` addresses this through two non-trivial architectural changes:
 
-1. **64-Way Set Associativity over Hash Maps**: Lock-free open-addressed hash maps mathematically require *tombstones* during deletion to preserve concurrent probe sequences. When tombstones accumulate, lock-free maps are forced to perform global, cooperative compactions, resulting in massive, catastrophic tail latency spikes (often >100ms) under heavy eviction load. `liteLRU` completely eliminates the hash map. Instead, it utilizes a hardware-inspired **64-way set associative architecture**. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). Evictions overwrite victims *in place* within the local set — there are no tombstones to compact, no probe sequences to preserve, and no background goroutine required.
+1. **64-Way Set Associativity over Hash Maps**: Lock-free open-addressed hash maps mathematically require *tombstones* during deletion to preserve concurrent probe sequences. When tombstones accumulate, lock-free maps are forced to perform global, cooperative compactions, resulting in large tail latency spikes (often >100ms) under heavy eviction load. `liteLRU` completely eliminates the hash map. Instead, it utilizes a hardware-inspired **64-way set associative architecture**. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). Evictions overwrite victims *in place* within the local set — there are no tombstones to compact, no probe sequences to preserve, and no background goroutine required.
 2. **SWAR Signature Scanning**: To instantly find a key within the 64-slot set without traversing arrays of strings, `liteLRU` maintains a `uint64` signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. An 8-bit signature carries a 1/256 per-slot false-positive probability. Across 8 slots per word, the expected false-positive rate per word is approximately $1 - (1 - 1/256)^8 \approx 3\%$. Any SWAR match is confirmed by a full string comparison before the entry is returned; false positives incur one extra comparison, not an incorrect response. Notably, 64 slots require 8 `uint64` signature words — exactly 64 bytes — fitting the entire signature metadata for a set in **one L1 cache line**, which is fetched once and eliminates redundant memory traffic during lookup.
 
 To achieve this without sacrificing safety, `liteLRU` employs a **hybrid memory architecture**. High-frequency concurrency primitives (bitmasks, seqlocks) are allocated purely off-heap via anonymous `mmap` to eliminate GC tracing and write barriers entirely. Conversely, data arrays containing Go pointers (keys, values, and handler functions) remain on the standard Go heap. This separation ensures the GC can still safely track and collect dynamic strings or closures, completely avoiding dangling-pointer hazards while keeping the hot eviction path invisible to the GC.
@@ -170,7 +178,44 @@ Because `liteLRU` seeds the starting chunk index from the hash of the incoming r
 
 ---
 
-## 6. Sequence Lock Design
+## 6. Algorithm and Correctness
+
+### 6.1 State Definitions and Layout
+
+The cache state is divided into global configuration, per-chunk metadata, and per-slot data:
+
+* **Global:** Total capacity $C$ and number of chunks $N = C/64$.
+* **Per-Chunk:** A `chunk` struct containing 64-bit masks $V_k$ (valid bits), $W_k$ (writing bits), $A_k$ (access/recency bits), and an array of 8 `uint64` SWAR signatures for fast scanning.
+* **Per-Slot:** A `slotState` padded to 64 bytes containing the seqlock $S_i$, alongside Structure of Arrays (SoA) slices for keys, values, and handlers.
+
+### 6.2 Pseudocode and Control Flow
+
+**Get(key)**
+1. Hash the key to find the corresponding chunk $k$.
+2. Scan the 8 SWAR signature words using byte-wise comparison.
+3. For any match at slot $i$, load the seqlock $S_i$.
+4. Read the key/value from the SoA arrays.
+5. Verify the seqlock $S_i$ is even and unchanged.
+6. Atomically OR the bit $i$ into $A_k$ to record recency.
+
+**Add(key, value)**
+1. Hash the key to find chunk $k$.
+2. Run `findVictim(k)` (see Load-Shedding below).
+3. If `findVictim` returns the failure sentinel, drop the admission and return.
+4. Write the new key/value into the SoA arrays at the victim slot.
+5. Update the seqlock $S_i$ and clear the victim's bit in $V_k$ and $A_k$.
+
+**findVictim(chunk k)**
+1. Retry loop (max 10 iterations).
+2. Apply the CLOCK approximation: identify candidate slots using `CTZ(V_k & ~A_k & ~W_k)`.
+3. Attempt to CAS the $W_k$ bitmask to claim the slot.
+4. If successful, return the slot index.
+5. If unsuccessful (due to concurrent writers), increment retry counter.
+6. If 10 retries are exhausted, return the `0xFFFFFFFF` failure sentinel.
+
+### 6.3 Padded Seqlocks and Wait-Free Reads
+
+A strict requirement for web-scale caches is that `Get` operations must never block. `liteLRU` achieves this via a 64-byte padded seqlock $S_i$. The read path consists of a SWAR signature scan, atomic loads of $S_i$, a string comparison, and a single bitwise OR for the access bit. Under no circumstances does a reader wait for a lock or block on a channel.
 
 ### 6.1 Wait-Free Reads
 
@@ -219,7 +264,7 @@ The same argument applies to the statistics counters. Aggregating hits and misse
 
 ---
 
-## 8. The Measurement Artifact of `b.RunParallel`
+## 8. Benchmark Methodology and Artifacts
 
 Standard Go micro-benchmarks use `b.RunParallel`, which distributes iterations of the benchmark loop across goroutines via an internal `pb.Next()` call. `pb.Next()` performs an atomic fetch-and-add on a shared 64-bit counter to assign work to each goroutine.
 
@@ -379,9 +424,13 @@ The cache was attacked with a 10-second `vegeta` workload utilizing 64 concurren
 
 By shielding the application from the simulated network upstream, `liteLRU` drops the median (p50) response time from 57.36 ms down to 147 µs—an approximately **390x improvement** in user-facing latency. The p99 latency in the cached runs (69.22 ms) perfectly reflects the intentional upstream penalty during cold-start cache misses, showing that the cache's own internal mechanism latency is statistically invisible compared to the network bound.
 
-### 9.10 Dynamic Router Integration (Path Params and Middleware)
 
-To demonstrate that route lookup and cache hit times still win when parameter extraction and handler metadata are part of the hot path, we simulated a dynamic routing layer. The un-cached origin simulates a CPU-bound regex routing tree lookup and path extraction (e.g. `/api/user/{id}/profile`). `liteLRU` caches the resulting `HandlerFunc` and extracted `[]Param` directly. Crucially, `liteLRU` uses a stack-allocated buffer (`var pbuf [4]liteLRU.Param`) for retrieving parameters, eliminating any pool-managed or heap allocations on route hits.
+
+### 9.10 Dynamic Router Integration and Pathological Stress Testing
+
+To evaluate the cache under realistic API workloads and extreme pathological contention, we simulated a dynamic routing layer. We designed a synthetic worst-case stress test (using artificial timer synchronization) to deliberately saturate a single URL's chunk with 64 simultaneous cache misses (a "Thundering Herd"). This test confirmed that without bounds, spin-lock preemption cascades cause latency spikes. By employing the 10-retry load-shedding mechanism (Section 6.2), `liteLRU` rigorously bounds this execution. 
+
+We then present the realistic end-to-end results below, where the un-cached origin simulates a CPU-bound regex routing tree lookup and path extraction (e.g. `/api/user/{id}/profile`). `liteLRU` caches the resulting `HandlerFunc` and extracted `[]Param` directly. Crucially, `liteLRU` uses a stack-allocated buffer (`var pbuf [4]liteLRU.Param`) for retrieving parameters, eliminating any pool-managed or heap allocations on route hits.
 
 | Cache Implementation | Rate (Req/s) | p50 Latency | p99 Latency | Max Latency |
 |----------------------|--------------|-------------|-------------|-------------|
@@ -397,7 +446,7 @@ This performance delta highlights the effectiveness of `liteLRU`'s **Load-Sheddi
 
 In contrast, Otter’s implementation uses asynchronous buffering and background processing, whereas `liteLRU` performs synchronous inline admission; the higher tail latency (37.92 ms max) observed here is consistent with that architectural tradeoff. Because `liteLRU` remains strictly synchronous, its evictions run inline on the executing thread without background queues, guaranteeing zero heap allocations for the returned parameter slices while delivering superior end-to-end responsiveness.
 
-By caching the route resolution itself, `liteLRU` drops the median observed request latency in this benchmark from 381 µs to just 253 µs, proving that it acts as a tremendously effective layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
+By caching the route resolution itself, `liteLRU` drops the median observed request latency in this benchmark from 381 µs to just 253 µs, proving that it acts as a effective caching layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
 
 ## 10. Discussion and Limitations
 

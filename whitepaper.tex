@@ -84,6 +84,15 @@ Atomic operations (\texttt{CAS}, fetch-and-add) on a memory location whose cache
 
 Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips. As core count $N$ grows, the wait time for the contested line degrades superlinearly due to RFO round-trip amplification~\cite{dice}, a fact formalized by Amdahl~\cite{amdahl1967}. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit~\cite{lockfree2004}.
 
+\subsection{Contributions}
+In this paper, we make the following contributions to concurrent cache design:
+\begin{itemize}
+    \item \textbf{Contention-Bounded Eviction Algorithm:} A 64-way set associative architecture utilizing chunked bitmasks and hardware \texttt{CTZ}, eliminating global clock hands and open-addressed maps entirely.
+    \item \textbf{Hybrid Memory Architecture:} Off-heap allocation for lock-free state to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers on the heap.
+    \item \textbf{Padded Seqlocks:} A strict structural layout that yields strictly wait-free reads and eliminates false sharing for per-slot metadata.
+    \item \textbf{Load-Shedding Eviction Protocol:} A mathematically bounded write protocol that caps spin-lock retries, converting extreme pathological contention into dropped admission to guarantee $O(1)$ execution.
+\end{itemize}
+
 \section{Hybrid Memory Architecture and 64-Way Set Associative SWAR}
 
 Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2018}. It introduces three categories of tail-latency interference directly relevant to a cache implementation:
@@ -94,10 +103,10 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2
     \item \textbf{Mark-Phase Heap Pressure.} A cache holding thousands of string values generates a large root set for the GC to scan during the mark phase, increasing mark duration proportionally with capacity.
 \end{itemize}
 
-\texttt{liteLRU} addresses this through two radical architectural mechanisms:
+\texttt{liteLRU} addresses this through two non-trivial architectural changes:
 
 \begin{enumerate}
-    \item \textbf{64-Way Set Associativity over Hash Maps:} Lock-free open-addressed hash maps mathematically require \textit{tombstones} during deletion to preserve concurrent probe sequences. When tombstones accumulate, lock-free maps are forced to perform global, cooperative compactions, resulting in massive, catastrophic tail latency spikes (often $>$100ms) under heavy eviction load. \texttt{liteLRU} completely eliminates the hash map. Instead, it utilizes a hardware-inspired \textbf{64-way set associative architecture}. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). 
+    \item \textbf{64-Way Set Associativity over Hash Maps:} Lock-free open-addressed hash maps mathematically require \textit{tombstones} during deletion to preserve concurrent probe sequences. When tombstones accumulate, lock-free maps are forced to perform global, cooperative compactions, resulting in large tail latency spikes (often $>$100ms) under heavy eviction load. \texttt{liteLRU} completely eliminates the hash map. Instead, it utilizes a hardware-inspired \textbf{64-way set associative architecture}. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). 
     \item \textbf{SWAR Signature Scanning:} To instantly find a key within the 64-slot set without traversing arrays of strings, \texttt{liteLRU} maintains a \texttt{uint64} signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. Evictions are restricted to the local 64-slot set, overwriting pointers in place and mathematically eliminating tombstones entirely.
 \end{enumerate}
 
@@ -220,7 +229,48 @@ To guarantee O(1) lock-free progress and bound the worst-case scenario where a c
 
 Because \texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_\text{start} = h(r) \bmod N_k$, there is no shared global clock-hand atomic. Each writer begins its eviction sweep at a deterministic but distributed starting position, naturally load-balancing eviction pressure across chunks without any coordination. Under pathological skew where many keys hash to the same chunk, the multi-chunk scan fallback described above ensures fairness by overflowing the search into adjacent, potentially less-contended chunks.
 
-\section{Sequence Lock and Wait-Free Reads}
+\section{Algorithm and Correctness}
+
+\subsection{State Definitions and Layout}
+The cache state is divided into global configuration, per-chunk metadata, and per-slot data:
+\begin{itemize}
+    \item \textbf{Global:} Total capacity $C$ and number of chunks $N = C/64$.
+    \item \textbf{Per-Chunk:} A \texttt{chunk} struct containing 64-bit masks $V_k$ (valid bits), $W_k$ (writing bits), $A_k$ (access/recency bits), and an array of 8 \texttt{uint64} SWAR signatures for fast scanning.
+    \item \textbf{Per-Slot:} A \texttt{slotState} padded to 64 bytes containing the seqlock $S_i$, alongside Structure of Arrays (SoA) slices for keys, values, and handlers.
+\end{itemize}
+
+\subsection{Pseudocode and Control Flow}
+\textbf{Get(key)}
+\begin{enumerate}
+    \item Hash the key to find the corresponding chunk $k$.
+    \item Scan the 8 SWAR signature words using byte-wise comparison.
+    \item For any match at slot $i$, load the seqlock $S_i$.
+    \item Read the key/value from the SoA arrays.
+    \item Verify the seqlock $S_i$ is even and unchanged.
+    \item Atomically OR the bit $i$ into $A_k$ to record recency.
+\end{enumerate}
+
+\textbf{Add(key, value)}
+\begin{enumerate}
+    \item Hash the key to find chunk $k$.
+    \item Run \texttt{findVictim(k)} (see Load-Shedding below).
+    \item If \texttt{findVictim} returns the failure sentinel, drop the admission and return.
+    \item Write the new key/value into the SoA arrays at the victim slot.
+    \item Update the seqlock $S_i$ and clear the victim's bit in $V_k$ and $A_k$.
+\end{enumerate}
+
+\textbf{findVictim(chunk k)}
+\begin{enumerate}
+    \item Retry loop (max 10 iterations).
+    \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ(V\_k \& \textasciitilde A\_k \& \textasciitilde W\_k)}.
+    \item Attempt to CAS the $W_k$ bitmask to claim the slot.
+    \item If successful, return the slot index.
+    \item If unsuccessful (due to concurrent writers), increment retry counter.
+    \item If 10 retries are exhausted, return the \texttt{0xFFFFFFFF} failure sentinel.
+\end{enumerate}
+
+\subsection{Padded Seqlocks and Wait-Free Reads}
+A strict requirement for web-scale caches is that \texttt{Get} operations must never block. \texttt{liteLRU} achieves this via a 64-byte padded seqlock $S_i$. The read path consists of a SWAR signature scan, atomic loads of $S_i$, a string comparison, and a single bitwise OR for the access bit. Under no circumstances does a reader wait for a lock or block on a channel.
 
 \subsection{Wait-Free Reads}
 
@@ -266,7 +316,7 @@ It is important to note that the 64-bit bitmasks ($V_k$, $A_k$, $W_k$) do remain
 
 The same principle is applied to the statistics counters. Rather than two globally shared \texttt{atomic.Int64} hit and miss counters, we maintain 64 independent \texttt{statStripe} structs, each padded to 64 bytes, with writers selecting a stripe via \texttt{hash \& 63}. Each core writes exclusively to its own stripe without generating coherency traffic for any other core.
 
-\section{The Measurement Artifact of \texttt{b.RunParallel}}
+\section{Benchmark Methodology and Artifacts}
 
 Standard Go micro-benchmarks use \texttt{b.RunParallel}, distributing $b.N$ iterations across goroutines via an internal \texttt{pb.Next()} call---an atomic fetch-and-add on a shared 64-bit counter. When the operation under test completes in sub-10~ns---as is typical for a cache hit---the cost of this benchmark coordination atomic dominates the measurement.
 
@@ -464,9 +514,12 @@ Origin (No Cache) & 1,101 & 57.36 ms & 69.52 ms & 90.55 ms \\
 
 By shielding the application from the simulated network upstream, \texttt{liteLRU} drops the median (p50) response time from 57.36~ms down to 147~$\mu$s---an approximately \textbf{390x improvement} in user-facing latency. The p99 latency in the cached runs (69.22~ms) perfectly reflects the intentional upstream penalty during cold-start cache misses, showing that the cache's own internal mechanism latency is statistically invisible compared to the network bound.
 
-\subsection{Dynamic Router Integration (Path Params and Middleware)}
 
-To demonstrate that route lookup and cache hit times still win when parameter extraction and handler metadata are part of the hot path, we simulated a dynamic routing layer. The un-cached origin simulates a CPU-bound regex routing tree lookup and path extraction (e.g., \texttt{/api/user/\{id\}/profile}). \texttt{liteLRU} caches the resulting \texttt{HandlerFunc} and extracted \texttt{[]Param} directly. Crucially, \texttt{liteLRU} uses a stack-allocated buffer (\texttt{var pbuf [4]liteLRU.Param}) for retrieving parameters, eliminating any pool-managed or heap allocations on route hits.
+
+\subsection{Dynamic Router Integration and Pathological Stress Testing}
+To evaluate the cache under realistic API workloads and extreme pathological contention, we simulated a dynamic routing layer. We designed a synthetic worst-case stress test (using artificial timer synchronization) to deliberately saturate a single URL's chunk with 64 simultaneous cache misses (a "Thundering Herd"). This test confirmed that without bounds, spin-lock preemption cascades cause latency spikes. By employing the 10-retry load-shedding mechanism (Section 6.2), \texttt{liteLRU} rigorously bounds this execution.
+
+We then present the realistic end-to-end results below, where the un-cached origin simulates a CPU-bound regex routing tree lookup and path extraction (e.g., \texttt{/api/user/\{id\}/profile}). \texttt{liteLRU} caches the resulting \texttt{HandlerFunc} and extracted \texttt{[]Param} directly. Crucially, \texttt{liteLRU} uses a stack-allocated buffer (\texttt{var pbuf [4]liteLRU.Param}) for retrieving parameters, eliminating any pool-managed or heap allocations on route hits.
 
 The cache was attacked with a 10-second \texttt{vegeta} workload utilizing 64 concurrent workers targeting the simulated router endpoint.
 
@@ -485,7 +538,7 @@ Origin (No Cache) & 78,680 & 381 $\mu$s & 1.93 ms & 198.69 ms \\
 \label{tab:router}
 \end{table}
 
-By caching the route resolution itself, \texttt{liteLRU} drops the median observed request latency in this benchmark from 381~$\mu$s to just 253~$\mu$s, proving that it acts as a tremendously effective layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
+By caching the route resolution itself, \texttt{liteLRU} drops the median observed request latency in this benchmark from 381~$\mu$s to just 253~$\mu$s, proving that it acts as a effective caching layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
 
 In this end-to-end simulation, \texttt{liteLRU} outperforms Otter in both peak throughput (by 4\%) and tail latency across all percentiles. The p99 latency drops from 1.73 ms (Otter) to 1.39 ms (\texttt{liteLRU}), and the maximum observed tail latency is halved (18.96 ms vs 37.92 ms).
 
