@@ -74,7 +74,7 @@ By shielding the application from the simulated network upstream, `liteLRU` drop
 
 ## Dynamic Router Integration (Path Params + Middleware)
 
-To demonstrate that route lookup and cache hit times still win when parameter extraction and handler metadata are part of the hot path, we simulated a dynamic routing layer. The un-cached origin simulates an expensive 1ms routing tree lookup and path extraction (e.g. `/api/user/{id}/profile`). `liteLRU` caches the resulting `HandlerFunc` and extracted `[]Param` directly. Crucially, `liteLRU` uses a stack-allocated buffer for retrieving parameters, eliminating any heap allocations on route hits.
+To demonstrate that route lookup and cache hit times still win when parameter extraction and handler metadata are part of the hot path, we simulated a dynamic routing layer. The un-cached origin simulates a CPU-bound regex routing tree lookup and path extraction (e.g. `/api/user/{id}/profile`). `liteLRU` caches the resulting `HandlerFunc` and extracted `[]Param` directly. Crucially, `liteLRU` uses a stack-allocated buffer for retrieving parameters, eliminating any heap allocations on route hits.
 
 | Cache Implementation | Rate (Req/s) | p50 Latency | p99 Latency | Max Latency |
 |----------------------|--------------|-------------|-------------|-------------|

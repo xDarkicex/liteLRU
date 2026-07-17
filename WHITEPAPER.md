@@ -381,7 +381,7 @@ By shielding the application from the simulated network upstream, `liteLRU` drop
 
 ### 9.10 Dynamic Router Integration (Path Params and Middleware)
 
-To demonstrate that route lookup and cache hit times still win when parameter extraction and handler metadata are part of the hot path, we simulated a dynamic routing layer. The un-cached origin simulates an expensive 1 ms routing tree lookup and path extraction (e.g. `/api/user/{id}/profile`). `liteLRU` caches the resulting `HandlerFunc` and extracted `[]Param` directly. Crucially, `liteLRU` uses a stack-allocated buffer (`var pbuf [4]liteLRU.Param`) for retrieving parameters, eliminating any pool-managed or heap allocations on route hits.
+To demonstrate that route lookup and cache hit times still win when parameter extraction and handler metadata are part of the hot path, we simulated a dynamic routing layer. The un-cached origin simulates a CPU-bound regex routing tree lookup and path extraction (e.g. `/api/user/{id}/profile`). `liteLRU` caches the resulting `HandlerFunc` and extracted `[]Param` directly. Crucially, `liteLRU` uses a stack-allocated buffer (`var pbuf [4]liteLRU.Param`) for retrieving parameters, eliminating any pool-managed or heap allocations on route hits.
 
 | Cache Implementation | Rate (Req/s) | p50 Latency | p99 Latency | Max Latency |
 |----------------------|--------------|-------------|-------------|-------------|
@@ -389,15 +389,15 @@ To demonstrate that route lookup and cache hit times still win when parameter ex
 | Otter                | 91,959 req/s | 269 µs      | 1.73 ms     | 37.92 ms    |
 | Origin (No Cache)    | 78,680 req/s | 381 µs      | 1.93 ms     | 198.69 ms   |
 
-*Table 7: Dynamic router simulation with 1 ms routing/middleware penalty on cache misses.*
+*Table 7: Dynamic router simulation with CPU-bound routing penalty on cache misses.*
 
 In this end-to-end simulation, `liteLRU` outperforms Otter in both peak throughput (by 4%) and tail latency across all percentiles. The p99 latency drops from 1.73 ms (Otter) to 1.39 ms (`liteLRU`), and the maximum observed tail latency is halved (18.96 ms vs 37.92 ms).
 
 This performance delta highlights the effectiveness of `liteLRU`'s **Load-Shedding Eviction** mechanism. Under pathological concurrent writes (simulating a Thundering Herd on a cache miss), bounded execution takes precedence over absolute cache insertion. If `liteLRU` detects that a specific 64-slot chunk is saturated by concurrent evicting threads, it dynamically aborts the insertion. This mechanism caps per-attempt write-side work at a fixed constant and converts extreme contention into dropped admission, preventing spin-lock preemption cascades.
 
-In contrast, Otter's asynchronous buffering queue absorbs the thundering herd but incurs queue-processing delays, which translates directly into higher tail latency (37.92 ms max) because the latency profile is consistent with asynchronous buffering overhead. Because `liteLRU` remains strictly synchronous, its evictions run inline on the executing thread without background queues, guaranteeing zero heap allocations for the returned parameter slices while delivering superior end-to-end responsiveness.
+In contrast, Otter’s implementation uses asynchronous buffering and background processing, whereas `liteLRU` performs synchronous inline admission; the higher tail latency (37.92 ms max) observed here is consistent with that architectural tradeoff. Because `liteLRU` remains strictly synchronous, its evictions run inline on the executing thread without background queues, guaranteeing zero heap allocations for the returned parameter slices while delivering superior end-to-end responsiveness.
 
-By caching the route resolution itself, `liteLRU` drops the dynamic routing overhead from 381 µs to just 253 µs, proving that it acts as a tremendously effective layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
+By caching the route resolution itself, `liteLRU` drops the median observed request latency in this benchmark from 381 µs to just 253 µs, proving that it acts as a tremendously effective layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
 
 ## 10. Discussion and Limitations
 
