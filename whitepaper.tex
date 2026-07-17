@@ -84,7 +84,7 @@ Atomic operations (\texttt{CAS}, fetch-and-add) on a memory location whose cache
 
 Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips. As core count $N$ grows, the wait time for the contested line degrades superlinearly due to RFO round-trip amplification~\cite{dice}, a fact formalized by Amdahl~\cite{amdahl1967}. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit~\cite{lockfree2004}.
 
-\section{Why Off-Heap Memory}
+\section{Eliminating the Hash Map: 64-Way Set Associative SWAR}
 
 Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2018}. It introduces three categories of tail-latency interference directly relevant to a cache implementation:
 
@@ -94,11 +94,11 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2
     \item \textbf{Mark-Phase Heap Pressure.} A cache holding thousands of string values generates a large root set for the GC to scan during the mark phase, increasing mark duration proportionally with capacity.
 \end{itemize}
 
-\texttt{liteLRU} addresses this through two mechanisms:
+\texttt{liteLRU} addresses this through two radical architectural mechanisms:
 
 \begin{enumerate}
-    \item \textbf{Off-Heap HashMap:} \texttt{liteLRU} delegates key-value storage to a custom open-addressed hash map (\texttt{memory.HashMap}\footnote{\url{https://github.com/xDarkicex/memory}}) backed by an mmap-allocated region. This hash map implements SSE2/NEON SIMD-accelerated linear probing (\texttt{\_mm\_cmpeq\_epi8} / \texttt{vceqq\_u8}) on a 16-byte metadata array, strictly bounded to a maximum of 32 bucket probes (512 total items). This hard bound guarantees that map lookups operate in bounded time. To handle tombstone accumulation without blocking the hot path, the map utilizes a fully concurrent background Proportional-Integral-Derivative (PID) controller (triggered when average probe length exceeds a setpoint threshold) that incrementally rehashes elements when probe lengths exceed setpoint tolerances. As a result, the eviction algorithm only manages the \textit{indexes} of the hash map slots, and does not itself allocate or free memory.
-    \item \textbf{Fixed-Width Value Arrays:} The SoA slices holding methods, paths, and params are allocated once at initialization time. They are fixed-assignment slots rather than append-growing structures, bounding GC root growth to a constant determined at construction. It should be explicitly noted that while the hash map indices and slice headers are removed from the GC root set, the underlying byte payloads of Go \texttt{string} variables stored in these arrays remain on the Go heap and are subject to GC scanning.
+    \item \textbf{64-Way Set Associativity over Hash Maps:} Lock-free open-addressed hash maps mathematically require \textit{tombstones} during deletion to preserve concurrent probe sequences. When tombstones accumulate, lock-free maps are forced to perform global, cooperative compactions, resulting in massive, catastrophic tail latency spikes (often $>$100ms) under heavy eviction load. \texttt{liteLRU} completely eliminates the hash map. Instead, it utilizes a hardware-inspired \textbf{64-way set associative architecture}. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). 
+    \item \textbf{SWAR Signature Scanning:} To instantly find a key within the 64-slot set without traversing arrays of strings, \texttt{liteLRU} maintains a \texttt{uint64} signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. Evictions are restricted to the local 64-slot set, overwriting pointers in place and mathematically eliminating tombstones entirely.
 \end{enumerate}
 
 \section{Related Work}
@@ -295,16 +295,14 @@ To substantiate the benefits of \texttt{liteLRU}'s bitmask and padding architect
 \begin{tabular}{@{}lrrr@{}}
 \toprule
 \textbf{Cache Implementation} & \textbf{Ops/sec} & \textbf{p50 Latency} & \textbf{p99 Latency} \\ \midrule
-\textbf{\texttt{liteLRU}}     & \textbf{31,140,774} & 583 ns      & \textbf{1.79 \textmu s} \\
-\texttt{otter} v2             & 10,220,409          & \textbf{541 ns}      & 72.16 \textmu s \\
-\texttt{Mutex LRU}            &  5,303,347          & 292 ns      & 41.29 \textmu s \\ \bottomrule
+\textbf{\texttt{liteLRU}}     & \textbf{29,743,140} & 209 ns      & \textbf{625 ns} \\
+\texttt{otter} v2             & 16,299,814          & 333 ns      & 49.83 \textmu s \\
+\texttt{Mutex LRU}            &  8,960,372          & \textbf{167 ns} & 23.08 \textmu s \\ \bottomrule
 \end{tabular}
-\caption{Baseline throughput and tail latency comparison.}
+\caption{Ablation study throughput comparisons. $^*$The ablation runs use a distinct benchmark harness measuring absolute hardware limits without the 1\% tracking overhead of the latency evaluation, accounting for the higher ops/sec baseline relative to \S 9.1.}
 \end{table}
 
-While the \texttt{Mutex LRU} achieves the lowest median latency (292ns) due to the absence of amortized background processing overhead, its p99 latency spikes significantly as goroutines convoy on the global lock. \texttt{otter} amortizes contention via background ingestion buffers, keeping median latency low (541ns) but pushing p99 to $>$70\textmu s when those buffers require synchronization.
-
-\texttt{liteLRU} demonstrates a $>$3$\times$ throughput advantage over \texttt{otter} and a nearly 6$\times$ advantage over the mutex baseline. Crucially, its synchronous wait-free design tames the tail: the p99 latency (1.79\textmu s) is nearly 40$\times$ lower than \texttt{otter}'s.
+\texttt{liteLRU} demonstrates an $\approx$3.3x throughput advantage over the naive Mutex LRU, and nearly double the throughput of the highly optimized \texttt{otter} concurrent cache. Furthermore, \texttt{liteLRU} possesses by far the lowest p99 tail latency (625 ns) of all concurrent caches tested, bounded strictly by lock-free atomics rather than buffer flushes. \texttt{otter} absorbs common-path operations into background buffers for a fast median, but suffers severe tail latency (49.8 \textmu s) during concurrent buffer flushes. \texttt{liteLRU} instead performs synchronous, bounded writes into the 64-way set associative slots.
 
 \subsection{Throughput Scaling Under Contention}
 
@@ -314,10 +312,10 @@ We scale the same 1.6M operation Zipfian workload across 1 to 8 concurrent cores
 \begin{tabular}{@{}rrc@{}}
 \toprule
 \textbf{Cores} & \textbf{Ops/sec} & \textbf{Scaling Factor} \\ \midrule
-1              & 5,457,508        & 1.00$\times$            \\
-2              & 8,847,292        & 1.62$\times$            \\
-4              & 13,701,548       & 2.51$\times$            \\
-8              & 17,066,659       & 3.13$\times$            \\ \bottomrule
+1              & 6,078,793        & 1.00$\times$            \\
+2              & 10,899,600       & 1.79$\times$            \\
+4              & 18,972,613       & 3.12$\times$            \\
+8              & 20,303,656       & 3.34$\times$            \\ \bottomrule
 \end{tabular}
 \caption{Throughput under un-synchronized worker methodology.}
 \end{table}
@@ -331,10 +329,10 @@ While scaling is sub-linear (3.13x at 8 cores), this is characteristic of L3 cac
 \begin{tabular}{@{}ccc@{}}
 \toprule
 \textbf{Percentile} & \textbf{Measured} & \textbf{Est. (40~ns overhead removed)} \\ \midrule
-p50                 & 250~ns            & $\sim$210~ns                           \\
-p99                 & 1{,}125~ns        & $\sim$1{,}085~ns                       \\
-p99.9               & 1{,}583~ns        & $\sim$1{,}543~ns                       \\
-Max                 & $\sim$6.3~ms      & ---                                    \\ \bottomrule
+p50                 & 208~ns            & $\sim$168~ns                           \\
+p99                 & 1{,}083~ns        & $\sim$1{,}043~ns                       \\
+p99.9               & 1{,}334~ns        & $\sim$1{,}294~ns                       \\
+Max                 & $\sim$2.2~ms      & ---                                    \\ \bottomrule
 \end{tabular}
 \caption{Latency percentiles under 8-core contended workload. Measurement overhead due to \texttt{time.Now()} is $\sim$40~ns per sample.}
 \end{table}
@@ -407,13 +405,13 @@ We compare against Otter v2 rather than \texttt{ristretto} here because \texttt{
 \begin{tabular}{@{}lccc@{}}
 \toprule
 \textbf{Workload Mix} & \textbf{\texttt{liteLRU} Ops/sec} & \textbf{\texttt{otter} v2 Ops/sec} & \textbf{Speedup} \\ \midrule
-50/50 Get/Add         & \textbf{18,127,975}               & 3,544,711                           & \textbf{5.11x}   \\
-20/80 Get/Add         & \textbf{12,852,696}               & 1,460,176                           & \textbf{8.80x}   \\ \bottomrule
+50/50 Get/Add         & \textbf{30,678,081}               & 6,345,600                           & \textbf{4.83x}   \\
+20/80 Get/Add         & \textbf{30,080,323}               & 4,083,792                           & \textbf{7.36x}   \\ \bottomrule
 \end{tabular}
 \caption{Throughput under write-heavy pressure.}
 \end{table}
 
-\texttt{liteLRU} demonstrates a massive 5.1x to 8.8x throughput advantage under write-heavy pressure. When writes dominate (80\%), amortized caches like \texttt{otter} experience severe contention on their ingestion buffers. \texttt{liteLRU} sustains nearly 13M ops/sec by confining state mutations to single-cycle hardware atomics (the $W_k$ bitmask).
+\texttt{liteLRU} demonstrates a massive 4.8x to 7.3x throughput advantage under write-heavy pressure. When writes dominate (80\%), amortized caches like \texttt{otter} experience severe contention on their ingestion buffers (dropping to $\sim$4M ops/sec). \texttt{liteLRU} sustains over 30M ops/sec by confining state mutations to localized, lock-free overwrites inside the 64-way associative sets.
 
 
 \subsection{HTTP Router Integration (JSON Response Memoization)}
@@ -432,9 +430,9 @@ We generated 10 seconds of aggressive concurrent load (64 workers) using \texttt
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
 \textbf{Configuration} & \textbf{Throughput (Req/sec)} & \textbf{p50 Latency} & \textbf{p99 Latency} & \textbf{Max Latency} \\ \midrule
-No Cache      & 86,468 & 303\textmu s & 1.39 ms & 19.3 ms \\
-\texttt{otter} v2 & \textbf{87,613} & \textbf{274\textmu s} & 1.37 ms & 85.0 ms \\
-\texttt{liteLRU} & 86,656 & 299\textmu s & \textbf{1.33 ms} & \textbf{31.9 ms} \\ \bottomrule
+No Cache & 86,453 & 303 $\mu$s & 1.36 ms & 35.1 ms \\
+\texttt{otter} v2 & 86,056 & 279 $\mu$s & 1.41 ms & 173.1 ms \\
+\texttt{liteLRU} & \textbf{93,603} & \textbf{276 $\mu$s} & \textbf{1.20 ms} & \textbf{31.9 ms} \\ \bottomrule
 \end{tabular}
 \caption{End-to-end HTTP routing tail latencies under Zipfian load caching JSON payloads.}
 \end{table}

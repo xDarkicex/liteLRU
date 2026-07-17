@@ -20,10 +20,10 @@ The `BenchmarkParallelLRUCache` simulates a highly concurrent web server load ut
 
 | Cores | Benchmark | Speed (ns/op) | Memory (B/op) | Allocs |
 |-------|-----------|---------------|---------------|--------|
-| 1     | ParallelMixedWorkload-1   | **30.01 ns**  | 0             | 0      |
-| 2     | ParallelMixedWorkload-2   | **40.44 ns**  | 0             | 0      |
-| 4     | ParallelMixedWorkload-4   | **46.05 ns**  | 0             | 0      |
-| 8     | ParallelMixedWorkload-8   | **58.68 ns**  | 0             | 0      |
+| 1     | ParallelMixedWorkload-1   | **26.13 ns**  | 0             | 0      |
+| 2     | ParallelMixedWorkload-2   | **19.54 ns**  | 0             | 0      |
+| 4     | ParallelMixedWorkload-4   | **30.17 ns**  | 0             | 0      |
+| 8     | ParallelMixedWorkload-8   | **46.95 ns**  | 0             | 0      |
 
 As you can see, the cache absorbs heavy read/write contention gracefully without the catastrophic latency spikes associated with mutex locks. Traditional LRU caches would bottleneck significantly at 8 cores.
 
@@ -48,7 +48,7 @@ These benchmarks run in a single-threaded loop. While they do not test concurren
 
 ### Add Operations
 
-Add operations are naturally slower as they require tombstoning old hashes in the `HashMap`, parameter slice pooling, and O(1) bitwise eviction calculations.
+Add operations are naturally slower as they require updating 64-way set associative SWAR signatures, copying parameter slices, and O(1) bitwise eviction calculations.
 
 | Benchmark | Speed (ns/op) | Memory (B/op) | Allocs |
 |-----------|---------------|---------------|--------|
@@ -64,7 +64,7 @@ A simulation of a realistic web server routing cache (single-threaded).
 
 | Benchmark | Speed (ns/op) | Memory (B/op) | Allocs |
 |-----------|---------------|---------------|--------|
-| BenchmarkParamPooling/RealWorldWorkload-8 | 150.6 ns | 3 | 0 |
+| BenchmarkParamPooling/RealWorldWorkload-8 | 96.88 ns | 2 | 0 |
 
 ---
 

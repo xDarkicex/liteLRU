@@ -12,7 +12,7 @@ Let's break it down:
 - **100% Lock-Free**: Absolutely zero `sync.Mutex` or `sync.RWMutex` usage. Fully concurrent operations across all cores.
 - **O(1) Bitmask Eviction**: We use mathematical Chunked Bitmask CLOCK algorithms (powered by `bits.TrailingZeros64`) to find eviction victims in a single CPU cycle.
 - **Mind-blowing Parallel Speed**: Get and Add operations scale beautifully across CPU cores, crushing traditional lock-based designs under heavy concurrent load (down to **~30ns** per operation in parallel!).
-- **Memory Wizardry**: Uses `xDarkicex/memory.HashMap` for zero-allocation lock-free routing hash lookups, perfectly recycling tombstones to prevent GC spikes.
+- **Memory Wizardry**: Uses a hardware-inspired **64-way set associative SWAR architecture** for direct lock-free routing. Zero tombstones, zero GC spikes, and zero latency compactions.
 - **Structure of Arrays (SoA)**: Contiguous parallel arrays guarantee pristine L1/L2 cache locality and prevent false-sharing CPU cache bounces.
 - **Zero-Allocation Reads**: Read paths (Gets) produce absolutely zero allocations.
 
@@ -107,10 +107,10 @@ Here is a quick teaser of our `RunParallel` performance running across multiple 
 
 | Cores | Workload (80% Get / 20% Add) | Speed (ns/op) | Allocations |
 |-------|------------------------------|---------------|-------------|
-| 1     | ParallelMixedWorkload        | **30.01 ns**  | 0           |
-| 2     | ParallelMixedWorkload-2      | **40.44 ns**  | 0           |
-| 4     | ParallelMixedWorkload-4      | **46.05 ns**  | 0           |
-| 8     | ParallelMixedWorkload-8      | **58.68 ns**  | 0           |
+| 1     | ParallelMixedWorkload        | **26.13 ns**  | 0           |
+| 2     | ParallelMixedWorkload-2      | **19.54 ns**  | 0           |
+| 4     | ParallelMixedWorkload-4      | **30.17 ns**  | 0           |
+| 8     | ParallelMixedWorkload-8      | **46.95 ns**  | 0           |
 
 *(Yes, that is ~30ns per operation for a fully thread-safe, LRU-evicting cache!)*
 
@@ -145,9 +145,9 @@ candidates := ^validBits | (validBits & ^accessedBits)
 bit := bits.TrailingZeros64(candidates) 
 ```
 
-### 3. Lock-Free memory.HashMap Routing
+### 3. 64-Way Set Associative SWAR Routing
 
-We use the incredibly fast `xDarkicex/memory.HashMap` to route an FNV-1a hash of the Method+Path to an internal SoA index. During eviction, we carefully `Delete` the old hash, allowing the `HashMap` to safely recycle its tombstones without ever triggering a latency-inducing map resize!
+We mathematically eliminated the need for a Hash Map (which requires tombstone compactions that bottleneck concurrency). Instead, `liteLRU` groups slots into 64-way associative sets, just like hardware L1 CPU caches. We use a single `uint64` word containing eight 1-byte hash signatures and SIMD Within A Register (SWAR) to instantly scan 8 slots per CPU bitwise instruction!
 
 ### 4. Seqlocks for Zero-Tearing Reads
 

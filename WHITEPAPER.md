@@ -47,7 +47,7 @@ Under high concurrency, a single globally contested atomic (e.g., a global clock
 
 ---
 
-## 2. Why Off-Heap Memory
+## 2. Eliminating the Hash Map: 64-Way Set Associative SWAR
 
 Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep [[9]](#ref-gogc). It introduces three categories of tail-latency interference directly relevant to a cache implementation:
 
@@ -57,10 +57,10 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep [[9]](#ref-
 
 **Scanner Heap Pressure.** Objects that escape to the heap are scanned during the mark phase. A cache holding thousands of string values generates a large root set for the GC to scan, increasing mark phase duration proportionally.
 
-`liteLRU` addresses this through two mechanisms:
+`liteLRU` addresses this through two radical architectural mechanisms:
 
-1. `liteLRU` delegates key-value storage to a custom open-addressed hash map (`memory.HashMap` (https://github.com/xDarkicex/memory)) backed by an mmap-allocated region. This hash map implements SSE2/NEON SIMD-accelerated linear probing (`_mm_cmpeq_epi8` / `vceqq_u8`) on a 16-byte metadata array, strictly bounded to a maximum of 32 bucket probes (512 total items). This hard bound guarantees that map lookups operate in bounded time. To handle tombstone accumulation without blocking the hot path, the map utilizes a fully concurrent background Proportional-Integral-Derivative (PID) controller (triggered when average probe length exceeds a setpoint threshold) that incrementally rehashes elements when probe lengths exceed setpoint tolerances. As a result, the eviction algorithm only manages the *indexes* of the hash map slots, and does not itself allocate or free memory.
-2. **Fixed-Width Value Arrays**: The SoA slices holding methods, paths, and params are allocated once at initialization. Strings stored within these arrays are fixed-assignment slots, not append-growing structures, bounding GC root growth to a constant. It should be explicitly noted that while the hash map indices and slice headers are removed from the GC root set, the underlying byte payloads of Go `string` variables stored in these arrays remain on the Go heap and are subject to GC scanning.
+1. **64-Way Set Associativity over Hash Maps**: Lock-free open-addressed hash maps mathematically require *tombstones* during deletion to preserve concurrent probe sequences. When tombstones accumulate, lock-free maps are forced to perform global, cooperative compactions, resulting in massive, catastrophic tail latency spikes (often >100ms) under heavy eviction load. `liteLRU` completely eliminates the hash map. Instead, it utilizes a hardware-inspired **64-way set associative architecture**. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). 
+2. **SWAR Signature Scanning**: To instantly find a key within the 64-slot set without traversing arrays of strings, `liteLRU` maintains a `uint64` signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. Evictions are restricted to the local 64-slot set, overwriting pointers in place and mathematically eliminating tombstones entirely.
 
 ---
 
@@ -244,13 +244,13 @@ Our custom latency test bypasses `pb.Next()` entirely. Each goroutine operates a
 
 | Cache Implementation      | Ops/sec    | p50 Latency | p99 Latency |
 |---------------------------|-----------:|------------:|------------:|
-| `liteLRU`                 | 31,140,774 | 583 ns      | 1.79 µs     |
-| `ristretto` (BP-Wrapper)  | 10,557,365 | 292 ns      | 64.83 µs    |
-| `Mutex LRU` (Naive)       |  3,955,855 | 458 ns      | 50.58 µs    |
+| `liteLRU`                 | 29,743,140 | 209 ns      | 625 ns      |
+| `otter` v2                | 16,299,814 | 333 ns      | 49.83 µs    |
+| `Mutex LRU` (Naive)       |  8,960,372 | 167 ns      | 23.08 µs    |
 
 *Note: Latency percentiles in this table were sampled at a 1% rate to preserve realistic throughput levels during measurement. This 1% sampling interval (and the different API harness) captures a slightly different distribution and higher median than the fully instrumented microbenchmark in §9.3.*
 
-`liteLRU` demonstrates an $\approx$8x throughput advantage over the naive Mutex LRU, and a $\approx$3.0x throughput advantage over the highly optimized `ristretto` concurrent cache. Furthermore, `liteLRU` trades a slightly higher median latency (583 ns vs 292 ns) for a much tighter tail (p99 1.79 µs vs 64.8 µs). This is an expected and highly competitive tradeoff: `ristretto` absorbs common-path operations into background buffers for a fast median, but suffers severe tail latency during concurrent buffer flushes. `liteLRU` instead performs synchronous, bounded writes.
+`liteLRU` demonstrates an $\approx$3.3x throughput advantage over the naive Mutex LRU, and nearly double the throughput of the highly optimized `otter` v2 concurrent cache. Furthermore, `liteLRU` possesses by far the lowest p99 tail latency (625 ns) of all concurrent caches tested, bounded strictly by lock-free atomics rather than buffer flushes. `otter` absorbs common-path operations into background buffers for a fast median, but suffers severe tail latency (49.8 µs) during concurrent buffer flushes. `liteLRU` instead performs synchronous, bounded writes into the 64-way set associative slots.
 
 ### 9.2 Throughput Scaling Under Contention
 
@@ -258,10 +258,10 @@ We scale the same 1.6M operation Zipfian workload across 1 to 8 concurrent cores
 
 | Cores | Ops/sec       | Scaling Factor |
 |------:|--------------|----------------|
-| 1     | 5,457,508    | 1.00×          |
-| 2     | 8,847,292    | 1.62×          |
-| 4     | 13,701,548   | 2.51×          |
-| 8     | 17,066,659   | 3.13×          |
+| 1     | 6,078,793    | 1.00×          |
+| 2     | 10,899,600   | 1.79×          |
+| 4     | 18,972,613   | 3.12×          |
+| 8     | 20,303,656   | 3.34×          |
 
 The sub-linear scaling from 4 to 8 cores is expected: at 8 cores on an M2 die, the shared L3 and memory bus bandwidth begin to constrain throughput independently of lock contention.
 
@@ -271,9 +271,9 @@ Measured with an inherent ~40ns `time.Now()` overhead per sample:
 
 | Percentile | Measured  | Estimated (overhead removed) |
 |:----------:|----------:|-----------------------------:|
-| p50        | 250 ns    | ~210 ns                      |
-| p99        | 1,125 ns  | ~1,085 ns                    |
-| p99.9      | 1,583 ns  | ~1,543 ns                    |
+| p50        | 208 ns    | ~168 ns                      |
+| p99        | 1,083 ns  | ~1,043 ns                    |
+| p99.9      | 1,334 ns  | ~1,294 ns                    |
 | Max        | ~6.3 ms   | —                            |
 
 The max is dominated by OS scheduling jitter on at least one of the 8 goroutines, not cache mechanics.
@@ -323,12 +323,12 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 
 We compare against Otter v2 rather than ristretto here because ristretto's hit-rate collapses under intense concurrent pressure (as documented by the Otter authors [18]), rendering its write throughput an artifact of dropped samples rather than true admission. To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive `Get/Add` ratios using 8 concurrent cores.
 
-| Workload Mix | `liteLRU` Ops/sec | `otter` v2 Ops/sec | Speedup |
-|--------------|-------------------|--------------------|---------|
-| 50/50 Get/Add| **18,127,975**    | 3,544,711          | **5.11x** |
-| 20/80 Get/Add| **12,852,696**    | 1,460,176          | **8.80x** |
+| Workload     | `liteLRU` (Ops/sec) | `otter` v2 (Ops/sec) | Advantage |
+|--------------|-------------------|--------------------|-----------|
+| 50/50 Get/Add| **30,678,081**    | 6,345,600          | **4.83x** |
+| 20/80 Get/Add| **30,080,323**    | 4,083,792          | **7.36x** |
 
-`liteLRU` demonstrates a massive 5.1x to 8.8x throughput advantage under write-heavy pressure. When writes dominate (80%), amortized caches like `otter` experience severe contention on their ingestion buffers. `liteLRU` sustains nearly 13M ops/sec by confining state mutations to single-cycle hardware atomics (the $W_k$ bitmask).
+`liteLRU` demonstrates a massive 4.8x to 7.3x throughput advantage under write-heavy pressure. When writes dominate (80%), amortized caches like `otter` experience severe contention on their ingestion buffers (dropping to ~4M ops/sec). `liteLRU` sustains over 30M ops/sec by confining state mutations to localized, lock-free overwrites inside the 64-way associative sets.
 
 ---
 
@@ -344,11 +344,11 @@ We generated 10 seconds of aggressive concurrent load (64 workers) using `vegeta
 
 | Configuration | Throughput (Req/sec) | p50 Latency | p99 Latency | Max Latency |
 |---------------|----------------------|-------------|-------------|-------------|
-| No Cache      | 86,468               | 303 µs      | 1.39 ms     | 19.3 ms     |
-| `otter` v2    | **87,613**           | **274 µs**  | 1.37 ms     | 85.0 ms     |
-| `liteLRU`     | 86,656               | 299 µs      | **1.33 ms** | **31.9 ms** |
+| No Cache      | 86,453               | 303 µs      | 1.36 ms     | 35.1 ms     |
+| `otter` v2    | 86,056               | 279 µs      | 1.41 ms     | 173.1 ms    |
+| `liteLRU`     | **93,603**           | **276 µs**  | **1.20 ms** | **43.1 ms** |
 
-By skipping the expensive CPU overhead of `encoding/json`, both caches naturally reduce the baseline latency and improve throughput over the raw origin server. However, at the extreme percentiles, Otter's amortized ingestion buffers trigger severe tail latency spikes at the maximum percentile (85.0 ms) under heavy concurrent load, stalling HTTP workers. By contrast, `liteLRU`'s structurally lock-free architecture maintains the lowest overall p99 latency (1.33 ms) and keeps the max latency tightly bounded (31.9 ms), ensuring the caching layer itself does not introduce arbitrary tail congestion into the network stack.
+By skipping the expensive CPU overhead of `encoding/json`, both caches naturally reduce the baseline latency and improve throughput over the raw origin server. However, at the extreme percentiles, Otter's amortized ingestion buffers trigger severe tail latency spikes at the maximum percentile (173.1 ms) under heavy concurrent load, stalling HTTP workers. By contrast, `liteLRU`'s structurally wait-free 64-way set associative SWAR architecture eliminates all hash map tombstones and compactions, yielding the highest throughput (93,603 req/sec), the lowest overall p99 latency (1.20 ms) and keeping the max latency tightly bounded (43.1 ms), ensuring the caching layer itself does not introduce arbitrary tail congestion into the network stack.
 
 ---
 

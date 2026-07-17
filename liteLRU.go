@@ -4,12 +4,9 @@
 package liteLRU
 
 import (
-	"fmt"
 	"math/bits"
 	"sync/atomic"
 	"unsafe"
-
-	"github.com/xDarkicex/memory"
 )
 
 // Param represents a key-value parameter in a cache entry.
@@ -37,13 +34,21 @@ func hashRoute(method, path string) uint64 {
 	return hash
 }
 
+func hasByteSWAR(word uint64, b uint8) bool {
+	pattern := uint64(b) * 0x0101010101010101
+	v := word ^ pattern
+	return (v-0x0101010101010101)&^v&0x8080808080808080 != 0
+}
+
 // chunk represents a group of 64 slots with bitmasks for O(1) eviction logic.
-// Padded to 64 bytes to prevent false sharing between CPU cache lines.
+// Padded to 128 bytes (2 cache lines) to prevent false sharing.
 type chunk struct {
 	valid    atomic.Uint64
 	accessed atomic.Uint64
 	writing  atomic.Uint64
-	_        [40]byte
+	_        [8]byte
+	sigs     [8]atomic.Uint64 // 64 8-bit hash signatures (1 per slot)
+	_        [32]byte         // pad to 128 bytes total
 }
 
 // slotState holds the seqlock, padded to a full 64-byte cache line 
@@ -130,17 +135,12 @@ func (a *atomicHandler) Load() HandlerFunc {
 	return *(*HandlerFunc)(unsafe.Pointer(&ptr))
 }
 
-// LRUCache implements an ultra-low latency lock-free cache with fixed capacity.
-// It uses a Chunked Bitmask CLOCK algorithm for O(1) eviction.
+// LRUCache implements an ultra-low latency lock-free 64-way set associative cache.
+// It uses a Chunked Bitmask CLOCK algorithm for O(1) eviction within each set,
+// and SIMD/SWAR byte scanning for O(1) lookups without a hash map.
 type LRUCache struct {
 	capacity  uint32
 	maxParams int
-
-	// Lock-free HashMap maps a route hash to a pointer to an SoA index
-	indexMap *memory.HashMap
-
-	// Pre-allocated index pointers to prevent checkptr panics
-	indices []uint32
 
 	// Structure of Arrays (SoA) for fast contiguous memory access
 	methods  []atomicString
@@ -150,7 +150,7 @@ type LRUCache struct {
 
 	// Concurrency control
 	states []slotState // padded seqlocks to prevent read-tearing
-	chunks []chunk     // padded bitmasks (64 slots per chunk)
+	chunks []chunk     // padded bitmasks and SWAR signatures (64 slots per chunk)
 
 	numGroups  uint32
 	stats      [64]statStripe
@@ -170,9 +170,7 @@ func nextPowerOfTwo(n int) int {
 	return n
 }
 
-
-
-// NewLRUCache creates a new fully lock-free LRU cache.
+// NewLRUCache creates a new fully lock-free 64-way set associative LRU cache.
 func NewLRUCache(capacity, maxParams int) *LRUCache {
 	if capacity <= 0 {
 		capacity = 1024
@@ -186,19 +184,11 @@ func NewLRUCache(capacity, maxParams int) *LRUCache {
 		maxParams = 10
 	}
 
-	hm, err := memory.NewHashMap(memory.HashMapConfig{
-		Capacity: uint64(capacity * 2), // oversized to minimize collisions
-	})
-	if err != nil {
-		panic(fmt.Sprintf("liteLRU: failed to initialize off-heap memory map: %v", err))
-	}
-
 	numGroups := uint32(capacity / 64)
 
 	c := &LRUCache{
 		capacity:  uint32(capacity),
 		maxParams: maxParams,
-		indexMap:  hm,
 		methods:   make([]atomicString, capacity),
 		paths:     make([]atomicString, capacity),
 		handlers:  make([]atomicHandler, capacity),
@@ -206,77 +196,104 @@ func NewLRUCache(capacity, maxParams int) *LRUCache {
 		states:    make([]slotState, capacity),
 		chunks:    make([]chunk, numGroups),
 		numGroups: uint32(numGroups),
-		indices:   make([]uint32, capacity),
-	}
-
-	for i := uint32(0); i < uint32(capacity); i++ {
-		c.indices[i] = i
 	}
 
 	return c
 }
 
-// findVictim uses bitwise operations to instantly find an eviction victim in O(1) time.
-// It uses the hash to pick a starting group, naturally distributing the eviction sweep 
-// and eliminating the need for a highly-contended global clock hand.
-func (c *LRUCache) findVictim(hash uint64) uint32 {
-	startGroup := uint32(hash % uint64(c.numGroups))
-	for offset := uint32(0); ; offset++ {
-		group := (startGroup + offset) % c.numGroups
-		chk := &c.chunks[group]
+// findVictim uses bitwise operations to instantly find an eviction victim in O(1) time
+// within a specific 64-slot set (group).
+func (c *LRUCache) findVictim(group uint32) uint32 {
+	chk := &c.chunks[group]
 
-		for {
-			validBits := chk.valid.Load()
-			accessedBits := chk.accessed.Load()
-			writingBits := chk.writing.Load()
+	for {
+		validBits := chk.valid.Load()
+		accessedBits := chk.accessed.Load()
+		writingBits := chk.writing.Load()
 
-			// Candidates: not valid (empty), or valid but not accessed
-			candidates := ^validBits | (validBits & ^accessedBits)
-			// Exclude currently writing slots
-			candidates &= ^writingBits
+		// Candidates: not valid (empty), or valid but not accessed
+		candidates := ^validBits | (validBits & ^accessedBits)
+		// Exclude currently writing slots
+		candidates &= ^writingBits
 
-			if candidates != 0 {
-				bit := uint32(bits.TrailingZeros64(candidates))
+		if candidates != 0 {
+			bit := uint32(bits.TrailingZeros64(candidates))
 
-				// Attempt to claim this bit for writing
-				if chk.writing.CompareAndSwap(writingBits, writingBits|(1<<bit)) {
-					return group*64 + bit
-				}
-				continue // CAS failed, retry this chunk
+			// Attempt to claim this bit for writing
+			if chk.writing.CompareAndSwap(writingBits, writingBits|(1<<bit)) {
+				return group*64 + bit
 			}
-
-			// No candidates available in this chunk.
-			// Clear the accessed bits of currently valid items to give them a second chance,
-			// while preserving any concurrent access bits set by readers.
-			chk.accessed.And(^validBits)
-			break // move to the next chunk group
+			continue // CAS failed, retry
 		}
+
+		// No candidates available in this chunk.
+		// Clear the accessed bits of currently valid items to give them a second chance,
+		// while preserving any concurrent access bits set by readers.
+		chk.accessed.And(^validBits)
 	}
 }
 
 // Add adds a new entry to the cache or updates an existing one.
 func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param) {
 	hash := hashRoute(method, path)
-
-	// O(1) Bitwise victim selection
-	victimIdx := c.findVictim(hash)
-	group := victimIdx / 64
-	bit := victimIdx % 64
+	group := uint32(hash % uint64(c.numGroups))
 	chk := &c.chunks[group]
+
+	sig8 := uint8(hash >> 32)
+	if sig8 == 0 {
+		sig8 = 1
+	}
+
+	// 1. Try to find and update an existing entry
+	for i := uint32(0); i < 8; i++ {
+		word := chk.sigs[i].Load()
+		if hasByteSWAR(word, sig8) {
+			for j := uint32(0); j < 8; j++ {
+				if byte((word>>(j*8))&0xFF) == sig8 {
+					idx := group*64 + i*8 + j
+
+					validBits := chk.valid.Load()
+					if (validBits & (1 << (i*8 + j))) == 0 {
+						continue
+					}
+
+					// Verify lock-free
+					if c.methods[idx].Load() == method && c.paths[idx].Load() == path {
+						// Found it! Try to lock and overwrite.
+						seq := c.states[idx].seq.Load()
+						if seq%2 != 0 || !c.states[idx].seq.CompareAndSwap(seq, seq+1) {
+							return // Someone else is updating it, drop our redundant update
+						}
+
+						c.handlers[idx].Store(handler)
+						oldParams := c.params[idx].Load()
+						var newParams []Param
+						if len(params) > 0 {
+							if cap(oldParams) >= len(params) {
+								newParams = oldParams[:len(params)]
+								copy(newParams, params)
+							} else {
+								newParams = make([]Param, len(params))
+								copy(newParams, params)
+							}
+						}
+						c.params[idx].Store(newParams)
+
+						c.states[idx].seq.Store(seq + 2)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Not found, we need to evict a victim from this 64-slot set
+	victimIdx := c.findVictim(group)
+	bit := victimIdx % 64
 
 	// We own the writing bit. Set seqlock to odd.
 	seq := c.states[victimIdx].seq.Load()
 	c.states[victimIdx].seq.Store(seq + 1) // odd
-
-	// If it was valid previously, cleanly delete the old hash from indexMap
-	// to allow memory.HashMap to safely recycle the tombstone and prevent resizes!
-	validBits := chk.valid.Load()
-	if (validBits & (1 << bit)) != 0 {
-		oldHash := hashRoute(c.methods[victimIdx].Load(), c.paths[victimIdx].Load())
-		if ptr, found := c.indexMap.Get(oldHash); found && ptr != nil && *(*uint32)(ptr) == victimIdx {
-			c.indexMap.Delete(oldHash)
-		}
-	}
 
 	// Write new data safely under seqlock
 	c.methods[victimIdx].Store(method)
@@ -298,6 +315,18 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 	}
 	c.params[victimIdx].Store(newParams)
 
+	// Update SWAR signature
+	sigWordIdx := bit / 8
+	sigByteShift := (bit % 8) * 8
+	for {
+		oldWord := chk.sigs[sigWordIdx].Load()
+		newWord := oldWord & ^(uint64(0xFF) << sigByteShift)
+		newWord |= (uint64(sig8) << sigByteShift)
+		if chk.sigs[sigWordIdx].CompareAndSwap(oldWord, newWord) {
+			break
+		}
+	}
+
 	// Mark as accessed
 	for {
 		acc := chk.accessed.Load()
@@ -313,9 +342,6 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 			break
 		}
 	}
-
-	// Insert pointer to the pre-allocated index into the lock-free map
-	c.indexMap.Put(hash, unsafe.Pointer(&c.indices[victimIdx]))
 
 	// Finish write: seq becomes even
 	c.states[victimIdx].seq.Store(seq + 2)
@@ -333,86 +359,84 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 // The dst slice is used to avoid heap allocations when copying params.
 func (c *LRUCache) Get(method, path string, dst []Param) (HandlerFunc, []Param, bool) {
 	hash := hashRoute(method, path)
+	group := uint32(hash % uint64(c.numGroups))
+	chk := &c.chunks[group]
 	stripeIdx := hash & 63
 
-	ptr, found := c.indexMap.Get(hash)
-	if !found || ptr == nil {
-		c.stats[stripeIdx].misses.Add(1)
-		return nil, nil, false
+	sig8 := uint8(hash >> 32)
+	if sig8 == 0 {
+		sig8 = 1
 	}
 
-	idx := *(*uint32)(ptr)
-	group := idx / 64
-	bit := idx % 64
-	chk := &c.chunks[group]
+	for i := uint32(0); i < 8; i++ {
+		word := chk.sigs[i].Load()
+		if hasByteSWAR(word, sig8) {
+			for j := uint32(0); j < 8; j++ {
+				if byte((word>>(j*8))&0xFF) == sig8 {
+					idx := group*64 + i*8 + j
 
-	// Verify the slot is valid
-	validBits := chk.valid.Load()
-	if (validBits & (1 << bit)) == 0 {
-		c.stats[stripeIdx].misses.Add(1)
-		return nil, nil, false
-	}
+					validBits := chk.valid.Load()
+					if (validBits & (1 << (i*8 + j))) == 0 {
+						continue
+					}
 
-	// Start read seqlock
-	seq1 := c.states[idx].seq.Load()
-	if seq1%2 != 0 {
-		c.stats[stripeIdx].misses.Add(1)
-		return nil, nil, false
-	}
+					// Start read seqlock
+					seq1 := c.states[idx].seq.Load()
+					if seq1%2 != 0 {
+						continue // Being written
+					}
 
-	// Validate method/path against concurrent evictions and collisions
-	if c.methods[idx].Load() != method || c.paths[idx].Load() != path {
-		c.stats[stripeIdx].misses.Add(1)
-		return nil, nil, false
-	}
+					// Validate method/path against concurrent evictions and collisions
+					if c.methods[idx].Load() == method && c.paths[idx].Load() == path {
+						// Safely read data
+						handler := c.handlers[idx].Load()
+						params := c.params[idx].Load()
 
-	// Safely read data
-	handler := c.handlers[idx].Load()
-	params := c.params[idx].Load()
+						var copiedParams []Param
+						if len(params) > 0 {
+							if cap(dst) >= len(params) {
+								copiedParams = dst[:len(params)]
+							} else {
+								copiedParams = make([]Param, len(params))
+							}
+							copy(copiedParams, params)
+						}
 
-	var copiedParams []Param
-	if len(params) > 0 {
-		if cap(dst) >= len(params) {
-			copiedParams = dst[:len(params)]
-		} else {
-			copiedParams = make([]Param, len(params))
+						// Validate read seqlock
+						seq2 := c.states[idx].seq.Load()
+						if seq1 != seq2 {
+							continue
+						}
+
+						// Mark as accessed for CLOCK via CAS loop
+						bit := i*8 + j
+						for {
+							acc := chk.accessed.Load()
+							if (acc & (1 << bit)) != 0 {
+								break // already accessed
+							}
+							if chk.accessed.CompareAndSwap(acc, acc|(1<<bit)) {
+								break
+							}
+						}
+
+						c.stats[stripeIdx].hits.Add(1)
+						return handler, copiedParams, true
+					}
+				}
+			}
 		}
-		copy(copiedParams, params)
 	}
 
-	// Validate read seqlock
-	seq2 := c.states[idx].seq.Load()
-	if seq1 != seq2 {
-		// Slot was modified while we were reading!
-		c.stats[stripeIdx].misses.Add(1)
-		return nil, nil, false
-	}
-
-	// Mark as accessed for CLOCK via CAS loop
-	for {
-		acc := chk.accessed.Load()
-		if (acc & (1 << bit)) != 0 {
-			break // already accessed
-		}
-		if chk.accessed.CompareAndSwap(acc, acc|(1<<bit)) {
-			break
-		}
-	}
-
-	c.stats[stripeIdx].hits.Add(1)
-	return handler, copiedParams, true
+	c.stats[stripeIdx].misses.Add(1)
+	return nil, nil, false
 }
 
 // Clear gracefully removes all entries from the cache lock-free.
 func (c *LRUCache) Clear() {
-	hm, _ := memory.NewHashMap(memory.HashMapConfig{
-		Capacity: uint64(c.capacity * 2),
-	})
-	c.indexMap = hm
-
 	for group := uint32(0); group < c.numGroups; group++ {
 		chk := &c.chunks[group]
-		
+
 		for {
 			w := chk.writing.Load()
 			// Claim all non-writing slots
@@ -425,6 +449,11 @@ func (c *LRUCache) Clear() {
 		// Clear valid and accessed
 		chk.valid.Store(0)
 		chk.accessed.Store(0)
+
+		// Clear signatures
+		for i := 0; i < 8; i++ {
+			chk.sigs[i].Store(0)
+		}
 
 		for bit := uint32(0); bit < 64; bit++ {
 			idx := group*64 + bit
