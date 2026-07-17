@@ -391,6 +391,12 @@ To demonstrate that route lookup and cache hit times still win when parameter ex
 
 *Table 7: Dynamic router simulation with 1 ms routing/middleware penalty on cache misses.*
 
+It is worth examining the minor throughput inversion in this workload, where Otter demonstrates a 1.7% throughput advantage (93,448 req/s vs 91,864 req/s) despite trailing in median (p50) latency. This divergence highlights a fundamental architectural tradeoff between synchronous inline execution and asynchronous background buffering.
+
+Otter utilizes highly optimized, thread-local ring buffers (comparable to the BP-Wrapper architecture) to decouple cache mutations from the critical path. Under heavy concurrent load, cache operations are enqueued and returned almost immediately, with actual eviction and hash-table management deferred to a background goroutine. While this asynchronous approach inflates peak throughput on the executing HTTP threads, it inherently introduces eventual consistency on cache misses and requires pointer returns to heap-allocated data (in this case, the `RouteResult` struct containing the parameter slices), which incurs long-term garbage collection overhead.
+
+Conversely, `liteLRU` is strictly synchronous and contention-bounded. The executing thread performs the cache insertion, SWAR bitmask scanning, and policy eviction inline without background queues. Additionally, `liteLRU` expends a minimal number of CPU cycles looping over its internal SoA arrays to copy the retrieved parameters directly into the caller's stack-allocated buffer. While these inline operations trade away a fractional margin of peak throughput, they yield a deterministic, bounded execution profile (evidenced by the tighter 251 µs median latency) and mathematically guarantee zero heap allocations for the returned parameter slices. For routing cache implementations where bounding tail-latency and minimizing GC pressure take precedence over marginal throughput gains, the synchronous inline architecture remains optimal.
+
 By caching the route resolution itself, `liteLRU` drops the dynamic routing overhead from 1.11 ms to just 251 µs, proving that it acts as a tremendously effective layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
 
 ## 10. Discussion and Limitations
