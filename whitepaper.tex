@@ -289,7 +289,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 \section{Cache-Line Padding to Eliminate False Sharing}
 
-A naive implementation allocates seqlocks as a contiguous slice \texttt{[]atomic.Uint32}. Each \texttt{uint32} is 4 bytes, placing multiple seqlocks per cache line. By the MESI coherency protocol~\cite{mesi1984}, a write to slot $j$ invalidates the cache line holding $S_{j+1}, \ldots, S_{j+15}$ across all other cores, inducing spurious RFOs even for logically independent operations. This is the false sharing pathology described by Bolosky and Scott~\cite{falsesharing1993}.
+A naive implementation allocates seqlocks as a contiguous slice \texttt{[]atomic.Uint32}. Each \texttt{uint32} is 4 bytes, placing multiple seqlocks per cache line. By the MESI coherency protocol~\cite{mesi1984}, a write to slot $j$ invalidates the cache line holding multiple adjacent seqlocks across all other cores, inducing spurious RFOs even for logically independent operations. This is the false sharing pathology described by Bolosky and Scott~\cite{falsesharing1993}.
 
 \texttt{slotState} metadata is allocated in a page-aligned anonymous \texttt{mmap} region. For each supported platform, \texttt{liteLRU} selects a slot stride equal to the platform's verified coherence-line size $L$ (64 bytes for x86\_64, 128 bytes for Apple Silicon). Because the mapping base is page-aligned and each slot has stride $L$, distinct slot states begin on distinct coherence-line boundaries.
 
@@ -560,6 +560,7 @@ We have presented the hardware-grounded derivation of each principal design deci
 
 
 \section{Reproducibility}
+\setcounter{section}{12}
 \begin{itemize}
     \item \textbf{Platform Architecture}: Apple Silicon M2 ($L=128$)
     \item \textbf{Go Version}: \texttt{go1.25.7 darwin/arm64}
