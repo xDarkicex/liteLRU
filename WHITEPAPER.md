@@ -333,25 +333,25 @@ We compare against Otter v2 rather than ristretto here because ristretto's hit-r
 ---
 
 
-### 9.8 HTTP Router Integration
+### 9.8 HTTP Router Integration (JSON Response Memoization)
 
-To validate that `liteLRU`'s microsecond-level performance advantages manifest in real-world application environments, we integrated the cache into a standard Go `net/http` server router. The handler extracts a route ID, queries the cache, and either returns a cached response or computes and stores a new one.
+To validate `liteLRU`'s tail-latency advantages in a real-world scenario, we integrated it into a standard Go `net/http` server functioning as a REST API. In this scenario, the cache acts as a response memoization layer to bypass CPU-intensive JSON marshaling.
 
-We generated 10 seconds of aggressive concurrent load (64 workers) using `vegeta`, driving HTTP `GET` requests following a Zipfian distribution ($s=1.001$, $N=100,000$). We compared three configurations:
-1. **No Cache (Origin Only)**: The handler performs no work, instantly returning a 200 OK. This isolates the raw baseline overhead of the `net/http` stack.
-2. **Otter v2**: The handler checks and populates an Otter cache instance (75,000 capacity).
-3. **liteLRU**: The handler checks and populates a `liteLRU` instance (75,000 capacity).
+We generated 10 seconds of aggressive concurrent load (64 workers) using `vegeta`, driving HTTP `GET` requests following a Zipfian distribution ($s=1.001$, $N=100,000$). The server simulates a backend endpoint by dynamically selecting one of 20 complex, nested JSON payloads per request. We compared three configurations:
+1. **No Cache (Origin Only)**: The handler performs a full `json.Marshal()` on the complex payload structure for every single request before responding.
+2. **Otter v2**: The handler caches the serialized JSON string. On a cache hit, it instantly writes the string, bypassing the JSON marshaling completely.
+3. **liteLRU**: The handler stores the serialized JSON string in the `liteLRU` parameter block. On a hit, it instantly writes the parameter string, bypassing the JSON marshaling completely.
 
 | Configuration | Throughput (Req/sec) | p50 Latency | p99 Latency | Max Latency |
 |---------------|----------------------|-------------|-------------|-------------|
-| No Cache      | 92,344               | 277 µs      | 1.24 ms     | 13.7 ms     |
-| `otter` v2    | 91,916               | 272 µs      | 1.45 ms     | 134.4 ms    |
-| `liteLRU`     | **95,016**           | **270 µs**  | **1.14 ms** | **51.0 ms** |
+| No Cache      | 86,468               | 303 µs      | 1.39 ms     | 19.3 ms     |
+| `otter` v2    | **87,613**           | **274 µs**  | 1.37 ms     | 85.0 ms     |
+| `liteLRU`     | 86,656               | 299 µs      | **1.33 ms** | **31.9 ms** |
 
-`liteLRU` successfully sustained the highest overall throughput while exhibiting lower p99 latency (1.14 ms) than both Otter (1.45 ms) and the origin-only baseline (1.24 ms). Critically, Otter's amortized ingestion buffers introduced severe tail latency spikes at the maximum percentile (134.4 ms) under heavy load. By contrast, `liteLRU`'s structurally lock-free write protocol kept max latency bounded to 51.0 ms, demonstrating that its architectural advantages translate directly to superior network-level quality of service.
-
+By skipping the expensive CPU overhead of `encoding/json`, both caches naturally reduce the baseline latency and improve throughput over the raw origin server. However, at the extreme percentiles, Otter's amortized ingestion buffers trigger severe tail latency spikes at the maximum percentile (85.0 ms) under heavy concurrent load, stalling HTTP workers. By contrast, `liteLRU`'s structurally lock-free architecture maintains the lowest overall p99 latency (1.33 ms) and keeps the max latency tightly bounded (31.9 ms), ensuring the caching layer itself does not introduce arbitrary tail congestion into the network stack.
 
 ---
+
 
 ## 10. Discussion and Limitations
 
