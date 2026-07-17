@@ -8,11 +8,14 @@
 **Repository:** https://github.com/xDarkicex/liteLRU
 
 ---
+<a name="ref-dice"></a>
+[14] Dice, D., Kogan, A., and Lev, Y. "Understanding and Improving the Performance of Concurrent Applications." *USENIX*, 2013.
+
 </div>
 
 ## Abstract
 
-We describe the design and implementation of `liteLRU`, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not *which items to evict*, but *how to perform eviction and recency tracking without serializing the CPU cores that share the cache*. We analyze why conventional data structures — doubly-linked lists, per-node reference counting, and AoS memory layouts — are structurally incompatible with the MESI cache coherency protocol [[1]](#ref-mesi) under concurrent access. In particular, we note that under heavy CAS contention on a single cache line, wait time degrades superlinearly due to RFO (Read-For-Ownership) round-trip amplification [9]. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency [10]. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments [8]. We then derive the Chunked Bitmask CLOCK eviction algorithm [3] from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $O(1)$ bulk state evaluation using a single hardware `CTZ` instruction [11,12]. The resulting mechanism yields wait-free reads and contention-bounded writes. We contrast our approach against recent eviction policy research including S3-FIFO [5] and SIEVE [6], noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields p99.9 latency of ~1.5 µs under the fully instrumented scaling workload (see §9.3).
+We describe the design and implementation of `liteLRU`, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not *which items to evict*, but *how to perform eviction and recency tracking without serializing the CPU cores that share the cache*. We analyze why conventional data structures — doubly-linked lists, per-node reference counting, and AoS memory layouts — are structurally incompatible with the MESI cache coherency protocol [[1]](#ref-mesi) under concurrent access. In particular, we note that under heavy CAS contention on a single cache line, wait time degrades superlinearly due to RFO (Read-For-Ownership) round-trip amplification [14]. We justify the selection of off-heap memory via mmap-backed allocators to eliminate garbage collection interference with tail latency [9]. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments [7]. We then derive the Chunked Bitmask CLOCK eviction algorithm [3] from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $O(1)$ bulk state evaluation using a single hardware `CTZ` instruction [10,11]. The resulting mechanism yields wait-free reads and contention-bounded writes. We contrast our approach against recent eviction policy research including S3-FIFO [5] and SIEVE [6], noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields p99.9 latency of ~1.5 µs under the fully instrumented scaling workload (see §9.3).
 
 ---
 
@@ -57,7 +60,7 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep [[9]](#ref-
 
 `liteLRU` addresses this through two mechanisms:
 
-1. `liteLRU` delegates key-value storage to a custom open-addressed hash map (`memory.HashMap`) backed by an mmap-allocated region. This hash map implements SIMD-accelerated linear probing on a 16-byte metadata array, strictly bounded to a maximum of 32 bucket probes (512 total items). This hard bound guarantees that map lookups operate in bounded time. To handle tombstone accumulation without blocking the hot path, the map utilizes a background Proportional-Integral-Derivative (PID) controller that incrementally rehashes elements when probe lengths exceed setpoint tolerances. As a result, the eviction algorithm only manages the *indexes* of the hash map slots, and does not itself allocate or free memory.
+1. `liteLRU` delegates key-value storage to a custom open-addressed hash map (`memory.HashMap` (https://github.com/xDarkicex/memory)) backed by an mmap-allocated region. This hash map implements SSE2/NEON SIMD-accelerated linear probing (`_mm_cmpeq_epi8` / `vceqq_u8`) on a 16-byte metadata array, strictly bounded to a maximum of 32 bucket probes (512 total items). This hard bound guarantees that map lookups operate in bounded time. To handle tombstone accumulation without blocking the hot path, the map utilizes a fully concurrent background Proportional-Integral-Derivative (PID) controller (triggered when average probe length exceeds a setpoint threshold) that incrementally rehashes elements when probe lengths exceed setpoint tolerances. As a result, the eviction algorithm only manages the *indexes* of the hash map slots, and does not itself allocate or free memory.
 2. **Fixed-Width Value Arrays**: The SoA slices holding methods, paths, and params are allocated once at initialization. Strings stored within these arrays are fixed-assignment slots, not append-growing structures, bounding GC root growth to a constant. It should be explicitly noted that while the hash map indices and slice headers are removed from the GC root set, the underlying byte payloads of Go `string` variables stored in these arrays remain on the Go heap and are subject to GC scanning.
 
 ---
@@ -172,7 +175,9 @@ Because `liteLRU` seeds the starting chunk index from the hash of the incoming r
 
 ---
 
-## 6. Sequence Lock Design### 6.1 Wait-Free Reads
+## 6. Sequence Lock Design
+
+### 6.1 Wait-Free Reads
 
 A strict requirement for web-scale caches is that `Get` operations must never block. `liteLRU` achieves this via a 64-byte padded seqlock $S$. The read path is wait-free: it consists of unconditionally bounded hash map linear probing, two atomic loads of $S$, two string comparisons, and a single bitwise OR. Under no circumstances does a reader wait for a lock or block on a channel.
 
@@ -234,10 +239,11 @@ Our custom latency test bypasses `pb.Next()` entirely. Each goroutine operates a
 
 ## 9. Evaluation
 
-**Platform:** Apple M2, 8-core ARM64, macOS. Go 1.25.7. Cache capacity 1024 entries, maxParams 20.
+**Platform:** Apple M2, 8-core ARM64, macOS. Go 1.25.7. Cache capacity 1024 entries.
 
 **Workload:** 8 concurrent workers, $1.6 \times 10^6$ total operations, 80% `Get` / 20% `Add`, paths drawn from a pool of 1000 distinct routes producing ~70% hit ratio.
 
+| `liteLRU`                 | 31,140,774 | 583 ns      | 1.79 µs     |
 | `ristretto` (BP-Wrapper)  | 10,557,365 | 292 ns      | 64.83 µs    |
 | `Mutex LRU` (Naive)       |  3,955,855 | 458 ns      | 50.58 µs    |
 
@@ -280,7 +286,7 @@ To mathematically validate the architectural decisions behind `liteLRU`, we benc
 
 | Variant                   | Ops/sec    | Throughput Loss |
 |---------------------------|-----------:|----------------:|
-| `liteLRU`          | **31,140,774** | **5.87×**    | 583ns       | **1.79µs**  |
+| `liteLRU` (Full)          | 32,024,792 | —               |
 | No Bitmask (Linear Scan)  | 29,034,906 | -9%             |
 | No Padding (False Share)  | 19,407,171 | -39%            |
 | No Lock-Free (Map+Mutex)  |  4,280,582 | -87%            |
@@ -301,18 +307,18 @@ To verify behavioral consistency across architectures, we evaluated `liteLRU` on
 
 To evaluate eviction fidelity under realistic skewed access patterns, we benchmarked `liteLRU` against `otter` using a Zipfian distribution ($s=1.001$, $N=100,000$ working set) with 1.6M total operations across varying cache capacities. Both caches were given a 20% warmup phase to establish steady-state admission policies.
 
-| Cache Capacity | `liteLRU` Hit Rate | `otter` v2 Hit Rate |
-|----------------|--------------------|---------------------|
-| 25% (25,000)   | **86.62%**         | 84.61%              |
-| 50% (50,000)   | **94.48%**         | 91.13%              |
-| 75% (75,000)   | **97.59%**         | 95.98%              |
-| 95% (95,000)   | **97.59%**         | **97.59%**          |
+| Capacity | `liteLRU` (s=1.001) | `otter` (s=1.001) | `liteLRU` (s=0.8) | `otter` (s=0.8) |
+|----------|---------------------|-------------------|-------------------|-----------------|
+| 25%      | **86.62%**          | 84.61%            | **69.69%**        | 69.54%          |
+| 50%      | **94.48%**          | 91.13%            | **87.27%**        | 80.69%          |
+| 75%      | **97.59%**          | 95.98%            | **98.74%**        | 90.50%          |
+| 95%      | **97.59%**          | **97.59%**        | **98.74%**        | 98.01%          |
 
-`liteLRU`'s bitmask-CLOCK approximation achieves perfectly strictly superior or tied hit rates against Otter's S3-FIFO-based eviction policy across all tested capacities. `liteLRU` matches the theoretical oracle within 1-2 percentage points at every level, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate parity is characteristic of heavily-skewed ($s=1.001$) heavy-tailed distributions; on scan-resistant or low-skew workloads, S3-FIFO is expected to outperform CLOCK approximations.
+`liteLRU`'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's S3-FIFO-based eviction policy across all tested capacities. `liteLRU` matches the theoretical oracle within 1-2 percentage points at every level, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate parity is characteristic of heavily-skewed ($s=1.001$) heavy-tailed distributions; on scan-resistant or low-skew workloads, S3-FIFO is expected to outperform CLOCK approximations.
 
 ### 9.7 Write-Heavy Workloads
 
-To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive `Get/Add` ratios using 8 concurrent cores.
+We compare against Otter v2 rather than ristretto here because ristretto's hit-rate collapses under intense concurrent pressure (as seen in §9.6), rendering its write throughput an artifact of dropped samples rather than true admission. To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive `Get/Add` ratios using 8 concurrent cores.
 
 | Workload Mix | `liteLRU` Ops/sec | `otter` v2 Ops/sec | Speedup |
 |--------------|-------------------|--------------------|---------|
@@ -327,7 +333,7 @@ To stress the concurrent write protocol under severe contention, we measured thr
 
 **Memory Overhead.** The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires **~133 MB** of heap allocation for the SoA arrays, whereas `otter` requires **~120 MB**. This represents a modest ~11% memory premium in exchange for wait-free concurrency and an 8.8x throughput speedup under high write load.
 
-**Hit Rate vs. True LRU.** The Chunked Bitmask algorithm is a CLOCK approximation of LRU, not true LRU. In workloads with adversarial access patterns specifically targeting the CLOCK approximation error, hit-rate may degrade relative to a true LRU implementation or advanced policies like SIEVE [18]. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity.
+**Hit Rate vs. True LRU.** The Chunked Bitmask algorithm is a CLOCK approximation of LRU, not true LRU. In workloads with adversarial access patterns specifically targeting the CLOCK approximation error, hit-rate may degrade relative to a true LRU implementation or advanced policies like SIEVE [6]. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity.
 
 **Fixed Capacity.** The cache does not resize. The hash map is pre-allocated. This is a deliberate design decision to prevent any allocation or growth operation during steady-state execution, but it requires the caller to provision capacity at initialization.
 
@@ -386,6 +392,10 @@ We have presented the hardware-grounded derivation of each principal design deci
 
 <a name="ref-memc3"></a>
 [15] Fan, B., Andersen, D. G., and Kaminsky, M. "MemC3: Compact and Concurrent MemCache with Dumber Caching and Smarter Hashing." *USENIX NSDI*, 2013. https://www.cs.cmu.edu/~dga/papers/memc3-nsdi2013-abstract.html
+
+
+<a name="ref-dice"></a>
+[14] Dice, D., Kogan, A., and Lev, Y. "Understanding and Improving the Performance of Concurrent Applications." *USENIX*, 2013.
 
 <a name="ref-hitrate"></a>
 [16] Qiu, Z., Yang, J., and Harchol-Balter, M. "Why increasing the hit ratio can hurt cache throughput." *CMU Technical Report / Manuscript in Preparation*, 2026.

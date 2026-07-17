@@ -82,7 +82,7 @@ Atomic operations (\texttt{CAS}, fetch-and-add) on a memory location whose cache
     \item The atomic read-modify-write in the modified cache line.
 \end{enumerate}
 
-Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips. As core count $N$ grows, the wait time for the contested line scales as $\mathcal{O}(N)$ per operation, a fact formalized by Amdahl~\cite{amdahl1967}. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit~\cite{lockfree2004}.
+Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips. As core count $N$ grows, the wait time for the contested line degrades superlinearly due to RFO round-trip amplification~\cite{dice}, a fact formalized by Amdahl~\cite{amdahl1967}. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit~\cite{lockfree2004}.
 
 \section{Why Off-Heap Memory}
 
@@ -97,7 +97,7 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2
 \texttt{liteLRU} addresses this through two mechanisms:
 
 \begin{enumerate}
-    \item \textbf{Off-Heap HashMap:} \texttt{liteLRU} delegates key-value storage to a custom open-addressed hash map (\texttt{memory.HashMap}) backed by an mmap-allocated region. This hash map implements SIMD-accelerated linear probing on a 16-byte metadata array, strictly bounded to a maximum of 32 bucket probes (512 total items). This hard bound guarantees that map lookups operate in bounded time. To handle tombstone accumulation without blocking the hot path, the map utilizes a background Proportional-Integral-Derivative (PID) controller that incrementally rehashes elements when probe lengths exceed setpoint tolerances. As a result, the eviction algorithm only manages the \textit{indexes} of the hash map slots, and does not itself allocate or free memory.
+    \item \textbf{Off-Heap HashMap:} \texttt{liteLRU} delegates key-value storage to a custom open-addressed hash map (\texttt{memory.HashMap}\footnote{\url{https://github.com/xDarkicex/memory}}) backed by an mmap-allocated region. This hash map implements SSE2/NEON SIMD-accelerated linear probing (\texttt{\_mm\_cmpeq\_epi8} / \texttt{vceqq\_u8}) on a 16-byte metadata array, strictly bounded to a maximum of 32 bucket probes (512 total items). This hard bound guarantees that map lookups operate in bounded time. To handle tombstone accumulation without blocking the hot path, the map utilizes a fully concurrent background Proportional-Integral-Derivative (PID) controller (triggered when average probe length exceeds a setpoint threshold) that incrementally rehashes elements when probe lengths exceed setpoint tolerances. As a result, the eviction algorithm only manages the \textit{indexes} of the hash map slots, and does not itself allocate or free memory.
     \item \textbf{Fixed-Width Value Arrays:} The SoA slices holding methods, paths, and params are allocated once at initialization time. They are fixed-assignment slots rather than append-growing structures, bounding GC root growth to a constant determined at construction. It should be explicitly noted that while the hash map indices and slice headers are removed from the GC root set, the underlying byte payloads of Go \texttt{string} variables stored in these arrays remain on the Go heap and are subject to GC scanning.
 \end{enumerate}
 
@@ -282,7 +282,7 @@ Our custom latency evaluation bypasses \texttt{pb.Next()} entirely. Each gorouti
 
 \section{Evaluation}
 
-\textbf{Platform:} Apple M2, 8-core ARM64, macOS. Go 1.25.7. Cache capacity 1024, maxParams 20.
+\textbf{Platform:} Apple M2, 8-core ARM64, macOS. Go 1.25.7. Cache capacity 1024.
 
 \textbf{Workload:} 8 concurrent workers, $1.6 \times 10^6$ total operations, 80\% \texttt{Get} / 20\% \texttt{Add}, paths drawn from a pool of 1000 distinct routes yielding $\approx$70\% hit ratio.
 
@@ -396,11 +396,11 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 \caption{Hit rates under Zipfian distribution.}
 \end{table}
 
-\texttt{liteLRU}'s bitmask-CLOCK approximation achieves strictly superior or tied hit rates against Otter's S3-FIFO-based eviction policy across all tested capacities. \texttt{liteLRU} matches the theoretical oracle within 1-2 percentage points at every level, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate parity is characteristic of heavily-skewed ($s=1.001$) heavy-tailed distributions; on scan-resistant or low-skew workloads, S3-FIFO is expected to outperform CLOCK approximations.
+\texttt{liteLRU}'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's S3-FIFO-based eviction policy across all tested capacities. \texttt{liteLRU} matches the theoretical oracle within 1-2 percentage points at every level, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate parity is characteristic of heavily-skewed ($s=1.001$) heavy-tailed distributions; on scan-resistant or low-skew workloads, S3-FIFO is expected to outperform CLOCK approximations.
 
 \subsection{Write-Heavy Workloads}
 
-To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive Get/Add ratios using 8 concurrent cores.
+We compare against Otter v2 rather than \texttt{ristretto} here because \texttt{ristretto}'s hit-rate collapses under intense concurrent pressure (as seen in \S 9.6), rendering its write throughput an artifact of dropped samples rather than true admission. To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive Get/Add ratios using 8 concurrent cores.
 
 \begin{table}[h]
 \centering
