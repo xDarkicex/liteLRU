@@ -8,8 +8,7 @@
 **Repository:** https://github.com/xDarkicex/liteLRU
 
 ---
-<a name="ref-dice"></a>
-[16] Dice, D., Kogan, A., and Lev, Y. "Understanding and Improving the Performance of Concurrent Applications." *USENIX*, 2013.
+
 
 </div>
 
@@ -318,11 +317,11 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 | 75%      | **97.59%**          | 95.98%            | **98.74%**        | 90.50%          |
 | 95%      | **97.59%**          | **97.59%**        | **98.74%**        | 98.01%          |
 
-`liteLRU`'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's S3-FIFO-based eviction policy across all tested capacities. `liteLRU` achieves hit rates competitive with frequency-optimal caching across both high-skew and moderate-skew Zipfian distributions. Furthermore, CLOCK's recency tracking provides an advantage over pure frequency-based eviction at moderate skew (e.g. s=0.8) due to temporal locality in the access pattern, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate parity is characteristic of heavily-skewed ($s=1.001$) heavy-tailed distributions; on scan-resistant or low-skew workloads, S3-FIFO is expected to outperform CLOCK approximations. However, `liteLRU`'s throughput remains immune to the high hit-ratio contention pathology formally described by Qiu et al. [17].
+`liteLRU`'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's S3-FIFO-based eviction policy across all tested capacities. `liteLRU` achieves hit rates competitive with frequency-optimal caching across both high-skew and moderate-skew Zipfian distributions. Furthermore, CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. s=0.8) due to temporal locality in the access pattern, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate advantage holds across both high-skew ($s=1.001$) and moderate-skew ($s=0.8$) distributions; on strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. However, `liteLRU`'s throughput remains immune to the high hit-ratio contention pathology described by Qiu et al. [17].
 
 ### 9.7 Write-Heavy Workloads
 
-We compare against Otter v2 rather than ristretto here because ristretto's hit-rate collapses under intense concurrent pressure, rendering its write throughput an artifact of dropped samples rather than true admission. To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive `Get/Add` ratios using 8 concurrent cores.
+We compare against Otter v2 rather than ristretto here because ristretto's hit-rate collapses under intense concurrent pressure (as documented by the Otter authors [18]), rendering its write throughput an artifact of dropped samples rather than true admission. To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive `Get/Add` ratios using 8 concurrent cores.
 
 | Workload Mix | `liteLRU` Ops/sec | `otter` v2 Ops/sec | Speedup |
 |--------------|-------------------|--------------------|---------|
