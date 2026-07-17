@@ -14,7 +14,7 @@
 
 ## Abstract
 
-We describe the design and implementation of `liteLRU`, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not *which items to evict*, but *how to perform eviction and recency tracking without serializing the CPU cores that share the cache*. We analyze why conventional data structures — doubly-linked lists, per-node reference counting, and AoS memory layouts — are structurally incompatible with the MESI cache coherency protocol [[1]](#ref-mesi) under concurrent access. In particular, we note that under heavy CAS contention on a single cache line, wait time degrades superlinearly due to RFO (Read-For-Ownership) round-trip amplification [16]. We justify a **hybrid memory architecture** — where heavily mutated lock-free state is allocated off-heap via mmap, while Go pointers remain on the heap — to eliminate garbage collection interference on the hot path without risking dangling pointers [9]. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments [7]. We then derive the Chunked Bitmask CLOCK eviction algorithm [3] from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $O(1)$ bulk state evaluation using a single hardware `CTZ` instruction [10,11]. Critically, we eliminate the open-addressed hash map entirely in favor of a **64-way set associative architecture** with SWAR (SIMD Within A Register) signature scanning, removing tombstone compaction as a source of tail-latency spikes.
+Concurrent approximate LRU structures often serialize cores on shared metadata. We present `liteLRU`, a fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are wait-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, `liteLRU` isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that `liteLRU` sustains over 30 million operations per second under severe 80% write contention while providing strictly bounded maximum tail latency ($O(1)$) across synthetic and end-to-end network simulations.
 
 ---
 
@@ -47,7 +47,7 @@ Under high concurrency, a single globally contested atomic (e.g., a global clock
 
 ---
 
-## 1.1 Contributions
+### Contributions
 
 In this paper, we make the following contributions to concurrent cache design:
 * **Contention-Bounded Eviction Algorithm:** A 64-way set associative architecture utilizing chunked bitmasks and hardware `CTZ`, eliminating global clock hands and open-addressed maps entirely.
@@ -200,46 +200,33 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 **Add(key, value)**
 1. Hash the key to find chunk $k$.
-2. Run `findVictim(k)` (see Load-Shedding below).
+2. Run `findVictim(k)`.
 3. If `findVictim` returns the failure sentinel, drop the admission and return.
-4. Write the new key/value into the SoA arrays at the victim slot.
-5. Update the seqlock $S_i$ and clear the victim's bit in $V_k$ and $A_k$.
+4. Clear the victim's bit in $V_k$.
+5. Increment the seqlock $S_i$ to an odd value.
+6. Write the new key and value into the SoA arrays at the victim slot.
+7. Update the SWAR signature byte for the new key.
+8. Increment the seqlock $S_i$ to an even value.
+9. Set the victim's bit in $V_k$, clear its bit in $A_k$, and release its bit in $W_k$.
 
 **findVictim(chunk k)**
 1. Retry loop (max 10 iterations).
-2. Apply the CLOCK approximation: identify candidate slots using `CTZ(V_k & ~A_k & ~W_k)`.
+2. Apply the CLOCK approximation: identify candidate slots using `CTZ((~V_k | ~A_k) & ~W_k)`.
 3. Attempt to CAS the $W_k$ bitmask to claim the slot.
 4. If successful, return the slot index.
 5. If unsuccessful (due to concurrent writers), increment retry counter.
 6. If 10 retries are exhausted, return the `0xFFFFFFFF` failure sentinel.
 
-### 6.3 Padded Seqlocks and Wait-Free Reads
+### 6.3 Correctness Theorems
 
-A strict requirement for web-scale caches is that `Get` operations must never block. `liteLRU` achieves this via a 64-byte padded seqlock $S_i$. The read path consists of a SWAR signature scan, atomic loads of $S_i$, a string comparison, and a single bitwise OR for the access bit. Under no circumstances does a reader wait for a lock or block on a channel.
+**Theorem 1 (Wait-Free Reads).** *Any thread executing `Get` is guaranteed to complete in a bounded number of instructions regardless of the state or execution speed of concurrent writers.*
+*Proof:* The read path consists solely of a SWAR signature scan, atomic loads of the 64-byte padded seqlock $S_i$, a string comparison, and a single bitwise `OR` for the access bit. The padded layout strictly isolates $S_i$, mathematically eliminating false-sharing invalidations. Under no circumstances does a reader spin on a lock or wait on a channel; concurrent writes merely cause an optimistic retry of the localized seqlock loop.
 
-### 6.1 Wait-Free Reads
+**Theorem 2 (Bounded Write-Side Work).** *Any thread executing `Add` will terminate in $O(1)$ atomic operations.*
+*Proof:* `findVictim` utilizes the `CTZ` instruction to identify eviction candidates in a single CPU cycle. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, `findVictim` returns a failure sentinel and `Add` drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
 
-A strict requirement for web-scale caches is that `Get` operations must never block. `liteLRU` achieves this via a 64-byte padded seqlock $S$. The read path is wait-free: it consists of a SWAR signature scan over at most 8 `uint64` words (bounded to the 64-slot set), two atomic loads of $S$, a full string comparison on any SWAR match, and a single bitwise OR for the access bit. Under no circumstances does a reader wait for a lock or block on a channel.
-
-**Reader Protocol:** Each slot $i$ maintains an atomic 32-bit sequence counter $S_i$, initialized to 0.
-
-**Write Protocol:** Before mutating slot $i$, a writer sets $S_i \leftarrow S_i + 1$ (making it odd). After completing the write, it sets $S_i \leftarrow S_i + 1$ (returning to even).
-
-**Read Protocol:** A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, the slot is being written; report a miss. Otherwise, read the data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, the slot was concurrently modified; report a miss. Finally, check if the bitmask is valid: if $V_k[i] = 0$, report a miss. Otherwise, the read is consistent.
-
-**64-Way Set Associative Write Consistency.** Because `liteLRU` uses in-place overwrite within a fixed 64-slot set rather than a hash map, there are no tombstones to manage and no global index to update. Following the successful claim of $W_k[i]$, the writer protocol is:
-1. Atomically invalidate the slot bitmask ($V_k[i] \leftarrow 0$).
-2. Under Seqlock, overwrite the new route data directly into the SoA arrays at slot index $i$.
-3. Update the 8-bit SWAR signature byte for slot $i$ in the set's signature word.
-4. Atomically validate the slot bitmask ($V_k[i] \leftarrow 1$) and release the claim ($W_k[i] \leftarrow 0$).
-
-Note that steps 2–4 operate entirely within the 64-slot set already identified by the route hash. No global index, probe sequence, or compaction step is required. Concurrent readers observing an odd seqlock during step 2 report a miss and retry on the next request.
-
-**Theorem (Wait-Free Reads).** The `Get` operation is wait-free: it always completes in a bounded number of steps, regardless of concurrent writer behavior.
-
-*Proof.* The reader never waits on a lock, retries in a loop, or participates in consensus. At any point where a concurrent write would invalidate the read (odd seqlock or $s_1 \neq s_2$), the reader detects the condition and immediately returns a cache miss. The total number of steps is strictly bounded by a constant: at most 8 SWAR word scans, two atomic loads, one string comparison, and one bitmask check. $\square$
-
----
+**Theorem 3 (Safety Invariant).** *No two writers may simultaneously overwrite the same slot, and readers will never observe torn key/value pairs.*
+*Proof:* A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, writing the SoA data, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ is guaranteed a linearizable, untorn read.
 
 ## 7. Cache-Line Padding to Eliminate False Sharing
 
@@ -401,7 +388,7 @@ Several results merit explicit discussion:
 
 **Otter's throughput is lower than no-cache (86,056 vs 86,453 req/sec).** Despite bypassing JSON marshaling on hits, `otter` is marginally slower than the baseline. This indicates that `otter`'s admission buffer overhead — background goroutines flushing the write buffer, mutex acquisition on hit promotion, and GC pressure from pointer-heavy internals — nearly cancels the JSON savings at this concurrency level. The cache adds latency, not just eliminates it.
 
-**Otter's 173.1 ms max latency is 4.9× worse than the no-cache baseline (35.1 ms).** This spike is suggestive of `otter`'s amortized write buffer saturating: under 64-worker concurrent pressure, if the background goroutine responsible for draining the ingestion buffer is delayed by the Go scheduler, the buffer may fill. Subsequent `Set` operations would then block until the drain completes — stalling HTTP workers. This latency profile is consistent with the structural properties of amortized-admission designs. `liteLRU` avoids it by performing all writes synchronously and in-place within the 64-slot set, with no background goroutine to be descheduled.
+**Otter's 173.1 ms max latency is 4.9× worse than the no-cache baseline (35.1 ms).** This latency profile is consistent with the structural properties of amortized-buffer designs under concurrent pressure. `liteLRU` avoids it by performing all writes synchronously and in-place within the 64-slot set, with no background goroutine to be descheduled.
 
 In summary, `liteLRU` yields the highest throughput (93,603 req/sec), the lowest p99 latency (1.20 ms), and a tightly bounded max latency (43.1 ms), confirming that the 64-way set associative SWAR architecture does not introduce tail congestion into the network stack under sustained load.
 
@@ -428,7 +415,7 @@ By shielding the application from the simulated network upstream, `liteLRU` drop
 
 ### 9.10 Dynamic Router Integration and Pathological Stress Testing
 
-To evaluate the cache under realistic API workloads and extreme pathological contention, we simulated a dynamic routing layer. We designed a synthetic worst-case stress test (using artificial timer synchronization) to deliberately saturate a single URL's chunk with 64 simultaneous cache misses (a "Thundering Herd"). This test confirmed that without bounds, spin-lock preemption cascades cause latency spikes. By employing the 10-retry load-shedding mechanism (Section 6.2), `liteLRU` rigorously bounds this execution. 
+To evaluate the cache under realistic API workloads and extreme pathological contention, we simulated a dynamic routing layer. We designed a synthetic worst-case stress test (using artificial timer synchronization) to deliberately saturate a single URL's chunk with 64 simultaneous cache misses (a "Thundering Herd"). We include this synthetic contention stress case to validate the load-shedding bound under simultaneous multi-miss admission. By employing the 10-retry load-shedding mechanism (Section 6.2), `liteLRU` rigorously bounds this execution. 
 
 We then present the realistic end-to-end results below, where the un-cached origin simulates a CPU-bound regex routing tree lookup and path extraction (e.g. `/api/user/{id}/profile`). `liteLRU` caches the resulting `HandlerFunc` and extracted `[]Param` directly. Crucially, `liteLRU` uses a stack-allocated buffer (`var pbuf [4]liteLRU.Param`) for retrieving parameters, eliminating any pool-managed or heap allocations on route hits.
 

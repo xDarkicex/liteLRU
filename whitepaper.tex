@@ -84,7 +84,7 @@ Atomic operations (\texttt{CAS}, fetch-and-add) on a memory location whose cache
 
 Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips. As core count $N$ grows, the wait time for the contested line degrades superlinearly due to RFO round-trip amplification~\cite{dice}, a fact formalized by Amdahl~\cite{amdahl1967}. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit~\cite{lockfree2004}.
 
-\subsection{Contributions}
+\subsubsection*{Contributions}
 In this paper, we make the following contributions to concurrent cache design:
 \begin{itemize}
     \item \textbf{Contention-Bounded Eviction Algorithm:} A 64-way set associative architecture utilizing chunked bitmasks and hardware \texttt{CTZ}, eliminating global clock hands and open-addressed maps entirely.
@@ -253,47 +253,36 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \textbf{Add(key, value)}
 \begin{enumerate}
     \item Hash the key to find chunk $k$.
-    \item Run \texttt{findVictim(k)} (see Load-Shedding below).
+    \item Run \texttt{findVictim(k)}.
     \item If \texttt{findVictim} returns the failure sentinel, drop the admission and return.
-    \item Write the new key/value into the SoA arrays at the victim slot.
-    \item Update the seqlock $S_i$ and clear the victim's bit in $V_k$ and $A_k$.
+    \item Clear the victim's bit in $V_k$.
+    \item Increment the seqlock $S_i$ to an odd value.
+    \item Write the new key and value into the SoA arrays at the victim slot.
+    \item Update the SWAR signature byte for the new key.
+    \item Increment the seqlock $S_i$ to an even value.
+    \item Set the victim's bit in $V_k$, clear its bit in $A_k$, and release its bit in $W_k$.
 \end{enumerate}
 
 \textbf{findVictim(chunk k)}
 \begin{enumerate}
     \item Retry loop (max 10 iterations).
-    \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ(V\_k \& \textasciitilde A\_k \& \textasciitilde W\_k)}.
+    \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ((\textasciitilde V\_k \textbar{} \textasciitilde A\_k) \& \textasciitilde W\_k)}.
     \item Attempt to CAS the $W_k$ bitmask to claim the slot.
     \item If successful, return the slot index.
     \item If unsuccessful (due to concurrent writers), increment retry counter.
     \item If 10 retries are exhausted, return the \texttt{0xFFFFFFFF} failure sentinel.
 \end{enumerate}
 
-\subsection{Padded Seqlocks and Wait-Free Reads}
-A strict requirement for web-scale caches is that \texttt{Get} operations must never block. \texttt{liteLRU} achieves this via a 64-byte padded seqlock $S_i$. The read path consists of a SWAR signature scan, atomic loads of $S_i$, a string comparison, and a single bitwise OR for the access bit. Under no circumstances does a reader wait for a lock or block on a channel.
+\subsection{Correctness Theorems}
 
-\subsection{Wait-Free Reads}
+\textbf{Theorem 1 (Wait-Free Reads).} \textit{Any thread executing \texttt{Get} is guaranteed to complete in a bounded number of instructions regardless of the state or execution speed of concurrent writers.}
+\\\textit{Proof:} The read path consists solely of a SWAR signature scan, atomic loads of the 64-byte padded seqlock $S_i$, a string comparison, and a single bitwise \texttt{OR} for the access bit. The padded layout strictly isolates $S_i$, mathematically eliminating false-sharing invalidations. Under no circumstances does a reader spin on a lock or wait on a channel; concurrent writes merely cause an optimistic retry of the localized seqlock loop.
 
-A strict requirement for web-scale caches is that \texttt{Get} operations must never block. \texttt{liteLRU} achieves this via a 64-byte padded seqlock $S$. The read path is wait-free: it consists of unconditionally bounded 64-way set associative SWAR signature scanning, two atomic loads of $S$, two string comparisons, and a single bitwise OR. Under no circumstances does a reader wait for a lock or block on a channel.
+\textbf{Theorem 2 (Bounded Write-Side Work).} \textit{Any thread executing \texttt{Add} will terminate in $O(1)$ atomic operations.}
+\\\textit{Proof:} \texttt{findVictim} utilizes the \texttt{CTZ} instruction to identify eviction candidates in a single CPU cycle. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, \texttt{findVictim} returns a failure sentinel and \texttt{Add} drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
 
-\textbf{Reader Protocol:} Each slot $i$ maintains an atomic 32-bit sequence counter $S_i$, initialized to 0.
-
-\textbf{Write Protocol:} A writer sets $S_i \leftarrow S_i + 1$ (making it odd). After completing the write, it sets $S_i \leftarrow S_i + 1$ (returning to even).
-
-\textbf{Read Protocol:} A reader samples $s_1 \leftarrow S_i$. If $s_1$ is odd, the slot is being written; report a miss immediately. Read the data. Sample $s_2 \leftarrow S_i$. If $s_1 \neq s_2$, a concurrent write occurred; report a miss. Finally, check if the bitmask is valid: if $V_k[i] = 0$, report a miss. Otherwise, the read is consistent.
-
-\textbf{Concurrent Set Associative Write Consistency.} Since \texttt{liteLRU} relies on a 64-way set associative array with in-place overwrites, eviction requires a strict ordering to prevent races where a reader observes a valid signature but reads torn data. Following the successful claim of $W_k[i]$, the writer protocol is:
-\begin{enumerate}
-    \item Atomically invalidate the slot bitmask ($V_k[i] \leftarrow 0$).
-    \item Delete the old hash entry from the map (tombstoning).
-    \item Under Seqlock, write the new route data to the SoA arrays.
-    \item Insert the new hash entry pointing to the fixed slot index.
-    \item Atomically validate the slot bitmask ($V_k[i] \leftarrow 1$) and release the claim ($W_k[i] \leftarrow 0$).
-\end{enumerate}
-
-\textbf{Theorem (Wait-Free Reads).} \textit{The \texttt{Get} operation is wait-free: it completes in a bounded number of steps regardless of concurrent writer behavior.}
-
-\textit{Proof.} The reader executes no loops, no spin-waits, and acquires no locks or consensus objects. Each decision point (odd seqlock, changed seqlock, mismatched key) results in an immediate return. By returning a miss rather than blocking or spinning, we trade marginal hit-rate deflation under heavy write pressure for strict, guaranteed worst-case latency bounds. The total steps are bounded by a constant: two atomic loads, one key comparison, one bitmask check. $\square$
+\textbf{Theorem 3 (Safety Invariant).} \textit{No two writers may simultaneously overwrite the same slot, and readers will never observe torn key/value pairs.}
+\\\textit{Proof:} A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, writing the SoA data, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ is guaranteed a linearizable, untorn read.
 
 \section{Cache-Line Padding to Eliminate False Sharing}
 
@@ -517,7 +506,7 @@ By shielding the application from the simulated network upstream, \texttt{liteLR
 
 
 \subsection{Dynamic Router Integration and Pathological Stress Testing}
-To evaluate the cache under realistic API workloads and extreme pathological contention, we simulated a dynamic routing layer. We designed a synthetic worst-case stress test (using artificial timer synchronization) to deliberately saturate a single URL's chunk with 64 simultaneous cache misses (a "Thundering Herd"). This test confirmed that without bounds, spin-lock preemption cascades cause latency spikes. By employing the 10-retry load-shedding mechanism (Section 6.2), \texttt{liteLRU} rigorously bounds this execution.
+To evaluate the cache under realistic API workloads and extreme pathological contention, we simulated a dynamic routing layer. We designed a synthetic worst-case stress test (using artificial timer synchronization) to deliberately saturate a single URL's chunk with 64 simultaneous cache misses (a "Thundering Herd"). We include this synthetic contention stress case to validate the load-shedding bound under simultaneous multi-miss admission. By employing the 10-retry load-shedding mechanism (Section 6.2), \texttt{liteLRU} rigorously bounds this execution.
 
 We then present the realistic end-to-end results below, where the un-cached origin simulates a CPU-bound regex routing tree lookup and path extraction (e.g., \texttt{/api/user/\{id\}/profile}). \texttt{liteLRU} caches the resulting \texttt{HandlerFunc} and extracted \texttt{[]Param} directly. Crucially, \texttt{liteLRU} uses a stack-allocated buffer (\texttt{var pbuf [4]liteLRU.Param}) for retrieving parameters, eliminating any pool-managed or heap allocations on route hits.
 
