@@ -14,6 +14,12 @@ import (
 	"github.com/xDarkicex/liteLRU"
 )
 
+
+type RouteResult struct {
+	Handler func()
+	Params  []liteLRU.Param
+}
+
 var cacheType = flag.String("cache", "none", "Cache to use: none, litelru, otter")
 
 type ComplexPayload struct {
@@ -64,6 +70,7 @@ func main() {
 
 	var lite *liteLRU.LRUCache
 	var otterCache otter.Cache[string, string]
+	var otterRouterCache otter.Cache[string, RouteResult]
 
 	if *cacheType == "litelru" {
 		lite = liteLRU.NewLRUCache(capacity, 5)
@@ -73,6 +80,12 @@ func main() {
 		otterCache, err = otter.MustBuilder[string, string](capacity).Build()
 		if err != nil {
 			log.Fatal(err)
+		}
+		
+		var err2 error
+		otterRouterCache, err2 = otter.MustBuilder[string, RouteResult](capacity).Build()
+		if err2 != nil {
+			log.Fatal(err2)
 		}
 		fmt.Println("Using Otter v2 cache")
 	} else {
@@ -184,6 +197,88 @@ func main() {
 		b, _ := json.Marshal(payload)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(b)
+	})
+
+	
+	http.HandleFunc("/api/user/", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+
+		if *cacheType == "litelru" {
+			var pbuf [4]liteLRU.Param
+			if handler, params, ok := lite.Get("GET", path, pbuf[:0]); ok {
+				if handler != nil {
+					handler()
+				}
+				w.Header().Set("Content-Type", "text/plain")
+				if len(params) > 0 {
+					w.Write([]byte(params[0].Value))
+				}
+				return
+			}
+			
+			parts := strings.Split(path, "/")
+			if len(parts) >= 5 && parts[4] == "profile" {
+				idStr := parts[3]
+				time.Sleep(1 * time.Millisecond) // Simulate route parsing & middleware overhead
+				
+				handler := func() {}
+				params := []liteLRU.Param{{Key: "id", Value: idStr}}
+				lite.Add("GET", path, handler, params)
+				
+				handler()
+				w.Header().Set("Content-Type", "text/plain")
+				w.Write([]byte(idStr))
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
+
+		if *cacheType == "otter" {
+			if res, ok := otterRouterCache.Get(path); ok {
+				if res.Handler != nil {
+					res.Handler()
+				}
+				w.Header().Set("Content-Type", "text/plain")
+				if len(res.Params) > 0 {
+					w.Write([]byte(res.Params[0].Value))
+				}
+				return
+			}
+			
+			parts := strings.Split(path, "/")
+			if len(parts) >= 5 && parts[4] == "profile" {
+				idStr := parts[3]
+				time.Sleep(1 * time.Millisecond) // Simulate route parsing & middleware overhead
+				
+				res := RouteResult{
+					Handler: func() {},
+					Params:  []liteLRU.Param{{Key: "id", Value: idStr}},
+				}
+				otterRouterCache.Set(path, res)
+				
+				res.Handler()
+				w.Header().Set("Content-Type", "text/plain")
+				w.Write([]byte(idStr))
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
+
+		parts := strings.Split(path, "/")
+		if len(parts) >= 5 && parts[4] == "profile" {
+			idStr := parts[3]
+			time.Sleep(1 * time.Millisecond) // Simulate route parsing & middleware overhead
+			
+			handler := func() {}
+			handler()
+			
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte(idStr))
+			return
+		}
+		http.NotFound(w, r)
 	})
 
 	fmt.Println("Listening on :8099...")

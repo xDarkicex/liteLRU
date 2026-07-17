@@ -20,6 +20,8 @@ func main() {
 	filename := "targets.txt"
 	if *endpoint == "proxy" {
 		filename = "targets_proxy.txt"
+	} else if *endpoint == "router" {
+		filename = "targets_router.txt"
 	}
 
 	f, err := os.Create(filename)
@@ -30,7 +32,11 @@ func main() {
 
 	for i := 0; i < numOps; i++ {
 		id := zipf.Uint64()
-		fmt.Fprintf(f, "GET http://localhost:8099/%s/%d\n", *endpoint, id)
+		if *endpoint == "router" {
+			fmt.Fprintf(f, "GET http://localhost:8099/api/user/%d/profile\n", id)
+		} else {
+			fmt.Fprintf(f, "GET http://localhost:8099/%s/%d\n", *endpoint, id)
+		}
 	}
 
 	fmt.Println("Generated", filename)

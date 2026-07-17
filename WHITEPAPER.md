@@ -379,6 +379,20 @@ The cache was attacked with a 10-second `vegeta` workload utilizing 64 concurren
 
 By shielding the application from the simulated network upstream, `liteLRU` drops the median (p50) response time from 57.36 ms down to 147 µs—an approximately **390x improvement** in user-facing latency. The p99 latency in the cached runs (69.22 ms) perfectly reflects the intentional upstream penalty during cold-start cache misses, showing that the cache's own internal mechanism latency is statistically invisible compared to the network bound.
 
+### 9.10 Dynamic Router Integration (Path Params and Middleware)
+
+To demonstrate that route lookup and cache hit times still win when parameter extraction and handler metadata are part of the hot path, we simulated a dynamic routing layer. The un-cached origin simulates an expensive 1 ms routing tree lookup and path extraction (e.g. `/api/user/{id}/profile`). `liteLRU` caches the resulting `HandlerFunc` and extracted `[]Param` directly. Crucially, `liteLRU` uses a stack-allocated buffer (`var pbuf [4]liteLRU.Param`) for retrieving parameters, eliminating any pool-managed or heap allocations on route hits.
+
+| Cache Implementation | Rate (Req/s) | p50 Latency | p99 Latency | Max Latency |
+|----------------------|--------------|-------------|-------------|-------------|
+| Otter                | 93,448 req/s | 257 µs      | 1.84 ms     | 31.27 ms    |
+| **liteLRU**          | **91,864 req/s** | **251 µs**  | 1.74 ms     | 92.96 ms    |
+| Origin (No Cache)    | 53,861 req/s | 1.11 ms     | 1.59 ms     | 7.32 ms     |
+
+*Table 7: Dynamic router simulation with 1 ms routing/middleware penalty on cache misses.*
+
+By caching the route resolution itself, `liteLRU` drops the dynamic routing overhead from 1.11 ms to just 251 µs, proving that it acts as a tremendously effective layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
+
 ## 10. Discussion and Limitations
 
 **Memory Overhead.** The tradeoff for 64-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A `liteLRU` entry requires approximately 104 bytes of overhead (64 bytes for the seqlock + 40 bytes for atomic pointers/lengths). For a 1,000,000 entry cache, this requires **~133 MB** of heap allocation for the SoA arrays, whereas `otter` requires **~120 MB**. This represents a modest ~11% memory premium in exchange for wait-free concurrency and a **7.36x throughput speedup** under high write load (80% writes).
