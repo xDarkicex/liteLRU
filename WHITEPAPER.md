@@ -16,8 +16,6 @@
 
 We describe the design and implementation of `liteLRU`, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not *which items to evict*, but *how to perform eviction and recency tracking without serializing the CPU cores that share the cache*. We analyze why conventional data structures — doubly-linked lists, per-node reference counting, and AoS memory layouts — are structurally incompatible with the MESI cache coherency protocol [[1]](#ref-mesi) under concurrent access. In particular, we note that under heavy CAS contention on a single cache line, wait time degrades superlinearly due to RFO (Read-For-Ownership) round-trip amplification [16]. We justify a **hybrid memory architecture** — where heavily mutated lock-free state is allocated off-heap via mmap, while Go pointers remain on the heap — to eliminate garbage collection interference on the hot path without risking dangling pointers [9]. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments [7]. We then derive the Chunked Bitmask CLOCK eviction algorithm [3] from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $O(1)$ bulk state evaluation using a single hardware `CTZ` instruction [10,11]. Critically, we eliminate the open-addressed hash map entirely in favor of a **64-way set associative architecture** with SWAR (SIMD Within A Register) signature scanning, removing tombstone compaction as a source of tail-latency spikes.
 
-To achieve this without sacrificing safety, `liteLRU` employs a **hybrid memory architecture**. High-frequency concurrency primitives (bitmasks, seqlocks) are allocated purely off-heap via anonymous `mmap` to eliminate GC tracing and write barriers entirely. Conversely, data arrays containing Go pointers (keys, values, and handler functions) remain on the standard Go heap. This separation ensures the GC can still safely track and collect dynamic strings or closures, completely avoiding dangling-pointer hazards while keeping the hot eviction path invisible to the GC. The resulting mechanism yields wait-free reads and contention-bounded writes. We contrast our approach against recent eviction policy research including S3-FIFO [5] and SIEVE [6], noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields p99.9 latency of ~1.3 µs under the fully instrumented scaling workload (see §9.3).
-
 ---
 
 ## 1. Background: The Hardware Model
@@ -49,12 +47,16 @@ Under high concurrency, a single globally contested atomic (e.g., a global clock
 
 ---
 
+## 2. Hybrid Memory Architecture and GC Isolation
+
 **Scanner Heap Pressure.** Objects that escape to the heap are scanned during the mark phase. A cache holding thousands of string values generates a large root set for the GC to scan, increasing mark phase duration proportionally.
 
 `liteLRU` addresses this through two radical architectural mechanisms:
 
 1. **64-Way Set Associativity over Hash Maps**: Lock-free open-addressed hash maps mathematically require *tombstones* during deletion to preserve concurrent probe sequences. When tombstones accumulate, lock-free maps are forced to perform global, cooperative compactions, resulting in massive, catastrophic tail latency spikes (often >100ms) under heavy eviction load. `liteLRU` completely eliminates the hash map. Instead, it utilizes a hardware-inspired **64-way set associative architecture**. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). Evictions overwrite victims *in place* within the local set — there are no tombstones to compact, no probe sequences to preserve, and no background goroutine required.
 2. **SWAR Signature Scanning**: To instantly find a key within the 64-slot set without traversing arrays of strings, `liteLRU` maintains a `uint64` signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. An 8-bit signature carries a 1/256 per-slot false-positive probability. Across 8 slots per word, the expected false-positive rate per word is approximately $1 - (1 - 1/256)^8 \approx 3\%$. Any SWAR match is confirmed by a full string comparison before the entry is returned; false positives incur one extra comparison, not an incorrect response. Notably, 64 slots require 8 `uint64` signature words — exactly 64 bytes — fitting the entire signature metadata for a set in **one L1 cache line**, which is fetched once and eliminates redundant memory traffic during lookup.
+
+To achieve this without sacrificing safety, `liteLRU` employs a **hybrid memory architecture**. High-frequency concurrency primitives (bitmasks, seqlocks) are allocated purely off-heap via anonymous `mmap` to eliminate GC tracing and write barriers entirely. Conversely, data arrays containing Go pointers (keys, values, and handler functions) remain on the standard Go heap. This separation ensures the GC can still safely track and collect dynamic strings or closures, completely avoiding dangling-pointer hazards while keeping the hot eviction path invisible to the GC.
 
 ---
 
@@ -245,7 +247,7 @@ Our custom latency test bypasses `pb.Next()` entirely. Each goroutine operates a
 | `otter` v2                | 16,299,814 | 333 ns      | 49.83 µs    |
 | `Mutex LRU` (Naive)       |  8,960,372 | 167 ns      | 23.08 µs    |
 
-*Note: Latency percentiles in this table were sampled at a 1% rate to preserve realistic throughput levels during measurement. This 1% sampling interval (and the different API harness) captures a slightly different distribution and higher median than the fully instrumented microbenchmark in §9.3.*
+*Note: Latency percentiles in this table were sampled at a 1% rate to preserve realistic throughput levels during measurement. This 1% sampling interval (and the different API harness) captures a slightly different distribution and a slightly different percentile profile.*
 
 `liteLRU` demonstrates an $\approx$3.3x throughput advantage over the naive Mutex LRU, and nearly double the throughput of the highly optimized `otter` v2 concurrent cache. Furthermore, `liteLRU` possesses by far the lowest p99 tail latency (625 ns) of all concurrent caches tested, bounded strictly by lock-free atomics rather than buffer flushes. `otter` absorbs common-path operations into background buffers for a fast median, but suffers severe tail latency (49.8 µs) during concurrent buffer flushes. `liteLRU` instead performs synchronous, bounded writes into the 64-way set associative slots.
 
