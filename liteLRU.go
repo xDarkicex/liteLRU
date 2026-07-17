@@ -1,12 +1,15 @@
 // Package liteLRU implements a high-performance LRU (Least Recently Used) cache
-// designed for HTTP routing. It provides thread-safe operations, efficient memory
-// management through object pooling, and a fully lock-free architecture.
+// designed for HTTP routing. It provides thread-safe operations and a fully
+// lock-free, zero-tombstone 64-way set associative architecture backed by
+// off-heap mmap memory, invisible to the Go garbage collector.
 package liteLRU
 
 import (
 	"math/bits"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/xDarkicex/memory"
 )
 
 // Param represents a key-value parameter in a cache entry.
@@ -51,7 +54,7 @@ type chunk struct {
 	_        [32]byte         // pad to 128 bytes total
 }
 
-// slotState holds the seqlock, padded to a full 64-byte cache line 
+// slotState holds the seqlock, padded to a full 64-byte cache line
 // to completely eliminate false-sharing during concurrent writes.
 type slotState struct {
 	seq atomic.Uint32
@@ -137,12 +140,14 @@ func (a *atomicHandler) Load() HandlerFunc {
 
 // LRUCache implements an ultra-low latency lock-free 64-way set associative cache.
 // It uses a Chunked Bitmask CLOCK algorithm for O(1) eviction within each set,
-// and SIMD/SWAR byte scanning for O(1) lookups without a hash map.
+// SIMD/SWAR byte scanning for O(1) lookups without a hash map, and off-heap
+// mmap-backed SoA arrays that are invisible to the Go garbage collector.
 type LRUCache struct {
 	capacity  uint32
 	maxParams int
 
-	// Structure of Arrays (SoA) for fast contiguous memory access
+	// Structure of Arrays (SoA) backed by off-heap mmap memory.
+	// The GC never scans these; no write barriers on Store operations.
 	methods  []atomicString
 	paths    []atomicString
 	handlers []atomicHandler
@@ -152,8 +157,16 @@ type LRUCache struct {
 	states []slotState // padded seqlocks to prevent read-tearing
 	chunks []chunk     // padded bitmasks and SWAR signatures (64 slots per chunk)
 
-	numGroups  uint32
-	stats      [64]statStripe
+	// Raw mmap slabs — held for Munmap on Close()
+	methodsSlab  []byte
+	pathsSlab    []byte
+	handlersSlab []byte
+	paramsSlab   []byte
+	statesSlab   []byte
+	chunksSlab   []byte
+
+	numGroups uint32
+	stats     [64]statStripe
 }
 
 func nextPowerOfTwo(n int) int {
@@ -170,7 +183,24 @@ func nextPowerOfTwo(n int) int {
 	return n
 }
 
-// NewLRUCache creates a new fully lock-free 64-way set associative LRU cache.
+// mmapSlice allocates a contiguous off-heap slab of n elements of type T via
+// MmapAnonymous and reinterprets it as []T. Falls back to make() if mmap fails
+// (e.g., unsupported OS) so the cache is always functional.
+func mmapSlice[T any](n int) ([]T, []byte) {
+	var zero T
+	size := int(unsafe.Sizeof(zero)) * n
+	slab, err := memory.MmapAnonymous(size)
+	if err != nil {
+		// Graceful fallback: on unsupported platforms just use the heap.
+		return make([]T, n), nil
+	}
+	return unsafe.Slice((*T)(unsafe.Pointer(unsafe.SliceData(slab))), n), slab
+}
+
+// NewLRUCache creates a new fully lock-free 64-way set associative LRU cache
+// backed by off-heap mmap memory. The SoA arrays are invisible to the Go GC —
+// no write barriers, no mark-phase scanning, no GC-induced tail latency.
+// Call Close() to release the mmap slabs when the cache is no longer needed.
 func NewLRUCache(capacity, maxParams int) *LRUCache {
 	if capacity <= 0 {
 		capacity = 1024
@@ -186,19 +216,42 @@ func NewLRUCache(capacity, maxParams int) *LRUCache {
 
 	numGroups := uint32(capacity / 64)
 
-	c := &LRUCache{
-		capacity:  uint32(capacity),
-		maxParams: maxParams,
-		methods:   make([]atomicString, capacity),
-		paths:     make([]atomicString, capacity),
-		handlers:  make([]atomicHandler, capacity),
-		params:    make([]atomicSlice, capacity),
-		states:    make([]slotState, capacity),
-		chunks:    make([]chunk, numGroups),
-		numGroups: uint32(numGroups),
-	}
+	methods, methodsSlab := mmapSlice[atomicString](capacity)
+	paths, pathsSlab := mmapSlice[atomicString](capacity)
+	handlers, handlersSlab := mmapSlice[atomicHandler](capacity)
+	params, paramsSlab := mmapSlice[atomicSlice](capacity)
+	states, statesSlab := mmapSlice[slotState](capacity)
+	chunks, chunksSlab := mmapSlice[chunk](int(numGroups))
 
-	return c
+	return &LRUCache{
+		capacity:     uint32(capacity),
+		maxParams:    maxParams,
+		methods:      methods,
+		paths:        paths,
+		handlers:     handlers,
+		params:       params,
+		states:       states,
+		chunks:       chunks,
+		methodsSlab:  methodsSlab,
+		pathsSlab:    pathsSlab,
+		handlersSlab: handlersSlab,
+		paramsSlab:   paramsSlab,
+		statesSlab:   statesSlab,
+		chunksSlab:   chunksSlab,
+		numGroups:    numGroups,
+	}
+}
+
+// Close releases all off-heap mmap slabs. The cache must not be used after Close.
+func (c *LRUCache) Close() {
+	for _, slab := range [][]byte{
+		c.methodsSlab, c.pathsSlab, c.handlersSlab,
+		c.paramsSlab, c.statesSlab, c.chunksSlab,
+	} {
+		if slab != nil {
+			memory.Munmap(slab)
+		}
+	}
 }
 
 // findVictim uses bitwise operations to instantly find an eviction victim in O(1) time
