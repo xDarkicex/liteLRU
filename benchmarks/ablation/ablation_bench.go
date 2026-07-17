@@ -39,7 +39,7 @@ func main() {
 	fmt.Println("\n--- liteLRU (Full Architecture) ---")
 	lCache := liteLRU.NewLRUCache(capacity, 10)
 	runBench(ops, numWorkers, func(key string) {
-		lCache.Get("GET", key)
+		lCache.Get("GET", key, nil)
 	}, func(key string) {
 		lCache.Add("GET", key, nil, nil)
 	})
@@ -48,7 +48,7 @@ func main() {
 	fmt.Println("\n--- liteLRU (No Padding) ---")
 	npCache := nopad.NewLRUCache(capacity, 10)
 	runBench(ops, numWorkers, func(key string) {
-		npCache.Get("GET", key)
+		npCache.Get("GET", key, nil)
 	}, func(key string) {
 		npCache.Add("GET", key, nil, nil)
 	})
@@ -57,7 +57,7 @@ func main() {
 	fmt.Println("\n--- liteLRU (No Mmap / Go Map) ---")
 	nmCache := nommap.NewLRUCache(capacity, 10)
 	runBench(ops, numWorkers, func(key string) {
-		nmCache.Get("GET", key)
+		nmCache.Get("GET", key, nil)
 	}, func(key string) {
 		nmCache.Add("GET", key, nil, nil)
 	})
@@ -66,7 +66,7 @@ func main() {
 	fmt.Println("\n--- liteLRU (No Bitmask / Linear Scan) ---")
 	nbCache := nobitmask.NewLRUCache(capacity, 10)
 	runBench(ops, numWorkers, func(key string) {
-		nbCache.Get("GET", key)
+		nbCache.Get("GET", key, nil)
 	}, func(key string) {
 		nbCache.Add("GET", key, nil, nil)
 	})

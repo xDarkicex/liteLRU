@@ -59,7 +59,7 @@ func TestConcurrentLatency(t *testing.T) {
 				start := time.Now()
 				
 				if isGet {
-					cache.Get(method, path)
+					cache.Get(method, path, nil)
 				} else {
 					cache.Add(method, path, dummyHandler, nil)
 				}

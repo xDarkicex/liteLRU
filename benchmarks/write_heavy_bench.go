@@ -60,7 +60,7 @@ func main() {
 			go func(s, e int) {
 				for j := s; j < e; j++ {
 					if ops[j].isGet {
-						lite.Get("GET", ops[j].key)
+						lite.Get("GET", ops[j].key, nil)
 					} else {
 						lite.Add("GET", ops[j].key, nil, nil)
 					}
@@ -82,7 +82,7 @@ func main() {
 					if ops[j].isGet {
 						otterCache.Get(ops[j].key)
 					} else {
-						otterCache.Set(ops[j].key, nil)
+						otterCache.Set(ops[j].key, nil, nil)
 					}
 				}
 				wg.Done()

@@ -61,7 +61,7 @@ func main() {
 	fmt.Println("\n--- liteLRU (Full Architecture) ---")
 	fullCache := liteLRU.NewLRUCache(capacity, 10)
 	runBench(ops, numWorkers, func(key string) {
-		fullCache.Get("GET", key)
+		fullCache.Get("GET", key, nil)
 	}, func(key string) {
 		fullCache.Add("GET", key, nil, nil)
 	})

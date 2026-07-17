@@ -147,7 +147,7 @@ func BenchmarkLRUCache(b *testing.B) {
 					}
 
 					path := paths[pathIdx]
-					_, _, _ = cache.Get(method, path)
+					_, _, _ = cache.Get(method, path, nil)
 				}
 
 				// Report actual hit/miss ratio for validation
@@ -205,7 +205,7 @@ func BenchmarkLRUCache(b *testing.B) {
 						}
 
 						path := paths[pathIdx]
-						_, _, _ = cache.Get(method, path)
+						_, _, _ = cache.Get(method, path, nil)
 					} else {
 						// Add operation
 						pathIdx := rand.Intn(len(paths))
@@ -315,7 +315,7 @@ func BenchmarkParamPooling(b *testing.B) {
 
 			if rand.Float64() < 0.75 {
 				// 75% gets - typical read-heavy API workload
-				_, _, _ = cache.Get(entry.method, entry.path)
+				_, _, _ = cache.Get(entry.method, entry.path, nil)
 			} else {
 				// 25% adds - write operations
 				cache.Add(entry.method, entry.path, dummyHandler, entry.params)
@@ -355,7 +355,7 @@ func BenchmarkParallelLRUCache(b *testing.B) {
 
 				// 80% Gets, 20% Adds (typical read-heavy concurrent workload)
 				if r%100 < 80 {
-					cache.Get(method, path)
+					cache.Get(method, path, nil)
 				} else {
 					cache.Add(method, path, dummyHandler, nil)
 				}

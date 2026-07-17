@@ -66,7 +66,7 @@ func main() {
 
 		for i := 0; i < warmupOps; i++ {
 			key := ops[i]
-			if _, _, ok := lite.Get("GET", key); !ok {
+			if _, _, ok := lite.Get("GET", key, nil); !ok {
 				lite.Add("GET", key, nil, nil)
 			}
 		}
@@ -78,7 +78,7 @@ func main() {
 			go func(start, end int) {
 				for j := start; j < end; j++ {
 					key := ops[j]
-					if _, _, ok := lite.Get("GET", key); ok {
+					if _, _, ok := lite.Get("GET", key, nil); ok {
 						liteHits.Add(1)
 					} else {
 						liteMisses.Add(1)
@@ -115,7 +115,7 @@ func main() {
 						otterHits.Add(1)
 					} else {
 						otterMisses.Add(1)
-						otterCache.Set(key, nil)
+						otterCache.Set(key, nil, nil)
 					}
 				}
 				wg.Done()

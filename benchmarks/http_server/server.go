@@ -94,7 +94,8 @@ func main() {
 		payload := payloads[idNum%20]
 
 		if *cacheType == "litelru" {
-			if _, params, ok := lite.Get("GET", idStr); ok && len(params) > 0 {
+			var pbuf [1]liteLRU.Param
+			if _, params, ok := lite.Get("GET", idStr, pbuf[:0]); ok && len(params) > 0 {
 				// Cache hit
 				w.Header().Set("Content-Type", "application/json")
 				w.Write([]byte(params[0].Value))

@@ -6,7 +6,6 @@ package liteLRU
 import (
 	"fmt"
 	"math/bits"
-	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -171,42 +170,7 @@ func nextPowerOfTwo(n int) int {
 	return n
 }
 
-var paramSlicePools = [5]sync.Pool{
-	{New: func() interface{} { return make([]Param, 0, 4) }},
-	{New: func() interface{} { return make([]Param, 0, 8) }},
-	{New: func() interface{} { return make([]Param, 0, 16) }},
-	{New: func() interface{} { return make([]Param, 0, 32) }},
-	{New: func() interface{} { return make([]Param, 0, 64) }},
-}
 
-func getParamSlice(paramCount int) []Param {
-	if paramCount <= 4 {
-		return paramSlicePools[0].Get().([]Param)[:0]
-	} else if paramCount <= 8 {
-		return paramSlicePools[1].Get().([]Param)[:0]
-	} else if paramCount <= 16 {
-		return paramSlicePools[2].Get().([]Param)[:0]
-	} else if paramCount <= 32 {
-		return paramSlicePools[3].Get().([]Param)[:0]
-	} else {
-		return paramSlicePools[4].Get().([]Param)[:0]
-	}
-}
-
-func putParamSlice(s []Param) {
-	cap := cap(s)
-	if cap == 4 {
-		paramSlicePools[0].Put(s)
-	} else if cap == 8 {
-		paramSlicePools[1].Put(s)
-	} else if cap == 16 {
-		paramSlicePools[2].Put(s)
-	} else if cap == 32 {
-		paramSlicePools[3].Put(s)
-	} else if cap == 64 {
-		paramSlicePools[4].Put(s)
-	}
-}
 
 // NewLRUCache creates a new fully lock-free LRU cache.
 func NewLRUCache(capacity, maxParams int) *LRUCache {
@@ -326,16 +290,10 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 			newParams = oldParams[:len(params)]
 			copy(newParams, params)
 		} else {
-			if oldParams != nil {
-				putParamSlice(oldParams)
-			}
-			newParams = getParamSlice(len(params))
+			newParams = make([]Param, len(params))
 			copy(newParams, params)
 		}
 	} else {
-		if oldParams != nil {
-			putParamSlice(oldParams)
-		}
 		newParams = nil
 	}
 	c.params[victimIdx].Store(newParams)
@@ -371,9 +329,9 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 	}
 }
 
-// Get retrieves an entry from the cache.
-// 100% lock-free, zero allocation, utilizing seqlocks and O(1) bitmask lookups.
-func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
+// Get retrieves an entry from the cache lock-free, zero allocation.
+// The dst slice is used to avoid heap allocations when copying params.
+func (c *LRUCache) Get(method, path string, dst []Param) (HandlerFunc, []Param, bool) {
 	hash := hashRoute(method, path)
 	stripeIdx := hash & 63
 
@@ -414,7 +372,11 @@ func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
 
 	var copiedParams []Param
 	if len(params) > 0 {
-		copiedParams = getParamSlice(len(params))
+		if cap(dst) >= len(params) {
+			copiedParams = dst[:len(params)]
+		} else {
+			copiedParams = make([]Param, len(params))
+		}
 		copy(copiedParams, params)
 	}
 
@@ -422,9 +384,6 @@ func (c *LRUCache) Get(method, path string) (HandlerFunc, []Param, bool) {
 	seq2 := c.states[idx].seq.Load()
 	if seq1 != seq2 {
 		// Slot was modified while we were reading!
-		if copiedParams != nil {
-			putParamSlice(copiedParams)
-		}
 		c.stats[stripeIdx].misses.Add(1)
 		return nil, nil, false
 	}
@@ -469,11 +428,7 @@ func (c *LRUCache) Clear() {
 
 		for bit := uint32(0); bit < 64; bit++ {
 			idx := group*64 + bit
-			oldParams := c.params[idx].Load()
-			if oldParams != nil {
-				putParamSlice(oldParams)
-				c.params[idx].Store(nil)
-			}
+			c.params[idx].Store(nil)
 			c.methods[idx].Store("")
 			c.paths[idx].Store("")
 			c.handlers[idx].Store(nil)

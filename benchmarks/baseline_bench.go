@@ -40,7 +40,7 @@ func main() {
 	fmt.Println("\n--- liteLRU ---")
 	lCache := liteLRU.NewLRUCache(capacity, 10)
 	runBench(ops, numWorkers, func(key string) {
-		lCache.Get("GET", key)
+		lCache.Get("GET", key, nil)
 	}, func(key string) {
 		lCache.Add("GET", key, nil, nil)
 	})
@@ -50,7 +50,7 @@ func main() {
 	oCache, _ := otter.MustBuilder[string, any](capacity).Build()
 	runBench(ops, numWorkers, func(key string) {
 		oCache.Get(key)
-	}, func(key string) {
+	}, func(key string, nil) {
 		oCache.Set(key, 1)
 	})
 
@@ -59,7 +59,7 @@ func main() {
 	mCache := newMutexLRU(capacity)
 	runBench(ops, numWorkers, func(key string) {
 		mCache.Get(key)
-	}, func(key string) {
+	}, func(key string, nil) {
 		mCache.Add(key, 1)
 	})
 }
