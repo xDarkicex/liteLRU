@@ -57,7 +57,7 @@ In this paper, we make the following contributions to concurrent cache design:
 `liteLRU` addresses this through two non-trivial architectural changes:
 
 1. **64-Way Set Associativity over Hash Maps**: The prior open-addressed designs considered by `liteLRU` use tombstones or comparable reclamation mechanisms to preserve concurrent probe sequences. Their maintenance and reclamation costs complicate predictable deletion behavior under sustained eviction. `liteLRU` instead overwrites a victim in place within a fixed set. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set").
-2. **SWAR Signature Scanning**: To instantly find a key within the 64-slot set without traversing arrays of strings, `liteLRU` maintains a `uint64` signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. An 8-bit signature carries a 1/256 per-slot false-positive probability. Across 8 slots per word, the expected false-positive rate per word is approximately $1 - (1 - 1/256)^8 \approx 3\%$. Any SWAR match is confirmed by a full string comparison before the entry is returned; false positives incur one extra comparison, not an incorrect response. Notably, 64 slots require 8 `uint64` signature words — exactly 64 bytes — and the 64-byte signature metadata fits within one $L$-byte coherence line on the evaluated platforms, which is fetched once and eliminates redundant memory traffic during lookup.
+2. **SWAR Signature Scanning**: To instantly find a key within the 64-slot set without traversing arrays of strings, `liteLRU` maintains a `uint64` signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. SWAR-style scalar bitwise operations test eight 8-bit signatures per machine word, reducing the number of signature-word loads and branchy per-slot comparisons before full-key verification. Lookups are bounded by fixed 64-way associativity. An 8-bit signature carries a 1/256 per-slot false-positive probability. Across 8 slots per word, the expected false-positive rate per word is approximately $1 - (1 - 1/256)^8 \approx 3\%$. Any SWAR match is confirmed by a full string comparison before the entry is returned; false positives incur one extra comparison, not an incorrect response. Notably, 64 slots require 8 `uint64` signature words — occupying 64 bytes. It is compact relative to per-slot metadata, although the number of coherence lines touched depends on its runtime alignment.
 
 To achieve this without sacrificing safety, `liteLRU` employs a **hybrid memory architecture**. High-frequency concurrency primitives (bitmasks, seqlocks) are allocated purely off-heap via anonymous `mmap` to eliminate GC tracing and write barriers entirely. Conversely, data arrays containing Go pointers (keys, values, and handler functions) remain on the standard Go heap. This separation ensures the GC can still safely track and collect dynamic strings or closures, completely avoiding dangling-pointer hazards while keeping the hot eviction path invisible to the GC.
 
@@ -139,7 +139,7 @@ This approximates LRU behavior without pointer manipulation. Recent research suc
 
 ### 5.3 From One Bit to One 64-bit Integer
 
-Standard CLOCK still maintains a global clock-hand pointer — an atomic integer indicating the current sweep position. Every eviction increments this counter and examines a single entry. Under high concurrency, all evicting threads contend on this single atomic, reintroducing the same RFO serialization we wished to avoid.
+Standard CLOCK still maintains a global clock-hand pointer — an atomic integer indicating the current sweep position. Every eviction increments this counter and examines a single entry. Under high concurrency, all evicting threads contend on this single atomic, creating repeated coherence ownership transfers under contention.
 
 The key observation driving `liteLRU`'s design: if we partition the cache into chunks of exactly 64 entries, the valid state and access state of all 64 entries in a chunk can be represented as two 64-bit integers:
 
@@ -169,7 +169,7 @@ To guarantee O(1) lock-free progress and bound the worst-case scenario where a c
 
 ### 5.4 Eliminating the Global Clock Hand
 
-Because `liteLRU` seeds the starting chunk index from the hash of the incoming route, $k_{start} = h(r) \bmod N_k$, there is no global clock-hand atomic. Each thread begins its eviction sweep at a deterministic but distributed starting position. Contention on a shared sweep counter is eliminated entirely. 
+Because `liteLRU` seeds the starting chunk index from the hash of the incoming route, $k_{start} = h(r) \bmod N$, there is no global clock-hand atomic. Each thread begins its eviction sweep at a deterministic but distributed starting position. Contention on a shared sweep counter is eliminated entirely. 
 
 ---
 
@@ -257,7 +257,7 @@ type slotState struct {
 }
 ```
 
-Because the `mmap` allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (page alignment implies $L$ alignment for $L \le 4096$), and $\text{addr}(S_{i+1}) = \text{addr}(S_i) + L$, adjacent entries reside on disjoint, non-overlapping $L$-byte aligned cache lines. A write to $S_i$ sets the MESI state of line $\lfloor \text{addr}(S_i) / L \rfloor$ to Modified, which does not affect the state of line $\lfloor \text{addr}(S_j) / L \rfloor$ for any $j \neq i$. False sharing is structurally impossible. $\square$
+Because the `mmap` allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (page alignment implies $L$ alignment for $L \le 4096$), and $\text{addr}(S_{i+1}) = \text{addr}(S_i) + L$, adjacent entries reside on disjoint, non-overlapping $L$-byte aligned cache lines. A write to $S_i$ can require coherence activity for its own line but does not require ownership transfer for a distinct slot-state line. False sharing is structurally impossible. $\square$
 
 It is important to note that the 64-bit bitmasks ($V_k$, $A_k$, $W_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
 
@@ -306,7 +306,7 @@ To stress lock-free scaling under skewed access patterns, we scale a 1.6M operat
 | 4     | 18,972,613   | 3.12×          |
 | 8     | 20,303,656   | 3.34×          |
 
-The sub-linear scaling from 4 to 8 cores is expected: at 8 cores on an M2 die, the shared L3 and memory bus bandwidth begin to constrain throughput independently of lock contention.
+The sub-linear scaling from 4 to 8 cores is expected: Scaling is sub-linear from four to eight workers, consistent with increasing contention and shared-resource pressure; this experiment does not isolate their individual contributions.
 
 ### 9.3 Latency Percentiles (ARM64)
 
@@ -342,7 +342,7 @@ The ablation confirms that while SWAR hardware acceleration provides a measurabl
 
 ### 9.5 x86_64 Smoke Test
 
-To verify behavioral consistency across architectures, we evaluated `liteLRU` on an x86_64 Docker container instance. Due to the differing memory models and MESI topologies between Intel/AMD and Apple Silicon, absolute latency numbers differ, but the lock-free scaling properties hold.
+To verify behavioral consistency across architectures, we evaluated `liteLRU` on an x86_64 Docker container instance. The x86_64 measurement is a behavioral smoke test only; its virtualized environment and different microarchitecture do not support a direct cross-platform performance comparison.
 
 | Architecture | Cores | Ops/sec (x86_64) |
 |--------------|------:|-----------------:|
@@ -361,7 +361,7 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 | 75%      | **97.59%**          | 95.98%            | **98.74%**        | 90.50%          |
 | 95%      | **97.59%**          | **97.59%**        | **98.74%**        | 98.01%          |
 
-`liteLRU`'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's [[18]](#ref-otter) S3-FIFO-based eviction policy across all tested capacities. These hit-rate benchmarks were re-run against the current 64-way set associative codebase. The set associative design restricts each key to one of $N/64$ fixed sets, which could theoretically reduce hit rates if the hash function produces skewed set occupancy. In practice, the Zipfian distribution's natural clustering aligns well with set boundaries (e.g., under $s=0.8$ skew, average set occupancy across hot sets remains below 85% with negligible collision evictions), and the observed hit rates are consistent with the prior hash-map-based implementation. CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern. On strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. 
+`liteLRU`'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's [[18]](#ref-otter) S3-FIFO-based eviction policy across all tested capacities. These hit-rate benchmarks were re-run against the current 64-way set associative codebase. The set associative design restricts each key to one of $N$ fixed sets, which could theoretically reduce hit rates if the hash function produces skewed set occupancy. In practice, the Zipfian distribution's natural clustering aligns well with set boundaries (e.g., under $s=0.8$ skew, average set occupancy across hot sets remains below 85% with negligible collision evictions), and the observed hit rates are consistent with the prior hash-map-based implementation. CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern. On strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. 
 
 ### 9.7 Write-Heavy Workloads
 
@@ -463,7 +463,7 @@ By caching the route resolution itself, `liteLRU` drops the median observed requ
 
 ## 11. Conclusion
 
-We have presented the hardware-grounded derivation of each principal design decision in `liteLRU`: a hybrid memory architecture to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers [[9]](#ref-gogc); SoA layout to maximize cache-line occupancy per field access [[7]](#ref-soa); bitset-encoded recency state enabling bulk $O(1)$ evaluation via hardware `CTZ` intrinsics [[10,11]](#ref-tzcnt); Seqlocks [[14]](#ref-seqlock) to provide bounded-probe lock-free read semantics; $L$-byte cache-line padding [[1,8]](#ref-mesi) to eliminate false-sharing serialization; and — critically — the replacement of an open-addressed lock-free hash map with a **64-way set associative architecture** using SWAR signature scanning. This final decision eliminates tombstone compaction as a source of tail-latency spikes, reduces all write paths to bounded in-place overwrites, and the 64-byte signature metadata fits within one $L$-byte coherence line on the evaluated platforms. The combination yields a cache architecture whose concurrency cost is bounded by a small, fixed set of hardware atomic operations rather than OS-level synchronization primitives, achieving over 30M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
+We have presented the hardware-grounded derivation of each principal design decision in `liteLRU`: a hybrid memory architecture to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers [[9]](#ref-gogc); SoA layout to maximize cache-line occupancy per field access [[7]](#ref-soa); bitset-encoded recency state enabling bulk $O(1)$ evaluation via hardware `CTZ` intrinsics [[10,11]](#ref-tzcnt); Seqlocks [[14]](#ref-seqlock) to provide bounded-probe lock-free read semantics; $L$-byte cache-line padding [[1,8]](#ref-mesi) to eliminate false-sharing serialization; and — critically — the replacement of an open-addressed lock-free hash map with a **64-way set associative architecture** using SWAR signature scanning. This final decision eliminates tombstone compaction as a source of tail-latency spikes, reduces all write paths to bounded in-place overwrites, and the 64-byte signature array is compact, although the number of coherence lines touched depends on its runtime alignment. The combination yields a cache architecture whose concurrency cost is bounded by a small, fixed set of hardware atomic operations rather than OS-level synchronization primitives, achieving over 30M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
 
 ---
 

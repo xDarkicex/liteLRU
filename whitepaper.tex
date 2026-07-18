@@ -107,7 +107,7 @@ Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2
 
 \begin{enumerate}
     \item \textbf{64-Way Set Associativity over Hash Maps:} The prior open-addressed designs considered by \texttt{liteLRU} use tombstones or comparable reclamation mechanisms to preserve concurrent probe sequences. Their maintenance and reclamation costs complicate predictable deletion behavior under sustained eviction. \texttt{liteLRU} instead overwrites a victim in place within a fixed set. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). 
-    \item \textbf{SWAR Signature Scanning:} To instantly find a key within the 64-slot set without traversing arrays of strings, \texttt{liteLRU} maintains a \texttt{uint64} signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. Evictions are restricted to the local 64-slot set, overwriting pointers in place and eliminating tombstones entirely.
+    \item \textbf{SWAR Signature Scanning:} To instantly find a key within the 64-slot set without traversing arrays of strings, \texttt{liteLRU} maintains a \texttt{uint64} signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. SWAR-style scalar bitwise operations test eight 8-bit signatures per machine word, reducing the number of signature-word loads and branchy per-slot comparisons before full-key verification. Lookups are bounded by fixed 64-way associativity. Evictions are restricted to the local 64-slot set, overwriting pointers in place and eliminating tombstones entirely.
 \end{enumerate}
 
 \section{Related Work}
@@ -187,7 +187,7 @@ This approximates LRU behavior without pointer manipulation, requiring only non-
 
 \subsection{From One Bit to One 64-bit Integer}
 
-Standard CLOCK still maintains a global clock-hand pointer---an atomic integer indicating the current sweep position. Every eviction increments this counter and examines a single entry. Under high concurrency, all evicting threads contend on this single atomic, reintroducing the $\mathcal{O}(N)$ RFO serialization we wish to avoid.
+Standard CLOCK still maintains a global clock-hand pointer---an atomic integer indicating the current sweep position. Every eviction increments this counter and examines a single entry. Under high concurrency, all evicting threads contend on this single atomic, creating repeated coherence ownership transfers under contention.
 
 The key observation: if we partition the cache into chunks of exactly 64 entries, the valid state and access state of all 64 entries in a chunk fit into two 64-bit integers:
 
@@ -227,7 +227,7 @@ To guarantee O(1) lock-free progress and bound the worst-case scenario where a c
 
 \subsection{Eliminating the Global Clock Hand}
 
-Because \texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_\text{start} = h(r) \bmod N_k$, there is no shared global clock-hand atomic. Each writer begins its eviction sweep at a deterministic but distributed starting position, naturally load-balancing eviction pressure across chunks without any coordination. 
+Because \texttt{liteLRU} seeds the starting chunk index from the hash of the incoming route, $k_\text{start} = h(r) \bmod N$, there is no shared global clock-hand atomic. Each writer begins its eviction sweep at a deterministic but distributed starting position, naturally load-balancing eviction pressure across chunks without any coordination. 
 
 \section{Algorithm and Correctness}
 
@@ -310,7 +310,7 @@ type slotState struct {
 }
 \end{lstlisting}
 
-Because the \texttt{mmap} allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (page alignment implies $L$ alignment for $L \le 4096$), and $\text{addr}(S_{i+1}) = \text{addr}(S_i) + L$, adjacent entries reside on disjoint, non-overlapping $L$-byte aligned cache lines. A write to $S_i$ sets the MESI state of line $\lfloor \text{addr}(S_i) / L \rfloor$ to Modified, which does not affect the state of line $\lfloor \text{addr}(S_j) / L \rfloor$ for any $j \neq i$. False sharing is structurally impossible. $\square$
+Because the \texttt{mmap} allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (page alignment implies $L$ alignment for $L \le 4096$), and $\text{addr}(S_{i+1}) = \text{addr}(S_i) + L$, adjacent entries reside on disjoint, non-overlapping $L$-byte aligned cache lines. A write to $S_i$ can require coherence activity for its own line but does not require ownership transfer for a distinct slot-state line. False sharing is structurally impossible. $\square$
 
 It is important to note that the 64-bit bitmasks ($V_k$, $A_k$, $W_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
 The same principle is applied to the statistics counters. Rather than two globally shared \texttt{atomic.Int64} hit and miss counters, we maintain 64 independent \texttt{statStripe} structs, each padded to $L$ bytes, with writers selecting a stripe via \texttt{hash \& 63}. Writes are distributed across 64 padded stripes, reducing---rather than eliminating---counter contention.
@@ -369,7 +369,7 @@ We scale the same 1.6M operation Zipfian workload across 1 to 8 concurrent cores
 \caption{Throughput under un-synchronized worker methodology.}
 \end{table}
 
-While scaling is sub-linear (3.13x at 8 cores), this is characteristic of L3 cache and memory bus saturation on ARM architectures rather than lock convoying. Shared bitmask atomics ($V_k, A_k, W_k$) also contribute to this sub-linear degradation as cache lines ping-pong between cores, but the degradation is graceful compared to the complete collapse typical of mutexes.
+While scaling is sub-linear (3.13x at 8 cores), this is consistent with increasing contention and shared-resource pressure; this experiment does not isolate their individual contributions. Shared bitmask atomics ($V_k, A_k, W_k$) also contribute to this sub-linear degradation as cache lines ping-pong between cores, but the degradation is graceful compared to the complete collapse typical of mutexes.
 
 \subsection{Latency Percentiles (ARM64)}
 
@@ -414,7 +414,7 @@ The ablation confirms that while SWAR hardware acceleration provides a measurabl
 
 \subsection{x86\_64 Smoke Test}
 
-To verify behavioral consistency across architectures, we evaluated \texttt{liteLRU} on an x86\_64 Docker container instance. Due to the differing memory models and MESI topologies between Intel/AMD and Apple Silicon, absolute latency numbers differ, but the lock-free scaling properties hold.
+To verify behavioral consistency across architectures, we evaluated \texttt{liteLRU} on an x86\_64 Docker container instance. The x86\_64 measurement is a behavioral smoke test only; its virtualized environment and different microarchitecture do not support a direct cross-platform performance comparison.
 
 \begin{table}[h]
 \centering
