@@ -149,7 +149,7 @@ The key observation driving `liteLRU`'s design: if we partition the cache into c
 
 A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$), provided it is not currently owned by a writer ($W_k[i] = 0$). The set of all candidates across all 64 slots is computed in a single bitwise expression:
 
-$$C_k = \neg (V_k \;\land\; A_k) \;\land\; \neg W_k$$
+$$C_k = \neg (V_k \land A_k) \land \neg W_k$$
 
 The index of the first candidate is then extracted using the hardware `CTZ` (Count Trailing Zeros) instruction [[10,11]](#ref-tzcnt). It is crucial to handle platform-specific zero behavior: on x86_64, `TZCNT` returns 64 when the input is zero, whereas on ARM64, `RBIT` + `CLZ` requires an explicit branch or zero-check. When a non-zero candidate mask exists:
 
@@ -165,7 +165,7 @@ The eviction search process executes as follows:
 3. If the CAS fails (another writer claimed it), restart at step 1 for the same chunk.
 4. If $W_k[i] = 1$ is successfully claimed, proceed with the in-place 64-way set associative write protocol defined in §6.
 
-To guarantee O(1) lock-free progress and bound the worst-case scenario where a chunk is pathologically saturated by concurrent writers (e.g., a Thundering Herd), `liteLRU` employs **Load-Shedding Eviction**. The `findVictim` loop attempts to claim a write-lock (`writing` bit) on an eviction candidate. If it fails to claim any slot after 10 retries, it returns a sentinel failure value (`0xFFFFFFFF`). The `Add` operation intercepts this sentinel and safely drops the cache admission. By sacrificing absolute admission under extreme contention, `liteLRU` bounds write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
+To guarantee contention-bounded admission and bound the worst-case scenario where a chunk is pathologically saturated by concurrent writers (e.g., a Thundering Herd), `liteLRU` employs **Load-Shedding Eviction**. The `findVictim` loop attempts to claim a write-lock (`writing` bit) on an eviction candidate. If it fails to claim any slot after 10 retries, it returns a sentinel failure value (`0xFFFFFFFF`). The `Add` operation intercepts this sentinel and safely drops the cache admission. By sacrificing absolute admission under extreme contention, `liteLRU` bounds write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
 
 ### 5.4 Eliminating the Global Clock Hand
 
@@ -209,7 +209,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 **findVictim(chunk k)**
 1. Retry loop (max 10 iterations).
 2. Load $V_k, A_k, W_k$. If $C_k = 0$, atomically clear $A_k$ for all valid slots via CAS. Recompute $C_k$ before proceeding.
-3. Apply the CLOCK approximation: identify candidate slots using `CTZ((~V_k | ~A_k) & ~W_k)`.
+3. Apply the CLOCK approximation: identify candidate slots using `CTZ(\neg (V_k \land A_k) \land \neg W_k)`.
 4. Attempt to CAS the $W_k$ bitmask to claim the slot.
 5. If successful, return the slot index.
 6. If unsuccessful (due to concurrent writers), increment retry counter.
@@ -271,7 +271,7 @@ Standard Go micro-benchmarks use `b.RunParallel`, distributing $b.N$ iterations 
 
 $$S(N) = \frac{1}{s + \frac{1-s}{N}}$$
 
-When the operation time $T_{op}$ is comparable to the atomic latency $T_{atomic}$ (~20–40 ns including RFO round-trip), the contention on the central `pb.Next()` counter dominates. Using Amdahl's framework for parallel scaling [[2]](#ref-amdahl), this acts as an enforced sequential bottleneck, forcing $S(N) \to 1$ regardless of $N$. The result is an apparent decrease in throughput with additional cores — a benchmark artifact, not a property of the algorithm.
+When the operation time $T_{op}$ is comparable to the atomic latency $T_{atomic}$ (~20–40 ns including RFO round-trip amplification [[17]](#ref-dice)), the contention on the central `pb.Next()` counter dominates. Using Amdahl's framework for parallel scaling [[2]](#ref-amdahl), this acts as an enforced sequential bottleneck, forcing $S(N) \to 1$ regardless of $N$. The result is an apparent decrease in throughput with additional cores — a benchmark artifact, not a property of the algorithm.
 
 Our custom latency test bypasses `pb.Next()` entirely. Each goroutine operates a tight independent loop over a pre-allocated, fixed-size key array with no shared iteration counter, eliminating the artifact and isolating the cache mechanics.
 
@@ -519,7 +519,7 @@ We have presented the hardware-grounded derivation of each principal design deci
 <a name="ref-dice"></a>
 [17] Dice, D., Kogan, A., and Lev, Y. "Understanding and Improving the Performance of Concurrent Applications." *USENIX*, 2013.
 
-<a name="ref-hitrate"></a>
+
 
 
 <a name="ref-otter"></a>

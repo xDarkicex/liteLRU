@@ -200,7 +200,7 @@ The key observation: if we partition the cache into chunks of exactly 64 entries
 A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$), provided it is not currently owned by a writer ($W_k[i] = 0$). The complete candidate set across all 64 slots is computed in a single bitwise expression:
 
 \begin{equation}
-C_k = \neg (V_k \;\land\; A_k) \;\land\; \neg W_k
+C_k = \neg (V_k \land A_k) \land \neg W_k
 \end{equation}
 
 The index of the first candidate is extracted using the hardware Count Trailing Zeros (CTZ) instruction~\cite{inteltzcnt,armclz}. It is crucial to handle platform-specific zero behavior: on x86\_64, \texttt{TZCNT} returns 64 when the input is zero, whereas on ARM64, \texttt{RBIT} + \texttt{CLZ} requires an explicit branch or zero-check. When a non-zero candidate mask exists:
@@ -223,7 +223,7 @@ The eviction search process executes as follows:
     \item If $W_k[i] = 1$ is successfully claimed, proceed to step 1 of the concurrent Set Associative Write Consistency protocol defined in \S 6.
 \end{enumerate}
 
-To guarantee O(1) lock-free progress and bound the worst-case scenario where a chunk is pathologically saturated by concurrent writers (e.g., a Thundering Herd), \texttt{liteLRU} employs \textbf{Load-Shedding Eviction}. The \texttt{findVictim} loop attempts to claim a write-lock (\texttt{writing} bit) on an eviction candidate. If it fails to claim any slot after 10 retries, it returns a sentinel failure value (\texttt{0xFFFFFFFF}). The \texttt{Add} operation intercepts this sentinel and safely drops the cache admission. By sacrificing absolute admission under extreme contention, \texttt{liteLRU} bounds write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
+To guarantee contention-bounded admission and bound the worst-case scenario where a chunk is pathologically saturated by concurrent writers (e.g., a Thundering Herd), \texttt{liteLRU} employs \textbf{Load-Shedding Eviction}. The \texttt{findVictim} loop attempts to claim a write-lock (\texttt{writing} bit) on an eviction candidate. If it fails to claim any slot after 10 retries, it returns a sentinel failure value (\texttt{0xFFFFFFFF}). The \texttt{Add} operation intercepts this sentinel and safely drops the cache admission. By sacrificing absolute admission under extreme contention, \texttt{liteLRU} bounds write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
 
 \subsection{Eliminating the Global Clock Hand}
 
@@ -269,7 +269,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \begin{enumerate}
     \item Retry loop (max 10 iterations).
     \item Load $V_k, A_k, W_k$. If $C_k = 0$, atomically clear $A_k$ for all valid slots via CAS. Recompute $C_k$ before proceeding.
-    \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ((\textasciitilde V\_k \textbar{} \textasciitilde A\_k) \& \textasciitilde W\_k)}.
+    \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ(}$\neg (V_k \land A_k) \land \neg W_k$\texttt{)}.
     \item Attempt to CAS the $W_k$ bitmask to claim the slot.
     \item If successful, return the slot index.
     \item If unsuccessful (due to concurrent writers), increment retry counter.
@@ -393,7 +393,7 @@ The observed maximum latency is dominated by OS goroutine scheduling jitter, not
 To mathematically validate the architectural decisions behind \texttt{liteLRU}, we benchmarked the full implementation against three stripped-down variants under the identical 8-core 80/20 workload:
 \begin{itemize}
     \item \textbf{No Padding}: Removed the target-platform $L$-byte padding from seqlocks and stripe counters, inducing false sharing.
-    \item \textbf{No Bitmask}: Replaced the O(1) \texttt{CTZ} intrinsic with a naive 64-iteration \texttt{for} loop.
+    \item \textbf{No SWAR Signatures}: Replaced the SWAR signature scan with a naive 64-iteration \texttt{for} loop.
     \item \textbf{No Set Associative Arrays (Map+Mutex)}: Replaced the lock-free 64-way set associative architecture with a standard Go \texttt{map} protected by a \texttt{sync.RWMutex}. This represents a \textbf{combined penalty}, stripping away both lock-free associativity and SWAR scanning, restoring the lock-based eviction path the new architecture was designed to eliminate.
 \end{itemize}
 
