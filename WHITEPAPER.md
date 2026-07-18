@@ -14,7 +14,7 @@
 
 ## Abstract
 
-Concurrent approximate LRU structures often serialize cores on shared metadata. We present `liteLRU`, a fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are bounded-probe lock-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, `liteLRU` isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that `liteLRU` sustains ~30M ops/s under write-heavy Zipf (§9.7), with load-shedding dropping a few percent of admissions to bound CAS work; fully instrumented p99.9 remains ~1.3 µs (§9.3).
+Concurrent approximate LRU structures often serialize cores on shared metadata. We present `liteLRU`, an approximate LRU fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are bounded-probe lock-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, `liteLRU` isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that `liteLRU` sustains ~30M ops/s under write-heavy Zipf (§9.7), with load-shedding dropping a few percent of admissions to bound CAS work; fully instrumented p99.9 remains ~1.3 µs (§9.3).
 
 ---
 

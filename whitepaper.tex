@@ -50,7 +50,7 @@ Chunked Bitmask Eviction on Modern Multi-Core Hardware}}
 \maketitle
 
 \begin{abstract}
-Concurrent approximate LRU structures often serialize cores on shared metadata. We present \texttt{liteLRU}, a fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are bounded-probe lock-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, \texttt{liteLRU} isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that \texttt{liteLRU} sustains $\sim$30M ops/s under write-heavy Zipf (\S 9.7), with load-shedding dropping a few percent of admissions to bound CAS work; fully instrumented p99.9 remains $\sim$1.3 \textmu s (\S 9.3).
+Concurrent approximate LRU structures often serialize cores on shared metadata. We present \texttt{liteLRU}, an approximate LRU fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are bounded-probe lock-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, \texttt{liteLRU} isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that \texttt{liteLRU} sustains $\sim$30M ops/s under write-heavy Zipf (\S 9.7), with load-shedding dropping a few percent of admissions to bound CAS work; fully instrumented p99.9 remains $\sim$1.3 \textmu s (\S 9.3).
 \end{abstract}
 
 \section{Background: The Hardware Model}
