@@ -50,7 +50,7 @@ Chunked Bitmask Eviction on Modern Multi-Core Hardware}}
 \maketitle
 
 \begin{abstract}
-We describe the design and implementation of \texttt{liteLRU}, a fixed-capacity approximate LRU cache targeting multi-core concurrent workloads. The fundamental design question is not \textit{which items to evict}, but \textit{how to perform eviction and recency tracking without serializing the CPU cores that share the cache}. We analyze why conventional data structures---doubly-linked lists, per-node reference counting, and AoS memory layouts---are structurally incompatible with the MESI cache coherency protocol~\cite{mesi} under concurrent access. In particular, we note that under heavy CAS contention on a single cache line, wait time degrades superlinearly due to RFO (Read-For-Ownership) round-trip amplification~\cite{gogc}. We justify a \textbf{hybrid memory architecture}---where heavily mutated lock-free state is allocated off-heap via mmap, while Go pointers remain on the heap---to eliminate garbage collection interference on the hot path without risking dangling pointers~\cite{gogc2018}. We derive a Structure of Arrays (SoA) layout from first-principles cache-line occupancy arguments~\cite{soadesign}. We then derive the Chunked Bitmask CLOCK eviction algorithm~\cite{clock1969} from the observation that tracking recency state across 64 slots fits exactly into a 64-bit integer, enabling $O(1)$ bulk state evaluation using a single hardware \texttt{CTZ} instruction~\cite{inteltzcnt,armclz}. The resulting mechanism yields bounded wait-free reads and contention-bounded writes. We contrast our approach against recent eviction policy research including S3-FIFO~\cite{s3fifo2023} and SIEVE~\cite{sieve2024}, noting that policy-level optimizations are orthogonal to and do not resolve the synchronization bottleneck addressed here. Empirical evaluation on an 8-core ARM architecture yields p99.9 latency of $\sim$1.5~$\mu$s under the fully instrumented scaling workload (see \S 9.3).
+Concurrent approximate LRU structures often serialize cores on shared metadata. We present \texttt{liteLRU}, a fixed-capacity cache based on 64-slot bitmask CLOCK, 64-way set associativity with SWAR signatures, and padded seqlocks. Reads are bounded-probe lock-free; writes are contention-bounded via a load-shedding admission protocol. By confining heavily mutated synchronization state to off-heap memory, \texttt{liteLRU} isolates cache-line interconnect traffic from Go's garbage collector. Our evaluation demonstrates that \texttt{liteLRU} sustains $\sim$30M ops/s under write-heavy Zipf (\S 9.7), with load-shedding dropping a few percent of admissions to bound CAS work; fully instrumented p99.9 remains $\sim$1.3 \textmu s (\S 9.3).
 \end{abstract}
 
 \section{Background: The Hardware Model}
@@ -194,9 +194,10 @@ The key observation: if we partition the cache into chunks of exactly 64 entries
 \begin{itemize}
     \item $V_k \in \{0,1\}^{64}$: bit $i = 1$ iff slot $i$ holds a valid entry.
     \item $A_k \in \{0,1\}^{64}$: bit $i = 1$ iff slot $i$ has been accessed since the last sweep.
+    \item $W_k \in \{0,1\}^{64}$: bit $i = 1$ iff a writer currently owns slot $i$ for mutation.
 \end{itemize}
 
-A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$). The complete candidate set across all 64 slots is computed in a single bitwise expression:
+A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$), provided it is not currently owned by a writer ($W_k[i] = 0$). The complete candidate set across all 64 slots is computed in a single bitwise expression:
 
 \begin{equation}
 C_k = \neg (V_k \;\land\; A_k) \;\land\; \neg W_k
@@ -210,10 +211,9 @@ i^* = \text{CTZ}(C_k)
 
 This replaces an $\mathcal{O}(N)$ sequential scan over $N$ atomic loads with two register-width bitwise operations and one hardware intrinsic, bounding eviction search to a strict hardware-constant time within any chunk.
 
-If $C_k = 0$, it indicates all valid slots in the current chunk have been recently accessed. The algorithm deterministically falls back to a second-chance pass: it atomically clears the accessed bitmask ($A_k \leftarrow 0$) for the chunk and seamlessly advances to the next contiguous chunk. It is a known tradeoff of this bulk-clearing approach that bits set by concurrent readers microseconds prior will be wiped alongside stale bits; however, this mild loss of precision is accepted in exchange for eliminating $\mathcal{O}(N)$ per-slot atomic instructions. 
+If $C_k = 0$, it indicates either all valid slots in the current chunk have been recently accessed or free candidates are currently locked in $W_k$. The algorithm deterministically falls back to a second-chance pass: it atomically clears the accessed bitmask ($A_k \leftarrow 0$) for the chunk and seamlessly advances to the next contiguous chunk. It is a known tradeoff of this bulk-clearing approach that bits set by concurrent readers microseconds prior will be wiped alongside stale bits; however, this mild loss of precision is accepted in exchange for eliminating $\mathcal{O}(N)$ per-slot atomic instructions. 
 
 \textbf{Writer Progress and Claim Protocol.}
-To safely claim the selected bit $i$ for eviction, we define a third state bitmask for the chunk: $W_k \in \{0,1\}^{64}$, where bit $i = 1$ if and only if a writer currently owns slot $i$ for mutation. 
 
 The eviction search process executes as follows:
 \begin{enumerate}
@@ -278,7 +278,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 \subsection{Go Memory Model Safety}
 
-Seqlock validation establishes an algorithmic snapshot condition but does not by itself make concurrent accesses to pointer-bearing Go values race-free. \texttt{liteLRU} maintains hot metadata in an off-heap SoA layout, while the pointer-bearing logical payload (keys, values, handlers) is atomically published per slot. To satisfy Go's race-freedom rules without locks, writers publish each field individually via \texttt{atomic.Pointer} wrappers. However, individual atomic stores do not provide cross-field consistency. Instead, the algorithm relies on the seqlock: the writer increments the seqlock to an odd value, performs the individual atomic stores, and increments it to an even value. Readers perform individual atomic loads bounded by seqlock validation. If the sequence bounds match, the reader is guaranteed to have observed a mutually consistent set of fields.
+Seqlock validation establishes an algorithmic snapshot condition but does not by itself make concurrent accesses to pointer-bearing Go values race-free. \texttt{liteLRU} maintains hot metadata in an off-heap SoA layout, while the pointer-bearing logical payload (keys, values, handlers) is atomically published per slot. To satisfy Go's race-freedom rules without locks, writers publish each field individually via \texttt{atomic.Pointer} wrappers. However, individual atomic stores do not provide cross-field consistency. Instead, the algorithm relies on the seqlock: the writer increments the seqlock to an odd value, performs the individual atomic stores (including the SWAR signature byte), and increments it to an even value. Readers perform individual atomic loads bounded by seqlock validation. If the sequence bounds match, the reader is guaranteed to have observed a mutually consistent set of fields.
 
 \subsection{Correctness Theorems}
 
@@ -403,7 +403,7 @@ To mathematically validate the architectural decisions behind \texttt{liteLRU}, 
 \toprule
 \textbf{Variant} & \textbf{Ops/sec} & \textbf{Throughput Loss} \\ \midrule
 \texttt{liteLRU} (Full)$^*$          & 32,024,792 & --- \\
-No Bitmask (Linear Scan)         & 29,034,906 & -9\% \\
+No SWAR Signatures         & 29,034,906 & -9\% \\
 No Padding (False Share)         & 19,407,171 & -39\% \\
 No Lock-Free (Map+Mutex)         & 4,280,582  & -87\% \\ \bottomrule
 \end{tabular}
@@ -428,7 +428,7 @@ x86\_64               & 8              & 13{,}155{,}469                  \\ \bot
 
 \subsection{Zipfian Hit-Rate Evaluation}
 
-To evaluate eviction fidelity under realistic skewed access patterns, we benchmarked \texttt{liteLRU} against \texttt{otter}~\cite{otter} v2 using a Zipfian distribution ($s=1.001$, $N=100{,}000$ working set) with 1.6M total operations across varying cache capacities. Both caches were given a 20\% warmup phase.
+To evaluate eviction fidelity under realistic skewed access patterns, we benchmarked \texttt{liteLRU} against \texttt{otter}~\cite{otter} v2 using a Zipfian distribution ($s=1.001$, $N=100{,}000$ working set) with 1.6M total operations across varying cache capacities. Both caches were given a 20\% warmup phase to establish steady-state admission policies, using the same capacity definition (entry count) and key space. Values are the median of 10 runs.
 
 \begin{table}[h]
 \centering
@@ -443,7 +443,7 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 \caption{Hit rates under Zipfian distribution.}
 \end{table}
 
-\texttt{liteLRU}'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's~\cite{otter} S3-FIFO-based eviction policy across all tested capacities. \texttt{liteLRU} achieves hit rates competitive with frequency-optimal caching across both high-skew and moderate-skew Zipfian distributions. Furthermore, CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate advantage holds across both high-skew ($s=1.001$) and moderate-skew ($s=0.8$) distributions; on strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. ~\cite{hitrate2026}.
+\texttt{liteLRU}'s bitmask-CLOCK approximation achieves hit rates $\ge$ Otter's~\cite{otter} S3-FIFO-based eviction policy across all tested capacities. \texttt{liteLRU} achieves hit rates competitive with frequency-optimal caching across both high-skew and moderate-skew Zipfian distributions. Furthermore, CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate advantage holds across both high-skew ($s=1.001$) and moderate-skew ($s=0.8$) distributions; on strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. ~\cite{hitrate2026}.
 
 \subsection{Write-Heavy Workloads}
 
@@ -451,11 +451,11 @@ We compare against Otter v2 rather than \texttt{ristretto} here because \texttt{
 
 \begin{table}[h]
 \centering
-\begin{tabular}{@{}lccc@{}}
+\begin{tabular}{@{}lcccc@{}}
 \toprule
-\textbf{Workload Mix} & \textbf{\texttt{liteLRU} Ops/sec} & \textbf{\texttt{otter} v2 Ops/sec} & \textbf{Speedup} \\ \midrule
-50/50 Get/Add         & \textbf{30,678,081}               & 6,345,600                           & \textbf{4.83x}   \\
-20/80 Get/Add         & \textbf{30,080,323}               & 4,083,792                           & \textbf{7.36x}   \\ \bottomrule
+\textbf{Workload Mix} & \textbf{\texttt{liteLRU} Ops/sec} & \textbf{Drop Rate} & \textbf{\texttt{otter} v2 Ops/sec} & \textbf{Speedup} \\ \midrule
+50/50 Get/Add         & \textbf{30,678,081}               & $\sim$5.0\%        & 6,345,600                          & \textbf{4.83x}   \\
+20/80 Get/Add         & \textbf{30,080,323}               & $\sim$6.6\%        & 4,083,792                          & \textbf{7.36x}   \\ \bottomrule
 \end{tabular}
 \caption{Throughput under write-heavy pressure.}
 \end{table}
@@ -548,7 +548,7 @@ In contrast, Otter’s implementation uses asynchronous buffering and background
 
 \section{Discussion and Limitations}
 
-\textbf{Memory Overhead.} The tradeoff for $L$-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires platform-specific overhead. On x86\_64 ($L=64$), it requires 128 bytes of overhead (64 bytes for the seqlock + 64 bytes for the four atomic field wrappers: \texttt{atomicString}, \texttt{atomicSlice}, and \texttt{atomic.Pointer}), totaling \textbf{\textasciitilde 128 MB} of allocation overhead per million entries. On Apple Silicon ($L=128$), the 128-byte seqlock padding brings the total overhead to 192 bytes per entry (\textbf{\textasciitilde 192 MB} per million entries before chunk metadata). Both represent a memory premium in exchange for bounded-probe lock-free concurrency, with \texttt{otter} requiring \textbf{\textasciitilde 120 MB}.
+\textbf{Memory Overhead.} The tradeoff for $L$-byte padded seqlocks and SoA alignment is increased memory overhead per entry compared to dense tag-based implementations like MemC3. A \texttt{liteLRU} entry requires platform-specific overhead. On x86\_64 ($L=64$), it requires 128 bytes of overhead (64 bytes for the seqlock + 64 bytes for the four atomic field wrappers: \texttt{atomicString}, \texttt{atomicSlice}, and \texttt{atomic.Pointer}), totaling \textbf{\textasciitilde 128 MB} of allocation overhead per million entries. On Apple Silicon ($L=128$), the 128-byte seqlock padding brings the total overhead to 192 bytes per entry (\textbf{\textasciitilde 192 MB} per million entries before chunk metadata). Both represent a memory premium in exchange for bounded-probe lock-free concurrency, with \texttt{otter} requiring \textbf{\textasciitilde 120 MB} per million entries.
 
 \textbf{Hit Rate vs. True LRU.} The Chunked Bitmask algorithm is an approximation of LRU~\cite{lru1965,clock1969}. In workloads with access patterns adversarially tuned to the CLOCK approximation error, hit-rate may degrade relative to true LRU or more recent policies such as SIEVE~\cite{sieve2024}. The tradeoff is deliberate: structural lock freedom is valued over exact eviction fidelity for the target workload of web-scale routing caches.
 
