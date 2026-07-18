@@ -88,10 +88,13 @@ Under high concurrency, a single globally contested atomic (e.g., a global clock
 In this paper, we make the following contributions to concurrent cache design:
 \begin{itemize}
     \item \textbf{Contention-Bounded Eviction Algorithm:} A 64-way set associative architecture utilizing chunked bitmasks and hardware \texttt{CTZ}, eliminating global clock hands and open-addressed maps entirely.
+
     \item \textbf{Hybrid Memory Architecture:} Off-heap allocation for lock-free state to isolate hot concurrency primitives from GC write barriers while safely tracking Go pointers on the heap.
     \item \textbf{Padded Seqlocks:} A strict structural layout that yields bounded wait-free reads and eliminates false sharing for per-slot metadata.
     \item \textbf{Load-Shedding Eviction Protocol:} A load-shedding protocol that caps write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
 \end{itemize}
+
+The rest of this paper is structured as follows: Section \ref{sec:hybrid} details the hybrid memory architecture, Section \ref{sec:related} discusses related work, Section \ref{sec:assoc} outlines the set-associative design, and the remaining sections analyze the eviction algorithm, safety, and performance.
 
 \section{Hybrid Memory Architecture and 64-Way Set Associative SWAR}
 
@@ -121,6 +124,9 @@ The problem of concurrent cache design generally branches into two orthogonal do
 \textbf{Production Go Caches.} Existing Go caches like \texttt{freecache}, \texttt{bigcache}, and \texttt{ristretto} achieve high throughput via sharding and background eviction goroutines. \texttt{liteLRU} takes a different approach: rather than amortizing eviction cost over background threads or coarse-grained shard locks, \texttt{liteLRU} eliminates the locking overhead entirely via bitmask mathematics and seqlocks, enabling bounded wait-free synchronous reads and inline contention-bounded writes.
 
 \section{Why Structure of Arrays over Array of Structs}
+
+\textit{Note on Set Associativity:} Software caches traditionally use open-addressed hash maps, whereas hardware L1/L2 caches use $N$-way set associativity. \texttt{liteLRU} applies this hardware-style set associative design in software to bypass the global locking overhead of hash maps entirely.
+
 
 The conventional cache entry is represented as an Array of Structs (AoS):
 
@@ -199,7 +205,9 @@ The key observation: if we partition the cache into chunks of exactly 64 entries
 
 A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$), provided it is not currently owned by a writer ($W_k[i] = 0$). The complete candidate set across all 64 slots is computed in a single bitwise expression:
 
-\begin{center}\texttt{C\_k = \textbackslash{}neg (V\_k \textbackslash{}land A\_k) \textbackslash{}land \textbackslash{}neg W\_k}\end{center}
+\begin{equation}
+C_k = \neg (V_k \land A_k) \land \neg W_k
+\end{equation}
 
 The index of the first candidate is extracted using the hardware Count Trailing Zeros (CTZ) instruction~\cite{inteltzcnt,armclz}. It is crucial to handle platform-specific zero behavior: on x86\_64, \texttt{TZCNT} returns 64 when the input is zero, whereas on ARM64, \texttt{RBIT} + \texttt{CLZ} requires an explicit branch or zero-check. When a non-zero candidate mask exists:
 
@@ -267,7 +275,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \begin{enumerate}
     \item Retry loop (max 10 iterations).
     \item Load $V_k, A_k, W_k$. If $C_k = 0$, atomically clear $A_k$ for all valid slots via CAS. Recompute $C_k$ before proceeding.
-    \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ(\textbackslash{}neg (V\_k \textbackslash{}land A\_k) \textbackslash{}land \textbackslash{}neg W\_k)}.
+    \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ(}$\neg (V_k \land A_k) \land \neg W_k$\texttt{)}.
     \item Attempt to CAS the $W_k$ bitmask to claim the slot.
     \item If successful, return the slot index.
     \item If unsuccessful (due to concurrent writers), increment retry counter.
@@ -445,7 +453,7 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 
 \subsection{Write-Heavy Workloads}
 
-We compare against Otter v2 rather than \texttt{ristretto} here because \texttt{ristretto}'s hit-rate collapses under intense concurrent pressure (as documented by the Otter authors~\cite{otter}), rendering its write throughput an artifact of dropped samples rather than true admission. To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive Get/Add ratios using 8 concurrent cores.
+We omit \texttt{ristretto} from this benchmark because, as documented in~\cite{otter}, it exhibits hit-rate degradation under extreme concurrent write pressure, making raw throughput comparisons an inaccurate reflection of actual admission. We therefore compare exclusively against Otter v2. To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive Get/Add ratios using 8 concurrent cores.
 
 \begin{table}[h]
 \centering

@@ -1,6 +1,6 @@
 <div align="center">
 
-# liteLRU: A Coherence-Conscious, Contention-Bounded Approximate LRU via Chunked Bitmask Eviction on Modern Multi-Core Hardware
+# liteLRU: A Coherence-Conscious, Contention-Bounded Cache for Managed Runtimes via Chunked Bitmasks
 
 **Author:** xDarkicex  
 **Affiliations:** libravdb · bitdev · zephyr-systems  
@@ -50,6 +50,8 @@ In this paper, we make the following contributions to concurrent cache design:
 * **Padded Seqlocks:** A strict structural layout that yields bounded-probe lock-free reads and eliminates false sharing for per-slot metadata.
 * **Load-Shedding Eviction Protocol:** A load-shedding protocol that caps write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
 
+The rest of this paper is structured as follows: Section 2 details the hybrid memory architecture, Section 3 discusses related work, Section 4 outlines the set-associative design, and the remaining sections analyze the eviction algorithm, safety, and performance.
+
 ## 2. Hybrid Memory Architecture and GC Isolation
 
 **Scanner Heap Pressure.** Objects that escape to the heap are scanned during the mark phase. A cache holding thousands of string values generates a large root set for the GC to scan, increasing mark phase duration proportionally.
@@ -76,6 +78,8 @@ The problem of concurrent cache design generally branches into two orthogonal do
 ---
 
 ## 4. Why Structure of Arrays over Array of Structs
+
+*Note on Set Associativity:* Software caches traditionally use open-addressed hash maps, whereas hardware L1/L2 caches use $N$-way set associativity. `liteLRU` applies this hardware-style set associative design in software to bypass the global locking overhead of hash maps entirely.
 
 The conventional cache entry is represented as an Array of Structs (AoS):
 
@@ -149,7 +153,7 @@ The key observation driving `liteLRU`'s design: if we partition the cache into c
 
 A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$), provided it is not currently owned by a writer ($W_k[i] = 0$). The set of all candidates across all 64 slots is computed in a single bitwise expression:
 
-`C_k = \neg (V_k \land A_k) \land \neg W_k`
+$$C_k = \neg (V_k \land A_k) \land \neg W_k$$
 
 The index of the first candidate is then extracted using the hardware `CTZ` (Count Trailing Zeros) instruction [[10,11]](#ref-tzcnt). It is crucial to handle platform-specific zero behavior: on x86_64, `TZCNT` returns 64 when the input is zero, whereas on ARM64, `RBIT` + `CLZ` requires an explicit branch or zero-check. When a non-zero candidate mask exists:
 
@@ -209,7 +213,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 **findVictim(chunk k)**
 1. Retry loop (max 10 iterations).
 2. Load $V_k, A_k, W_k$. If $C_k = 0$, atomically clear $A_k$ for all valid slots via CAS. Recompute $C_k$ before proceeding.
-3. Apply the CLOCK approximation: identify candidate slots using `CTZ(\neg (V_k \land A_k) \land \neg W_k)`.
+3. Apply the CLOCK approximation: identify candidate slots using `CTZ`($\neg (V_k \land A_k) \land \neg W_k$).
 4. Attempt to CAS the $W_k$ bitmask to claim the slot.
 5. If successful, return the slot index.
 6. If unsuccessful (due to concurrent writers), increment retry counter.
@@ -291,7 +295,7 @@ Our custom latency test bypasses `pb.Next()` entirely. Each goroutine operates a
 | `otter` v2                | 16,299,814 | 333 ns      | 49.83 µs    |
 | `Mutex LRU` (Naive)       |  8,960,372 | 167 ns      | 23.08 µs    |
 
-*Note: Latency percentiles in this table were sampled at a 1% rate to preserve realistic throughput levels during measurement. This 1% sampling interval (and the different API harness) captures a slightly different distribution and a slightly different percentile profile.*
+*Note: Latency percentiles in this table were sampled at a 1% rate (to minimize the observer effect on RFO traffic) to preserve realistic throughput levels during measurement. This 1% sampling interval (and the different API harness) captures a slightly different distribution and a slightly different percentile profile.*
 
 `liteLRU` demonstrates an $\approx$3.3x throughput advantage over the naive Mutex LRU, and nearly double the throughput of the highly optimized `otter` v2 concurrent cache. Furthermore, `liteLRU` possesses by far the lowest p99 tail latency (625 ns) of all concurrent caches tested, achieving a p99 latency of 625 ns in this workload. `otter` absorbs common-path operations into background buffers for a fast median, but exhibits a 49.83 µs p99 latency in this workload. This result is consistent with the tradeoffs of asynchronous buffering and its associated implementation overheads; isolating individual internal causes would require profiling. `liteLRU` instead performs synchronous, bounded writes into the 64-way set associative slots.
 
@@ -365,7 +369,7 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 
 ### 9.7 Write-Heavy Workloads
 
-We compare against Otter v2 rather than ristretto here because ristretto's hit-rate collapses under intense concurrent pressure (as documented by the Otter authors [18]), rendering its write throughput an artifact of dropped samples rather than true admission. To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive `Get/Add` ratios using 8 concurrent cores.
+We omit Ristretto from this benchmark because, as documented in [18], it exhibits hit-rate degradation under extreme concurrent write pressure, making raw throughput comparisons an inaccurate reflection of actual admission. We therefore compare exclusively against Otter v2. To stress the concurrent write protocol under severe contention, we measured throughput across a 1.6M operation Zipfian workload with aggressive `Get/Add` ratios using 8 concurrent cores.
 
 | Workload     | `liteLRU` (Ops/sec) | Drop Rate | `otter` v2 (Ops/sec) | Advantage |
 |--------------|-------------------|-----------|--------------------|-----------|
@@ -457,7 +461,7 @@ By caching the route resolution itself, `liteLRU` drops the median observed requ
 
 **Extreme Contention Load-Shedding.** To preserve microsecond read latency and bound write times, `liteLRU` limits spin-lock retries to 10 per eviction attempt. Under pathological duplicate-insert contention (e.g., thousands of workers missing on the same URL simultaneously), `liteLRU` will sacrifice some admissions and drop the writes. This load-shedding is a deliberate bound: it prevents unbounded spinning under pathological multi-miss contention, prioritizing stable latency over guaranteed admission.
 
-**Zero-Allocation Param Retrieval.** By accepting a caller-provided stack-allocated buffer (`[]Param`), `liteLRU` guarantees zero heap allocations on cache hits, avoiding the GC overhead that plagues amortized caches returning pointer-backed slice structs.
+**Zero-Allocation Param Retrieval.** By accepting a caller-provided stack-allocated buffer (`[]Param`), `liteLRU` guarantees zero heap allocations on cache hits, avoiding the GC overhead common in amortized caches returning pointer-backed slice structs.
 
 ---
 
