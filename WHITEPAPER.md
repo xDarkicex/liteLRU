@@ -107,7 +107,7 @@ paths    []string    // [p0, p1, p2, ...] — contiguous
 handlers []uintptr   // [h0, h1, h2, ...] — contiguous
 ```
 
-When a `Get` operation scans `methods[i]` and `methods[i+1]`, both values reside in the same $L$-byte cache line (a `string` header is 16 bytes, so 4 string headers per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4 (assuming $L \ge 64$).
+When a `Get` operation scans `methods[i]` and `methods[i+1]`, both values reside in the same $L$-byte cache line (a `string` header is 16 bytes, so 4 string headers per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4 (since the target coherence-line size $L$ is at least 64 bytes).
 
 Formally, let $W_f$ be the width of field $f$ and $L = 64$ bytes be the cache line size. For AoS, the number of cache lines fetched to access field $f$ of $n$ consecutive entries depends heavily on padding and struct size. If $\text{sizeof}(\text{Entry}) \le L$ and the compiler naturally packs them, we approximate the cost as fetching one new cache line per entry:
 
@@ -206,7 +206,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 3. If `findVictim` returns the failure sentinel, drop the admission and return.
 4. Clear the victim's bit in $V_k$.
 5. Increment the seqlock $S_i$ to an odd value.
-6. Construct and atomically publish the immutable slot payloads in the SoA arrays.
+6. Atomically publish the pointer-bearing fields in the SoA arrays.
 7. Update the SWAR signature byte for the new key.
 8. Increment the seqlock $S_i$ to an even value.
 9. Set the victim's bit in $V_k$, clear its bit in $A_k$, and release its bit in $W_k$.
@@ -222,7 +222,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 ### 6.3 Go Memory Model Safety
 
-Seqlock validation establishes an algorithmic snapshot condition but does not by itself make concurrent accesses to pointer-bearing Go values race-free. `liteLRU` represents each slot payload as an immutable heap object. Writers fully initialize a payload before publishing its address through `atomic.Pointer`; readers obtain the payload through an atomic load before dereferencing it. Sequence validation detects concurrent replacement and returns a miss. Thus, implementation safety relies jointly on atomic publication, immutable payloads, and sequence validation.
+Seqlock validation establishes an algorithmic snapshot condition but does not by itself make concurrent accesses to pointer-bearing Go values race-free. `liteLRU` maintains hot metadata in an off-heap SoA layout, while the pointer-bearing logical payload (keys, values, handlers) is atomically published per slot. To satisfy Go's race-freedom rules without locks, writers publish each field individually via `atomic.Pointer` wrappers. However, individual atomic stores do not provide cross-field consistency. Instead, the algorithm relies on the seqlock: the writer increments the seqlock to an odd value, performs the individual atomic stores, and increments it to an even value. Readers perform individual atomic loads bounded by seqlock validation. If the sequence bounds match, the reader is guaranteed to have observed a mutually consistent set of fields.
 
 ### 6.4 Correctness Theorems
 
@@ -234,7 +234,7 @@ Seqlock validation establishes an algorithmic snapshot condition but does not by
 *Proof:* `findVictim` utilizes the `CTZ` instruction to identify eviction candidates. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, `findVictim` returns a failure sentinel and `Add` drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
 
 **Theorem 3 (Safety Invariant).** *No two writers may simultaneously overwrite the same slot, and readers will never observe torn key/value pairs.*
-*Proof:* A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, publishing the new immutable payload via an atomic store, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ alongside the atomic payload load is guaranteed to never observe a torn key/value pair for a single slot.
+*Proof:* A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, atomically publishing the individual SoA fields, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ alongside the independent atomic loads is guaranteed to never observe a torn or inconsistent set of fields for a single slot.
 
 ## 7. Cache-Line Padding to Eliminate False Sharing
 
@@ -258,15 +258,13 @@ Because the `mmap` allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (page al
 
 It is important to note that the 64-bit bitmasks ($V_k$, $A_k$, $W_k$) do remain shared contention points. However, because they batch 64 slots into a single atomic integer, the contention surface area is reduced by a factor of 64 compared to per-slot tracking.
 
-The same argument applies to the statistics counters. Aggregating hits and misses into two global `atomic.Int64` values would cause every `Get` on every core to contend on two shared cache lines. We instead shard into 64 independent `statStripe` structs, each padded to the target platform's $L$-byte coherence stride, selected by `hash & 63`. Each core writes exclusively to its own stripe with zero coherency interference.
+The same argument applies to the statistics counters. Aggregating hits and misses into two global `atomic.Int64` values would cause every `Get` on every core to contend on two shared cache lines. We instead shard into 64 independent `statStripe` structs, each padded to the target platform's $L$-byte coherence stride, selected by `hash & 63`. Writes are distributed across 64 padded stripes, reducing—rather than eliminating—counter contention.
 
 ---
 
 ## 8. Benchmark Methodology and Artifacts
 
-Standard Go micro-benchmarks use `b.RunParallel`, which distributes iterations of the benchmark loop across goroutines via an internal `pb.Next()` call. `pb.Next()` performs an atomic fetch-and-add on a shared 64-bit counter to assign work to each goroutine.
-
-When the operation under test completes in sub-10ns — as is typical for a cache hit — the benchmark overhead from the `pb.Next()` atomic dominates. According to Amdahl's Law, the maximum parallel speedup for a workload with sequential fraction $f$ across $N$ cores is:
+Standard Go micro-benchmarks use `b.RunParallel`, distributing $b.N$ iterations across goroutines via an internal `pb.Next()` call—an atomic fetch-and-add on a shared 64-bit counter. When the operation under test completes in sub-10ns — as is typical for a cache hit — the benchmark overhead from the `pb.Next()` atomic dominates. According to Amdahl's Law, the maximum parallel speedup for a workload with sequential fraction $f$ across $N$ cores is:
 
 $$S(N) = \frac{1}{(1-f) + \dfrac{f}{N}}$$
 
@@ -335,7 +333,7 @@ To isolate the contribution of each architectural decision in `liteLRU`'s **64-w
 | No Padding (False Share)       | 19,407,171 | -39%            |
 | No Set Associativity (Map+Mutex)|  4,280,582 | -87%            |
 
-The ablation confirms that while SWAR hardware acceleration provides a measurable 9% optimization, the two structural requirements for scaling are cache-line isolation (-39% without padding) and elimination of the centralized mutex-protected map (-87%). The -87% result quantifies the combined cost of Go's `sync.RWMutex` overhead and the single-contention-point map: the 64-way set associative design avoids both by confining all writes to a localized, lock-free slot within the pre-hashed set.
+The ablation confirms that while SWAR hardware acceleration provides a measurable 9% optimization, the two structural requirements for scaling are cache-line isolation (-39% without padding) and elimination of the centralized mutex-protected map (-87%). The -87% result quantifies the combined cost of Go's `sync.RWMutex` overhead and the single-contention-point map: the 64-way set associative design avoids both by confining all writes to a localized slot via bounded-attempt CAS within the pre-hashed set.
 
 *\*Note: The ablation runs use a distinct benchmark harness measuring absolute hardware limits without the 1% tracking overhead of the p99 latency evaluation, accounting for the higher ops/sec baseline relative to §9.1.*
 
@@ -371,9 +369,9 @@ We compare against Otter v2 rather than ristretto here because ristretto's hit-r
 | 50/50 Get/Add| **30,678,081**    | 6,345,600          | **4.83x** |
 | 20/80 Get/Add| **30,080,323**    | 4,083,792          | **7.36x** |
 
-`liteLRU` demonstrates a 4.8x to 7.4x throughput advantage under write-heavy pressure. When writes dominate (80%), amortized caches like `otter` experience severe contention on their ingestion buffers (dropping to ~4M ops/sec). `liteLRU` sustains over 30M ops/sec by confining state mutations to localized, lock-free overwrites inside the 64-way associative sets.
+`liteLRU` demonstrates a 4.8x to 7.4x throughput advantage under write-heavy pressure. At 80% writes, `otter` measured approximately 4M ops/sec in this workload. This outcome is consistent with the tradeoffs of asynchronous ingestion and buffering; identifying the contribution of individual internal mechanisms would require profiling. `liteLRU` sustains over 30M ops/sec by confining state mutations to localized, non-blocking bounded-attempt overwrites inside the 64-way associative sets.
 
-A notable result is that the 50/50 and 20/80 workloads yield nearly identical throughput for `liteLRU` (~30M ops/sec). However, raw throughput must be contextualized by the load-shedding mechanism: in these extreme contention synthetic benchmarks, `liteLRU` deliberately drops approximately 5% of admissions in the 50/50 workload and 6.6% in the 20/80 workload to maintain absolute bounded execution latency. This is a direct consequence of eliminating tombstones: in the old hash-map architecture, write-heavy loads triggered compaction cycles that significantly degraded throughput. In the 64-way set associative design, writes are bounded in-place operations with no table-wide rehash or compaction, so increasing write fraction does not degrade throughput.
+A notable result is that the 50/50 and 20/80 workloads yield nearly identical throughput for `liteLRU` (~30M ops/sec). However, raw throughput must be contextualized by the load-shedding mechanism: in these extreme contention synthetic benchmarks, `liteLRU` deliberately drops approximately 5% of admissions in the 50/50 workload and 6.6% in the 20/80 workload to bound cache-admission retry work. This is a direct consequence of eliminating tombstones: in the old hash-map architecture, write-heavy loads triggered compaction cycles that significantly degraded throughput. In the 64-way set associative design, writes are bounded in-place operations with no table-wide rehash or compaction, so increasing write fraction does not degrade throughput.
 
 ---
 
@@ -444,7 +442,7 @@ This performance delta highlights the effectiveness of `liteLRU`'s **Load-Sheddi
 
 In contrast, Otter’s implementation uses asynchronous buffering and background processing, whereas `liteLRU` performs synchronous inline admission; the higher tail latency (37.92 ms max) observed here is consistent with that architectural tradeoff. Because `liteLRU` remains strictly synchronous, its evictions run inline on the executing thread without background queues, guaranteeing zero heap allocations for the returned parameter slices while delivering superior end-to-end responsiveness.
 
-By caching the route resolution itself, `liteLRU` drops the median observed request latency in this benchmark from 381 µs to just 253 µs, proving that it acts as a effective caching layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
+By caching the route resolution itself, `liteLRU` drops the median observed request latency in this benchmark from 381 µs to just 253 µs, proving that it acts as an effective caching layer for HTTP frameworks looking to bypass dynamic parameter extraction logic entirely.
 
 ## 10. Discussion and Limitations
 
