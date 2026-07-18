@@ -199,9 +199,7 @@ The key observation: if we partition the cache into chunks of exactly 64 entries
 
 A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$), provided it is not currently owned by a writer ($W_k[i] = 0$). The complete candidate set across all 64 slots is computed in a single bitwise expression:
 
-\begin{equation}
-C_k = \neg (V_k \land A_k) \land \neg W_k
-\end{equation}
+\begin{center}\texttt{C\_k = \textbackslash{}neg (V\_k \textbackslash{}land A\_k) \textbackslash{}land \textbackslash{}neg W\_k}\end{center}
 
 The index of the first candidate is extracted using the hardware Count Trailing Zeros (CTZ) instruction~\cite{inteltzcnt,armclz}. It is crucial to handle platform-specific zero behavior: on x86\_64, \texttt{TZCNT} returns 64 when the input is zero, whereas on ARM64, \texttt{RBIT} + \texttt{CLZ} requires an explicit branch or zero-check. When a non-zero candidate mask exists:
 
@@ -269,7 +267,7 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 \begin{enumerate}
     \item Retry loop (max 10 iterations).
     \item Load $V_k, A_k, W_k$. If $C_k = 0$, atomically clear $A_k$ for all valid slots via CAS. Recompute $C_k$ before proceeding.
-    \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ(}$\neg (V_k \land A_k) \land \neg W_k$\texttt{)}.
+    \item Apply the CLOCK approximation: identify candidate slots using \texttt{CTZ(\textbackslash{}neg (V\_k \textbackslash{}land A\_k) \textbackslash{}land \textbackslash{}neg W\_k)}.
     \item Attempt to CAS the $W_k$ bitmask to claim the slot.
     \item If successful, return the slot index.
     \item If unsuccessful (due to concurrent writers), increment retry counter.
@@ -443,7 +441,7 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 \caption{Hit rates under Zipfian distribution.}
 \end{table}
 
-\texttt{liteLRU}'s bitmask-CLOCK approximation achieves hit rates $\ge$ Otter's~\cite{otter} S3-FIFO-based eviction policy across all tested capacities. \texttt{liteLRU} achieves hit rates competitive with frequency-optimal caching across both high-skew and moderate-skew Zipfian distributions. Furthermore, CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate advantage holds across both high-skew ($s=1.001$) and moderate-skew ($s=0.8$) distributions; on strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. ~\cite{hitrate2026}.
+\texttt{liteLRU}'s bitmask-CLOCK approximation matches or exceeds Otter's~\cite{otter} S3-FIFO-based hit rates across all tested capacities. \texttt{liteLRU} achieves hit rates competitive with frequency-optimal caching across both high-skew and moderate-skew Zipfian distributions. Furthermore, CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern, demonstrating that its structurally lock-free hit path trades no eviction fidelity for its speed. It should be noted that this hit-rate advantage holds across both high-skew ($s=1.001$) and moderate-skew ($s=0.8$) distributions; on strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. ~\cite{hitrate2026}.
 
 \subsection{Write-Heavy Workloads}
 
@@ -558,7 +556,7 @@ In contrast, Otter’s implementation uses asynchronous buffering and background
 
 \section{Conclusion}
 
-We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap mmap allocation to eliminate GC interference~\cite{gogc2018}; SoA layout to maximize cache-line occupancy per field access; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; Seqlocks~\cite{seqlockoriginal} to provide bounded wait-free read semantics; and $L$-byte cache-line padding~\cite{falsesharing1993,mesi1984} to eliminate false-sharing serialization. The result is a cache architecture whose concurrency cost is bounded by a small, fixed set of hardware atomic operations rather than OS-level synchronization primitives, achieving over 30M ops/sec under write-heavy workloads and sub-microsecond p99 tail latency under sustained 8-core load.
+We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap mmap allocation to eliminate GC interference~\cite{gogc2018}; SoA layout to maximize cache-line occupancy per field access; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; Seqlocks~\cite{seqlockoriginal} to provide bounded wait-free read semantics; and $L$-byte cache-line padding~\cite{falsesharing1993,mesi1984} to eliminate false-sharing serialization. The result is a cache architecture whose concurrency cost is bounded by a small, fixed set of hardware atomic operations rather than OS-level synchronization primitives, achieving over 30M ops/sec under write-heavy workloads and sub-µs p99 on the competitive harness (\S 9.1); $\sim$1.3 µs p99.9 under full instrumentation (\S 9.3).
 
 \bibliographystyle{plain}
 \bibliography{references}
