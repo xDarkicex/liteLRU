@@ -1,4 +1,4 @@
-module baseline
+module github.com/xDarkicex/liteLRU/benchmarks
 
 go 1.25.7
 
@@ -10,9 +10,8 @@ require (
 require (
 	github.com/dolthub/maphash v0.1.0 // indirect
 	github.com/gammazero/deque v0.2.1 // indirect
-	github.com/stretchr/testify v1.8.4 // indirect
 	github.com/xDarkicex/memory v1.2.2 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 )
 
-replace github.com/xDarkicex/liteLRU => /Users/z3robit/Development/golang/src/github.com/xDarkicex/liteLRU
+replace github.com/xDarkicex/liteLRU => ../

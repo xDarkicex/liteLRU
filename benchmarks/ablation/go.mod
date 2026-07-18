@@ -1,12 +1,12 @@
-module ablation
+module github.com/xDarkicex/liteLRU/benchmarks/ablation
 
 go 1.25.7
 
-replace github.com/xDarkicex/liteLRU => ../../../../../../../Development/golang/src/github.com/xDarkicex/liteLRU
-
-require github.com/xDarkicex/memory v1.2.1
-
 require (
-	github.com/xDarkicex/liteLRU v0.2.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
+	github.com/xDarkicex/liteLRU v0.2.0
+	github.com/xDarkicex/memory v1.2.2
 )
+
+require golang.org/x/sys v0.43.0 // indirect
+
+replace github.com/xDarkicex/liteLRU => ../../
