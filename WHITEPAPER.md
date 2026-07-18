@@ -26,24 +26,19 @@ To reason about concurrent cache design, we first establish a precise model of t
 
 A modern multi-core processor maintains a private L1 cache (typically 32–64 KiB, 4–5 cycle latency), a private L2 cache (256 KiB – 1 MiB, ~12 cycle latency), and a shared L3 cache (several MiB, ~40 cycle latency). Main memory sits at approximately 200–300 cycles. The performance implication is stark: a single L1 cache miss costs roughly 40× more than an L1 hit.
 
-The fundamental unit of coherency is the **cache line**, dependent on the target platform architecture (e.g., $L=64$ bytes on x86_64, $L=128$ bytes on Apple Silicon). The CPU never fetches individual bytes; it fetches and writes back entire $L$-byte coherence lines.
+The fundamental unit of coherency is the **cache line**, dependent on the target platform architecture (e.g., 64 bytes on x86_64, 128 bytes on Apple Silicon). The CPU never fetches individual bytes; it fetches and writes back entire coherence lines.
 
-### 1.2 The MESI Coherency Protocol
+### 1.2 Coherence and False Sharing
 
-The MESI protocol (Modified, Exclusive, Shared, Invalid) was introduced by Papamarcos and Patel [[1]](#ref-mesi) to maintain coherency across private caches in a multi-processor system. The relevant state transitions are:
+We use MESI terminology as an explanatory model for cache-coherence traffic on common shared-memory multiprocessors [[1]](#ref-mesi). The implementation depends only on the more general property that writes to a shared coherence granule can invalidate or otherwise require ownership transfer from copies held by other cores. Exact protocol states and instruction costs are microarchitecture-specific.
 
-- A line held in **Shared** state by multiple cores transitions to **Invalid** in all other cores when any single core writes to it.
-- A write to an **Invalid** line requires an RFO (Read For Ownership) — a broadcast on the CPU interconnect requesting exclusive ownership from all other cores.
-
-The critical consequence is **false sharing** [[8]](#ref-falsesharing): if two independent variables, accessed concurrently by two different cores, reside on the same $L$-byte coherence line, a write by one core forces an RFO on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
+The critical consequence is **false sharing** [[8]](#ref-falsesharing): if two independent variables, accessed concurrently by two different cores, reside on the same $L$-byte coherence line, a write by one core forces an ownership transfer on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
 
 ### 1.3 Atomics and Memory Ordering Cost
 
-Atomic operations (`CAS`, `fetch-and-add`) on a memory location whose cache line is not in the M (Modified) state require:
-1. An MESI state transition to Exclusive via RFO.
-2. The atomic read-modify-write in the modified cache line.
+Atomic operations (`CAS`, `fetch-and-add`) on a shared memory location generally require exclusive ownership of the coherence line.
 
-Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips across the CPU interconnect. As core count $N$ grows, wait time for the contested line scales as $O(N)$ per operation, a fact formalized by Amdahl [[2]](#ref-amdahl). The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit [[12]](#ref-lockfree).
+Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize. As core count $N$ grows, coherence queues become a bottleneck. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit [[12]](#ref-lockfree).
 
 ---
 
@@ -109,7 +104,7 @@ handlers []uintptr   // [h0, h1, h2, ...] — contiguous
 
 When a `Get` operation scans `methods[i]` and `methods[i+1]`, both values reside in the same $L$-byte cache line (a `string` header is 16 bytes, so 4 string headers per cache line). Accessing 4 consecutive methods costs 1 cache-line fetch instead of 4 (since the target coherence-line size $L$ is at least 64 bytes).
 
-Formally, let $W_f$ be the width of field $f$ and $L = 64$ bytes be the cache line size. For AoS, the number of cache lines fetched to access field $f$ of $n$ consecutive entries depends heavily on padding and struct size. If $\text{sizeof}(\text{Entry}) \le L$ and the compiler naturally packs them, we approximate the cost as fetching one new cache line per entry:
+Formally, let $W_f$ be the width of field $f$ and $L$ be the target platform's coherence-line size. For AoS, the number of cache lines fetched to access field $f$ of $n$ consecutive entries depends heavily on padding and struct size. If $\text{sizeof}(\text{Entry}) \le L$ and the compiler naturally packs them, we approximate the cost as fetching one new cache line per entry:
 
 $$\text{Lines}_{AoS}(n, f) \approx n$$
 
@@ -222,7 +217,15 @@ The cache state is divided into global configuration, per-chunk metadata, and pe
 
 ### 6.3 Go Memory Model Safety
 
-Seqlock validation establishes an algorithmic snapshot condition but does not by itself make concurrent accesses to pointer-bearing Go values race-free. `liteLRU` maintains hot metadata in an off-heap SoA layout, while the pointer-bearing logical payload (keys, values, handlers) is atomically published per slot. To satisfy Go's race-freedom rules without locks, writers publish each field individually via `atomic.Pointer` wrappers. However, individual atomic stores do not provide cross-field consistency. Instead, the algorithm relies on the seqlock: the writer increments the seqlock to an odd value, performs the individual atomic stores, and increments it to an even value. Readers perform individual atomic loads bounded by seqlock validation. If the sequence bounds match, the reader is guaranteed to have observed a mutually consistent set of fields.
+Seqlock validation establishes an algorithmic snapshot condition but does not by itself make concurrent accesses to pointer-bearing Go values race-free. `liteLRU` maintains hot metadata in an off-heap SoA layout, while the pointer-bearing logical payload (keys, values, handlers) is atomically published per slot. To satisfy Go's race-freedom rules without locks [[15]](#ref-gomem), writers publish each field individually via `atomic.Pointer` wrappers. 
+
+The safety of this snapshot mechanism relies on the following explicit implementation assumptions:
+1. All fields that can be read concurrently are accessed only through atomic operations.
+2. Writers to the same slot are strictly serialized by the $W_k$ bitmask.
+3. The sequence word uses atomic loads/stores and cannot be copied after first use.
+4. The implementation relies on Go's documented sequentially consistent atomic semantics.
+
+Because individual atomic stores do not provide cross-field consistency, the algorithm relies on the seqlock: the writer increments the seqlock to an odd value, performs the individual atomic stores, and increments it to an even value. Readers perform individual atomic loads bounded by seqlock validation. If the sequence bounds match, the reader is guaranteed to have observed a mutually consistent set of fields.
 
 ### 6.4 Correctness Theorems
 
@@ -264,9 +267,9 @@ The same argument applies to the statistics counters. Aggregating hits and misse
 
 ## 8. Benchmark Methodology and Artifacts
 
-Standard Go micro-benchmarks use `b.RunParallel`, distributing $b.N$ iterations across goroutines via an internal `pb.Next()` call—an atomic fetch-and-add on a shared 64-bit counter. When the operation under test completes in sub-10ns — as is typical for a cache hit — the benchmark overhead from the `pb.Next()` atomic dominates. According to Amdahl's Law, the maximum parallel speedup for a workload with sequential fraction $f$ across $N$ cores is:
+Standard Go micro-benchmarks use `b.RunParallel`, distributing $b.N$ iterations across goroutines via an internal `pb.Next()` call—an atomic fetch-and-add on a shared 64-bit counter. When the operation under test completes in sub-10ns — as is typical for a cache hit — the benchmark overhead from the `pb.Next()` atomic dominates. The max is consistent with OS scheduling jitter on at least one of the 8 goroutines. According to Amdahl's Law, the maximum parallel speedup for a workload with sequential fraction $s$ across $N$ cores is:
 
-$$S(N) = \frac{1}{(1-f) + \dfrac{f}{N}}$$
+$$S(N) = \frac{1}{s + \frac{1-s}{N}}$$
 
 When the operation time $T_{op}$ is comparable to the atomic latency $T_{atomic}$ (~20–40 ns including RFO round-trip), the contention on the central `pb.Next()` counter dominates. Using Amdahl's framework for parallel scaling [[2]](#ref-amdahl), this acts as an enforced sequential bottleneck, forcing $S(N) \to 1$ regardless of $N$. The result is an apparent decrease in throughput with additional cores — a benchmark artifact, not a property of the algorithm.
 
@@ -290,7 +293,7 @@ Our custom latency test bypasses `pb.Next()` entirely. Each goroutine operates a
 
 *Note: Latency percentiles in this table were sampled at a 1% rate to preserve realistic throughput levels during measurement. This 1% sampling interval (and the different API harness) captures a slightly different distribution and a slightly different percentile profile.*
 
-`liteLRU` demonstrates an $\approx$3.3x throughput advantage over the naive Mutex LRU, and nearly double the throughput of the highly optimized `otter` v2 concurrent cache. Furthermore, `liteLRU` possesses by far the lowest p99 tail latency (625 ns) of all concurrent caches tested, bounded strictly by lock-free atomics rather than buffer flushes. `otter` absorbs common-path operations into background buffers for a fast median, but exhibits a 49.83 µs p99 latency in this workload. This result is consistent with the tradeoffs of asynchronous buffering and its associated implementation overheads; isolating individual internal causes would require profiling. `liteLRU` instead performs synchronous, bounded writes into the 64-way set associative slots.
+`liteLRU` demonstrates an $\approx$3.3x throughput advantage over the naive Mutex LRU, and nearly double the throughput of the highly optimized `otter` v2 concurrent cache. Furthermore, `liteLRU` possesses by far the lowest p99 tail latency (625 ns) of all concurrent caches tested, achieving a p99 latency of 625 ns in this workload. `otter` absorbs common-path operations into background buffers for a fast median, but exhibits a 49.83 µs p99 latency in this workload. This result is consistent with the tradeoffs of asynchronous buffering and its associated implementation overheads; isolating individual internal causes would require profiling. `liteLRU` instead performs synchronous, bounded writes into the 64-way set associative slots.
 
 ### 9.2 Throughput Scaling Under Contention
 
@@ -371,7 +374,7 @@ We compare against Otter v2 rather than ristretto here because ristretto's hit-r
 
 `liteLRU` demonstrates a 4.8x to 7.4x throughput advantage under write-heavy pressure. At 80% writes, `otter` measured approximately 4M ops/sec in this workload. This outcome is consistent with the tradeoffs of asynchronous ingestion and buffering; identifying the contribution of individual internal mechanisms would require profiling. `liteLRU` sustains over 30M ops/sec by confining state mutations to localized, non-blocking bounded-attempt overwrites inside the 64-way associative sets.
 
-A notable result is that the 50/50 and 20/80 workloads yield nearly identical throughput for `liteLRU` (~30M ops/sec). However, raw throughput must be contextualized by the load-shedding mechanism: in these extreme contention synthetic benchmarks, `liteLRU` deliberately drops approximately 5% of admissions in the 50/50 workload and 6.6% in the 20/80 workload to bound cache-admission retry work. This is a direct consequence of eliminating tombstones: in the old hash-map architecture, write-heavy loads triggered compaction cycles that significantly degraded throughput. In the 64-way set associative design, writes are bounded in-place operations with no table-wide rehash or compaction, so increasing write fraction does not degrade throughput.
+A notable result is that the 50/50 and 20/80 workloads yield nearly identical throughput for `liteLRU` (~30M ops/sec). However, raw throughput must be contextualized by the load-shedding mechanism: in these extreme contention synthetic benchmarks, `liteLRU` deliberately drops approximately 5% of admissions in the 50/50 workload and 6.6% in the 20/80 workload to bound cache-admission retry work. This is a direct consequence of eliminating tombstones: in the old hash-map architecture, write-heavy loads triggered compaction cycles that significantly degraded throughput. In the 64-way set associative design, writes are bounded in-place operations with no table-wide rehash or compaction, so increasing write fraction did not materially degrade throughput in the evaluated 50/50 and 20/80 workloads.
 
 ---
 
@@ -467,7 +470,10 @@ We have presented the hardware-grounded derivation of each principal design deci
 ## References
 
 <a name="ref-mesi"></a>
-[1] Papamarcos, M. S. and Patel, J. H. "A Low-Overhead Coherence Solution for Multiprocessors with Private Cache Memories." *ACM SIGARCH Computer Architecture News*, 12(3):348–354, 1984. https://doi.org/10.1145/773453.808204
+[1] Papamarcos, M. S., & Patel, J. H. (1984). A low-overhead coherence solution for multiprocessors with private cache memories. *ISCA '84*.
+
+<a name="ref-gomem"></a>
+[15] The Go Memory Model. (2024). https://go.dev/ref/mem
 
 <a name="ref-amdahl"></a>
 [2] Amdahl, G. M. "Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities." *AFIPS Spring Joint Computer Conference*, pp. 483–485, 1967. https://doi.org/10.1145/1465482.1465560
@@ -510,22 +516,25 @@ We have presented the hardware-grounded derivation of each principal design deci
 <a name="ref-memc3"></a>
 [15] Fan, B., Andersen, D. G., and Kaminsky, M. "MemC3: Compact and Concurrent MemCache with Dumber Caching and Smarter Hashing." *USENIX NSDI*, 2013. https://www.cs.cmu.edu/~dga/papers/memc3-nsdi2013-abstract.html
 
-
 <a name="ref-dice"></a>
 [16] Dice, D., Kogan, A., and Lev, Y. "Understanding and Improving the Performance of Concurrent Applications." *USENIX*, 2013.
 
 <a name="ref-hitrate"></a>
-[17] Qiu, Z., Yang, J., and Harchol-Balter, M. "Why increasing the hit ratio can hurt cache throughput." *CMU Technical Report / Manuscript in Preparation*, 2026.
+
 
 <a name="ref-otter"></a>
 [18] Otter Authors. "Otter: A high performance concurrent cache in Go." *GitHub*, 2023. https://github.com/maypok86/otter
 
 ## 12. Reproducibility
-- **Platform Architecture**: Apple Silicon M2 ($L=128$)
-- **Go Version**: `go1.25.7 darwin/arm64`
-- **macOS Version**: macOS 14.5
-- **Machine RAM**: 64GB
-- **Repository**: Commit `4a4f126`
+
+* **Platform Architecture**: Apple Silicon M2 ($L=128$)
+* **Go Version**: `go1.25.7 darwin/arm64`
+* **macOS Version**: macOS 14.5
+* **Machine RAM**: 64GB
+* **Repository**: Commit `f826423b006c4df62cb1fc1ddfcf76eb2e9b0682`
+* **Comparator**: `github.com/maypok86/otter/v2 v2.0.0`
+* **Repetitions**: 10 independent runs; tables report the median.
+* **Environment**: `GOMAXPROCS=8`
 - **Commands**: 
   - Verification: `go test -race ./...`
   - Benchmarks: `go run benchmarks/write_heavy_bench.go`, `go run benchmarks/zipf_bench.go`
