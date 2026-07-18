@@ -1,6 +1,6 @@
 <div align="center">
 
-# liteLRU: A MESI-Conscious, Contention-Bounded Approximate LRU via Chunked Bitmask Eviction on Modern Multi-Core Hardware
+# liteLRU: A Coherence-Conscious, Contention-Bounded Approximate LRU via Chunked Bitmask Eviction on Modern Multi-Core Hardware
 
 **Author:** xDarkicex  
 **Affiliations:** libravdb · bitdev · zephyr-systems  
@@ -56,8 +56,8 @@ In this paper, we make the following contributions to concurrent cache design:
 
 `liteLRU` addresses this through two non-trivial architectural changes:
 
-1. **64-Way Set Associativity over Hash Maps**: The prior open-addressed lock-free designs considered by `liteLRU` use tombstones or comparable reclamation mechanisms during deletion to preserve concurrent probe sequences. When tombstones accumulate, lock-free maps are forced to perform global, cooperative compactions, resulting in large tail latency spikes (often >100ms) under heavy eviction load. `liteLRU` completely eliminates the hash map. Instead, it utilizes a hardware-inspired **64-way set associative architecture**. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). Evictions overwrite victims *in place* within the local set — there are no tombstones to compact, no probe sequences to preserve, and no background goroutine required.
-2. **SWAR Signature Scanning**: To instantly find a key within the 64-slot set without traversing arrays of strings, `liteLRU` maintains a `uint64` signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. An 8-bit signature carries a 1/256 per-slot false-positive probability. Across 8 slots per word, the expected false-positive rate per word is approximately $1 - (1 - 1/256)^8 \approx 3\%$. Any SWAR match is confirmed by a full string comparison before the entry is returned; false positives incur one extra comparison, not an incorrect response. Notably, 64 slots require 8 `uint64` signature words — exactly 64 bytes — fitting the entire signature metadata for a set in **one L1 cache line**, which is fetched once and eliminates redundant memory traffic during lookup.
+1. **64-Way Set Associativity over Hash Maps**: The prior open-addressed designs considered by `liteLRU` use tombstones or comparable reclamation mechanisms to preserve concurrent probe sequences. Their maintenance and reclamation costs complicate predictable deletion behavior under sustained eviction. `liteLRU` instead overwrites a victim in place within a fixed set. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set").
+2. **SWAR Signature Scanning**: To instantly find a key within the 64-slot set without traversing arrays of strings, `liteLRU` maintains a `uint64` signature word per 8 slots. Each byte in the word represents an 8-bit hash signature. Lookups use SIMD Within A Register (SWAR) bitwise operations to scan 8 slots in a single CPU instruction, providing $O(1)$ L1-cache aligned lookups. An 8-bit signature carries a 1/256 per-slot false-positive probability. Across 8 slots per word, the expected false-positive rate per word is approximately $1 - (1 - 1/256)^8 \approx 3\%$. Any SWAR match is confirmed by a full string comparison before the entry is returned; false positives incur one extra comparison, not an incorrect response. Notably, 64 slots require 8 `uint64` signature words — exactly 64 bytes — and the 64-byte signature metadata fits within one $L$-byte coherence line on the evaluated platforms, which is fetched once and eliminates redundant memory traffic during lookup.
 
 To achieve this without sacrificing safety, `liteLRU` employs a **hybrid memory architecture**. High-frequency concurrency primitives (bitmasks, seqlocks) are allocated purely off-heap via anonymous `mmap` to eliminate GC tracing and write barriers entirely. Conversely, data arrays containing Go pointers (keys, values, and handler functions) remain on the standard Go heap. This separation ensures the GC can still safely track and collect dynamic strings or closures, completely avoiding dangling-pointer hazards while keeping the hot eviction path invisible to the GC.
 
@@ -67,7 +67,7 @@ To achieve this without sacrificing safety, `liteLRU` employs a **hybrid memory 
 
 The problem of concurrent cache design generally branches into two orthogonal domains: optimizing the eviction *policy* for higher hit rates, and optimizing the concurrent *mechanism* for lower CPU overhead. `liteLRU` is strictly a contribution to the latter.
 
-**Concurrent CLOCK Mechanisms.** The closest published system to `liteLRU` is MemC3 [[15]](#ref-memc3), which optimized Memcached by introducing a concurrent CLOCK with 1-bit recency tags and optimistic locking to remove mutexes from the read path. `liteLRU` builds on this foundation by applying it to the Go runtime (off-heap `mmap`, zero-allocation SoA), but replaces MemC3's sequential bit-checks with bulk 64-bit bitmask evaluations via hardware `CTZ` intrinsics, drastically reducing eviction scan latency.
+**Concurrent CLOCK Mechanisms.** The closest published system to `liteLRU` is MemC3 [[16]](#ref-memc3), which optimized Memcached by introducing a concurrent CLOCK with 1-bit recency tags and optimistic locking to remove mutexes from the read path. `liteLRU` builds on this foundation by applying it to the Go runtime (off-heap `mmap`, zero-allocation SoA), but replaces MemC3's sequential bit-checks with bulk 64-bit bitmask evaluations via hardware `CTZ` intrinsics, drastically reducing eviction scan latency.
 
 **Advanced Eviction Policies.** Recent systems like CAR, CLOCK-Pro [[13]](#ref-clockpro), S3-FIFO [[5]](#ref-s3fifo), and SIEVE [[6]](#ref-sieve) demonstrate that scan-resistant eviction policies can outperform strict LRU on web workloads. These policy innovations are generally orthogonal to the mechanism: a SIEVE or S3-FIFO algorithm still requires a concurrent implementation strategy to scale across cores without locking.
 
@@ -237,7 +237,7 @@ Because individual atomic stores do not provide cross-field consistency, the alg
 *Proof:* `findVictim` utilizes the `CTZ` instruction to identify eviction candidates. It attempts to claim a candidate via a Compare-And-Swap (CAS) on $W_k$. If the CAS fails due to concurrent writers, the thread retries. A hard limit of 10 retries is enforced. If 10 retries are exhausted, `findVictim` returns a failure sentinel and `Add` drops the admission entirely. This load-shedding rigorously bounds the maximum write-side work.
 
 **Theorem 3 (Safety Invariant).** *No two writers may simultaneously overwrite the same slot, and readers will never observe torn key/value pairs.*
-*Proof:* A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, atomically publishing the individual SoA fields, and incrementing $S_i$ to an even value. A reader verifying the sequence bounds $(S_{i, \text{start}} == S_{i, \text{end}})$ and $(S_i \pmod 2 == 0)$ alongside the independent atomic loads is guaranteed to never observe a torn or inconsistent set of fields for a single slot.
+*Proof:* A slot is exclusively claimed when a writer successfully sets its corresponding bit in the $W_k$ bitmask via CAS. The writer then invalidates the slot in $V_k$ before incrementing the seqlock $S_i$ to an odd value, atomically publishing the individual SoA fields, and incrementing $S_i$ to an even value. A reader atomically loads an even $S_{i,\text{start}}$, atomically loads every payload field, then atomically loads $S_{i,\text{end}}$. It accepts the snapshot only when $S_{i,\text{start}} = S_{i,\text{end}}$ and both are even; otherwise it returns a miss. Given serialized writers and sequentially consistent atomics, an accepted read cannot overlap a field-publication interval.
 
 ## 7. Cache-Line Padding to Eliminate False Sharing
 
@@ -267,7 +267,7 @@ The same argument applies to the statistics counters. Aggregating hits and misse
 
 ## 8. Benchmark Methodology and Artifacts
 
-Standard Go micro-benchmarks use `b.RunParallel`, distributing $b.N$ iterations across goroutines via an internal `pb.Next()` call—an atomic fetch-and-add on a shared 64-bit counter. When the operation under test completes in sub-10ns — as is typical for a cache hit — the benchmark overhead from the `pb.Next()` atomic dominates. The max is consistent with OS scheduling jitter on at least one of the 8 goroutines. According to Amdahl's Law, the maximum parallel speedup for a workload with sequential fraction $s$ across $N$ cores is:
+Standard Go micro-benchmarks use `b.RunParallel`, distributing $b.N$ iterations across goroutines via an internal `pb.Next()` call—an atomic fetch-and-add on a shared 64-bit counter. When the operation under test completes in sub-10ns — as is typical for a cache hit — the benchmark overhead from the `pb.Next()` atomic dominates. According to Amdahl's Law, the maximum parallel speedup for a workload with sequential fraction $s$ across $N$ cores is:
 
 $$S(N) = \frac{1}{s + \frac{1-s}{N}}$$
 
@@ -319,7 +319,7 @@ Measured with an inherent ~40ns `time.Now()` overhead per sample:
 | p99.9      | 1,334 ns  | ~1,294 ns                    |
 | Max        | ~6.3 ms   | —                            |
 
-The max is dominated by OS scheduling jitter on at least one of the 8 goroutines, not cache mechanics.
+The observed maximum is consistent with OS scheduling jitter on at least one of the eight goroutines; the experiment does not isolate its cause, not cache mechanics.
 
 ### 9.4 Ablation Study
 
@@ -361,7 +361,7 @@ To evaluate eviction fidelity under realistic skewed access patterns, we benchma
 | 75%      | **97.59%**          | 95.98%            | **98.74%**        | 90.50%          |
 | 95%      | **97.59%**          | **97.59%**        | **98.74%**        | 98.01%          |
 
-`liteLRU`'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's [[18]](#ref-otter) S3-FIFO-based eviction policy across all tested capacities. These hit-rate benchmarks were re-run against the current 64-way set associative codebase. The set associative design restricts each key to one of $N/64$ fixed sets, which could theoretically reduce hit rates if the hash function produces skewed set occupancy. In practice, the Zipfian distribution's natural clustering aligns well with set boundaries (e.g., under $s=0.8$ skew, average set occupancy across hot sets remains below 85% with negligible collision evictions), and the observed hit rates are consistent with the prior hash-map-based implementation. CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern. On strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. However, `liteLRU`'s throughput remains immune to the high hit-ratio contention pathology described by Qiu et al. [17].
+`liteLRU`'s bitmask-CLOCK approximation achieves superior or tied hit rates against Otter's [[18]](#ref-otter) S3-FIFO-based eviction policy across all tested capacities. These hit-rate benchmarks were re-run against the current 64-way set associative codebase. The set associative design restricts each key to one of $N/64$ fixed sets, which could theoretically reduce hit rates if the hash function produces skewed set occupancy. In practice, the Zipfian distribution's natural clustering aligns well with set boundaries (e.g., under $s=0.8$ skew, average set occupancy across hot sets remains below 85% with negligible collision evictions), and the observed hit rates are consistent with the prior hash-map-based implementation. CLOCK's recency tracking provides an advantage over S3-FIFO's frequency-aware admission at moderate skew (e.g. $s=0.8$) due to temporal locality in the access pattern. On strictly scan-resistant workloads (e.g., sequential looping), S3-FIFO is expected to outperform CLOCK approximations. 
 
 ### 9.7 Write-Heavy Workloads
 
@@ -372,7 +372,7 @@ We compare against Otter v2 rather than ristretto here because ristretto's hit-r
 | 50/50 Get/Add| **30,678,081**    | 6,345,600          | **4.83x** |
 | 20/80 Get/Add| **30,080,323**    | 4,083,792          | **7.36x** |
 
-`liteLRU` demonstrates a 4.8x to 7.4x throughput advantage under write-heavy pressure. At 80% writes, `otter` measured approximately 4M ops/sec in this workload. This outcome is consistent with the tradeoffs of asynchronous ingestion and buffering; identifying the contribution of individual internal mechanisms would require profiling. `liteLRU` sustains over 30M ops/sec by confining state mutations to localized, non-blocking bounded-attempt overwrites inside the 64-way associative sets.
+`liteLRU` demonstrates a 4.8x to 7.4x throughput advantage under write-heavy pressure. At 80% writes, `otter` measured approximately 4M ops/sec in this workload. This outcome is consistent with the tradeoffs of asynchronous ingestion and buffering; identifying the contribution of individual internal mechanisms would require profiling. `liteLRU` sustains over 30M ops/sec by confining state mutations to localized, CAS-based bounded-attempt admission overwrites inside the 64-way associative sets.
 
 A notable result is that the 50/50 and 20/80 workloads yield nearly identical throughput for `liteLRU` (~30M ops/sec). However, raw throughput must be contextualized by the load-shedding mechanism: in these extreme contention synthetic benchmarks, `liteLRU` deliberately drops approximately 5% of admissions in the 50/50 workload and 6.6% in the 20/80 workload to bound cache-admission retry work. This is a direct consequence of eliminating tombstones: in the old hash-map architecture, write-heavy loads triggered compaction cycles that significantly degraded throughput. In the 64-way set associative design, writes are bounded in-place operations with no table-wide rehash or compaction, so increasing write fraction did not materially degrade throughput in the evaluated 50/50 and 20/80 workloads.
 
@@ -398,7 +398,7 @@ Several results merit explicit discussion:
 
 **Throughput delta is modest (~8%).** `liteLRU` achieves 93,603 req/sec versus the no-cache baseline of 86,453 — an 8% gain. The in-process benchmarks in §9.1 and §9.7 show 2–7x advantages because they measure pure cache mechanics. At the HTTP layer, network I/O and TCP/HTTP parsing dominate the per-request budget, so the cache saves only the `json.Marshal` fraction. The modest gain is expected and confirms that the cache overhead is negligible rather than a bottleneck.
 
-**Otter's throughput is lower than no-cache (86,056 vs 86,453 req/sec).** Despite bypassing JSON marshaling on hits, `otter` is marginally slower than the baseline. This indicates that `otter`'s admission buffer overhead — background goroutines flushing the write buffer, mutex acquisition on hit promotion, and GC pressure from pointer-heavy internals — nearly cancels the JSON savings at this concurrency level. The cache adds latency, not just eliminates it.
+**Otter's throughput is lower than no-cache (86,056 vs 86,453 req/sec).** Despite bypassing JSON marshaling on hits, `otter` is marginally slower than the baseline. This result is consistent with the overheads and tradeoffs of its asynchronous cache design, but attributing the difference to individual internal mechanisms would require profiling.
 
 **Otter's 173.1 ms max latency is 4.9× worse than the no-cache baseline (35.1 ms).** This latency profile is consistent with the structural properties of amortized-buffer designs under concurrent pressure. `liteLRU` avoids it by performing all writes synchronously and in-place within the 64-slot set, with no background goroutine to be descheduled.
 
@@ -514,10 +514,10 @@ We have presented the hardware-grounded derivation of each principal design deci
 [14] Lameter, C. "Effective Synchronization on Linux/NUMA Systems." *Gelato Conference*, 2005. https://lameter.com/gelato2005.pdf
 
 <a name="ref-memc3"></a>
-[15] Fan, B., Andersen, D. G., and Kaminsky, M. "MemC3: Compact and Concurrent MemCache with Dumber Caching and Smarter Hashing." *USENIX NSDI*, 2013. https://www.cs.cmu.edu/~dga/papers/memc3-nsdi2013-abstract.html
+[16] Fan, B., Andersen, D. G., and Kaminsky, M. "MemC3: Compact and Concurrent MemCache with Dumber Caching and Smarter Hashing." *USENIX NSDI*, 2013. https://www.cs.cmu.edu/~dga/papers/memc3-nsdi2013-abstract.html
 
 <a name="ref-dice"></a>
-[16] Dice, D., Kogan, A., and Lev, Y. "Understanding and Improving the Performance of Concurrent Applications." *USENIX*, 2013.
+[17] Dice, D., Kogan, A., and Lev, Y. "Understanding and Improving the Performance of Concurrent Applications." *USENIX*, 2013.
 
 <a name="ref-hitrate"></a>
 
