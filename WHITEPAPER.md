@@ -352,7 +352,7 @@ To verify behavioral consistency across architectures, we evaluated `liteLRU` on
 |--------------|------:|-----------------:|
 | x86\_64       | 8     | 13,155,469       |
 
-*Note: The x86_64 evaluation was performed inside a Docker Desktop virtualized instance, which introduces nominal hypervisor overhead compared to bare-metal execution.*
+*Note: The x86_64 evaluation was executed within a virtualized Docker Desktop environment. Because hypervisor layers introduce non-deterministic scheduling jitter and distort cache-coherence traffic (such as Read-For-Ownership loops), these metrics are presented strictly as a functional and behavioral smoke test to verify cross-platform correctness of the atomic bitmask and TZCNT mechanics, rather than a bare-metal microarchitectural performance baseline.*
 
 ### 9.6 Zipfian Hit-Rate Evaluation
 

@@ -429,7 +429,7 @@ To verify behavioral consistency across architectures, we evaluated \texttt{lite
 \textbf{Architecture} & \textbf{Cores} & \textbf{Ops/sec (x86\_64)} \\ \midrule
 x86\_64               & 8              & 13{,}155{,}469                  \\ \bottomrule
 \end{tabular}
-\caption{Throughput on x86\_64 architecture. *Note: Evaluation performed inside a Docker Desktop virtualized instance, which introduces nominal hypervisor overhead compared to bare-metal execution.}
+\caption{Throughput on x86\_64 architecture. *Note: The x86\_64 evaluation was executed within a virtualized Docker Desktop environment. Because hypervisor layers introduce non-deterministic scheduling jitter and distort cache-coherence traffic (such as Read-For-Ownership loops), these metrics are presented strictly as a functional and behavioral smoke test to verify cross-platform correctness of the atomic bitmask and TZCNT mechanics, rather than a bare-metal microarchitectural performance baseline.*}
 \end{table}
 
 \subsection{Zipfian Hit-Rate Evaluation}
