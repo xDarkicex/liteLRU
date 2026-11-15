@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -335,12 +336,16 @@ func BenchmarkParallelLRUCache(b *testing.B) {
 	dummyHandler := func() {}
 
 	cache := NewLRUCache(1024, 20)
-	
+	var workerSeq atomic.Uint32
+
 	b.Run("ParallelMixedWorkload", func(b *testing.B) {
 		b.ResetTimer()
 		b.RunParallel(func(pb *testing.PB) {
-			// Local random to avoid lock contention on global rand
-			localSeed := uint32(0)
+			// Non-zero per-worker xorshift seed so each worker generates distinct keys.
+			localSeed := workerSeq.Add(1) * 0x9e3779b9
+			if localSeed == 0 {
+				localSeed = 1
+			}
 			fastRand := func() uint32 {
 				localSeed ^= localSeed << 13
 				localSeed ^= localSeed >> 17

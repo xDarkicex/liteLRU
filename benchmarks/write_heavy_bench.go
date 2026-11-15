@@ -52,6 +52,12 @@ func main() {
 
 		// liteLRU
 		lite := liteLRU.NewLRUCache(1024, 10)
+		var addAttempts int
+		for i := 0; i < numOps; i++ {
+			if !ops[i].isGet {
+				addAttempts++
+			}
+		}
 		start := time.Now()
 		var wg sync.WaitGroup
 		wg.Add(8)
@@ -70,8 +76,13 @@ func main() {
 		}
 		wg.Wait()
 		duration := time.Since(start)
-		_, _, drops, _ := lite.Stats()
-		fmt.Printf("liteLRU   Ops/sec: %d (Drops: %d)\n", int(float64(numOps)/duration.Seconds()), drops)
+		_, _, drops, ratio := lite.Stats()
+		effectiveOps := numOps - int(drops)
+		dropPct := float64(drops) / float64(addAttempts) * 100
+		fmt.Printf("liteLRU   Attempted Ops/sec: %d | Effective Ops/sec: %d | Drops: %d (%.2f%% of Adds) | Hit Rate: %.2f%%\n",
+			int(float64(numOps)/duration.Seconds()),
+			int(float64(effectiveOps)/duration.Seconds()),
+			drops, dropPct, ratio*100)
 
 		// Otter
 		otterCache, _ := otter.MustBuilder[string, any](1024).Build()
