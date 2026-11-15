@@ -3,7 +3,7 @@
 # liteLRU: A Coherence-Conscious, Contention-Bounded Cache for Managed Runtimes via Chunked Bitmasks
 
 **Author:** xDarkicex  
-**Affiliations:** libravdb · bitdev · zephyr-systems  
+**Affiliations:** libravdb · bitdev · LibraVDB, INC.
 **Contact:** git@libravdb.com  
 **Repository:** https://github.com/xDarkicex/liteLRU
 
