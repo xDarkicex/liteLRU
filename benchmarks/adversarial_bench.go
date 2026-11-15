@@ -9,21 +9,6 @@ import (
 	"github.com/xDarkicex/liteLRU"
 )
 
-func hashRoute(method, path string) uint64 {
-	hash := uint64(14695981039346656037)
-	for i := 0; i < len(method); i++ {
-		hash ^= uint64(method[i])
-		hash *= 1099511628211
-	}
-	hash ^= uint64('/')
-	hash *= 1099511628211
-	for i := 0; i < len(path); i++ {
-		hash ^= uint64(path[i])
-		hash *= 1099511628211
-	}
-	return hash
-}
-
 func main() {
 	fmt.Println("Running Adversarial & Controlled Stress Benchmarks...")
 
@@ -34,7 +19,7 @@ func main() {
 		var singleSetKeys []string
 		for i := 0; len(singleSetKeys) < 128; i++ {
 			p := fmt.Sprintf("/hotset/%d", i)
-			if hashRoute("GET", p)%numGroups == 0 {
+			if liteLRU.HashRoute("GET", p)%numGroups == 0 {
 				singleSetKeys = append(singleSetKeys, p)
 			}
 		}
@@ -77,7 +62,7 @@ func main() {
 		var keys []string
 		for i := 0; len(keys) < nKeys; i++ {
 			p := fmt.Sprintf("/bound/%d", i)
-			if hashRoute("GET", p)%numGroups == 0 {
+			if liteLRU.HashRoute("GET", p)%numGroups == 0 {
 				keys = append(keys, p)
 			}
 		}

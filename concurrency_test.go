@@ -2,9 +2,11 @@ package liteLRU
 
 import (
 	"fmt"
+	"math/bits"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 )
 
 func TestZeroAllocGet(t *testing.T) {
@@ -33,6 +35,15 @@ func TestZeroAllocGet(t *testing.T) {
 	})
 	if allocsMiss != 0 {
 		t.Fatalf("expected 0 allocs on Get miss, got %v", allocsMiss)
+	}
+
+	// Verify caller-supplied dst buffer is never mutated on a miss/failed lookup.
+	dst[0] = Param{Key: "sentinel", Value: "untouched"}
+	if _, _, ok := c.Get("GET", "/users/missing", dst[:0]); ok {
+		t.Fatal("unexpected hit on missing key")
+	}
+	if dst[0].Key != "sentinel" || dst[0].Value != "untouched" {
+		t.Fatalf("dst buffer mutated on miss: %+v", dst[0])
 	}
 }
 
@@ -182,5 +193,88 @@ func TestSingleSetAssociativityBoundary(t *testing.T) {
 	}
 	if _, _, ok := c.Get("GET", group0Paths[64], dst[:0]); !ok {
 		t.Fatal("expected 65th key to be present after eviction")
+	}
+}
+
+func TestLayoutInvariants(t *testing.T) {
+	if got := unsafe.Sizeof(chunk{}); got != 128 {
+		t.Fatalf("expected sizeof(chunk) == 128, got %d", got)
+	}
+	if off := unsafe.Offsetof(chunk{}.sigs); off != 0 {
+		t.Fatalf("expected offsetof(chunk.sigs) == 0, got %d", off)
+	}
+	if off := unsafe.Offsetof(chunk{}.valid); off != 64 {
+		t.Fatalf("expected offsetof(chunk.valid) == 64, got %d", off)
+	}
+	if got := unsafe.Sizeof(cacheEntry{}); got != 64 {
+		t.Fatalf("expected sizeof(cacheEntry) == 64, got %d", got)
+	}
+	if got := unsafe.Sizeof(statStripe{}); got != CacheLineSize {
+		t.Fatalf("expected sizeof(statStripe) == %d, got %d", CacheLineSize, got)
+	}
+}
+
+func TestS3FIFOScanResistanceAndGhostPromotion(t *testing.T) {
+	// Single-chunk cache (capacity 64) to isolate Small/Main + Ghost transitions deterministically.
+	c := NewLRUCache(64, 4)
+	defer c.Close()
+
+	// Admit 16 hot items into Small and hit each once (f0=1), then fill chunk with 48 filler keys
+	// so findVictim bulk-promotes hit Small items into Main while keeping unhit fillers in Small.
+	const hotN = 16
+	for i := 0; i < hotN; i++ {
+		k := fmt.Sprintf("/hot/%d", i)
+		c.Add("GET", k, nil, nil)
+		if _, _, ok := c.Get("GET", k, nil); !ok {
+			t.Fatalf("expected hot key %s to hit", k)
+		}
+	}
+	for i := 0; i < 48; i++ {
+		c.Add("GET", fmt.Sprintf("/fill/%d", i), nil, nil)
+	}
+
+	// Stream 128 one-hit scan items; Small absorbs the scan and Main retains all 16 hot items.
+	for i := 0; i < 128; i++ {
+		c.Add("GET", fmt.Sprintf("/scan/%d", i), nil, nil)
+	}
+	for i := 0; i < hotN; i++ {
+		if _, _, ok := c.Get("GET", fmt.Sprintf("/hot/%d", i), nil); !ok {
+			t.Fatalf("expected hot Main key /hot/%d to survive scan", i)
+		}
+	}
+
+	// Verify an evicted unhit Small key triggers Ghost admission directly into Main (prob=0).
+	chk := &c.chunks[0]
+	var probeKey string
+	for i := 0; i < 128; i++ {
+		k := fmt.Sprintf("/scan/%d", i)
+		h := hashRoute("GET", k)
+		if c.inGhost(chk, h) {
+			if _, _, ok := c.Get("GET", k, nil); !ok {
+				probeKey = k
+				break
+			}
+		}
+	}
+	if probeKey == "" {
+		t.Fatal("expected at least one evicted scan key present in chunk 0 Ghost filter")
+	}
+	c.Add("GET", probeKey, nil, nil)
+	// Locate probeKey in chunk 0 and check it entered Main (prob bit = 0, valid bit = 1).
+	foundMain := false
+	v := chk.valid.Load()
+	p := chk.prob.Load()
+	for v != 0 {
+		bit := uint32(bits.TrailingZeros64(v))
+		v &= v - 1
+		if ep := c.entries[bit].Load(); ep != nil && ep.path == probeKey {
+			if (p & (uint64(1) << bit)) == 0 {
+				foundMain = true
+			}
+			break
+		}
+	}
+	if !foundMain {
+		t.Fatalf("expected Ghost-hit key %s to be admitted directly to Main (prob=0)", probeKey)
 	}
 }

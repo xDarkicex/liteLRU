@@ -35,8 +35,8 @@
 }
 \lstset{style=mystyle}
 
-\title{\textbf{liteLRU: A Coherence-Conscious, Contention-Bounded Approximate LRU via\\
-Chunked Bitmask Eviction on Modern Multi-Core Hardware}}
+\title{\textbf{liteLRU: A Coherence-Conscious, Contention-Bounded Cache for\\
+Managed Runtimes via Chunked Bitmasks}}
 \author{
   xDarkicex \\
   \small Affiliations: libravdb $\cdot$ bitdev $\cdot$ LibraVDB, INC. \\
@@ -50,7 +50,7 @@ Chunked Bitmask Eviction on Modern Multi-Core Hardware}}
 \maketitle
 
 \begin{abstract}
-Concurrent approximate LRU structures often serialize cores on shared metadata. We investigate whether a bounded-probe, 64-way set-associative cache combining bit-parallel CLOCK recency tracking, padded seqlocks, and contention-aware admission load-shedding can deliver predictable concurrency costs without centralized locking in a garbage-collected runtime. We present \texttt{liteLRU}, a fixed-capacity cache in Go whose synchronization metadata (seqlocks, bitmasks, and SWAR signatures) resides in off-heap \texttt{mmap} memory while pointer-bearing payloads remain on the Go heap behind single-word \texttt{atomic.Pointer} wrappers to immutable values. Reads provide lock-free bounded-probe execution with zero heap allocations on hits when supplied a caller buffer; writes are best-effort, non-linearizable cache insertions/updates capping per-claim ownership CAS retries at $R=10$ (leaving post-claim signature-word CAS retries outside $R$). Across 10-run hardened evaluations on an 8-core Apple M2 (24 GB RAM), \texttt{liteLRU} sustains 21.60M--27.97M ops/s under 80/20 workloads ($1.38\times$ \texttt{otter v1.2.4} and $3.02\times$ \texttt{Mutex LRU} on the uniform baseline, with 1.69~\textmu s sampled p99), trails \texttt{otter} (33.64M vs.\ 94.27M) on ultra-read-dominated insert-on-miss lookups (99.94\% hits), and sustains 19.20M--21.83M effective ops/s under direct write-heavy contention while shedding 2.36--3.07\% of \texttt{Add} attempts (\S 9.1, \S 9.4, \S 9.7).
+Concurrent approximate LRU structures often serialize cores on shared metadata. We investigate whether a bounded-probe, 64-way set-associative cache combining bit-sliced S3-FIFO eviction, single-pointer immutable payloads, and contention-aware admission load-shedding can achieve both high scan-resistant hit rates and predictable concurrency costs without centralized locking in a garbage-collected runtime. We present \texttt{liteLRU} (v2), a fixed-capacity cache in Go whose compact synchronization metadata (SWAR signatures, Small/Main partitions, 2-bit bit-sliced frequencies, 128-bit Ghost Bloom filter, and writer ownership masks) packs into 128-byte off-heap \texttt{mmap} chunks (2~bytes/slot), while key/value snapshots reside on the Go heap behind a single \texttt{atomic.Pointer[cacheEntry]} per slot (8~bytes/slot). Reads provide lock-free bounded-probe execution with zero heap allocations on hits when supplied a caller buffer and never mutate that buffer on misses; writes are best-effort, non-linearizable cache insertions/updates capping per-slot ownership CAS retries at $R=10$. Across 10-run hardened evaluations on an 8-core Apple M2 (24 GB RAM), \texttt{liteLRU} sustains \textbf{51.32M~ops/s} on the uniform 80/20 baseline ($3.14\times$ \texttt{otter v1.2.4} and $7.29\times$ \texttt{Mutex LRU}, with 500~ns sampled p99 vs.\ 9.90~\textmu s for \texttt{otter}), leads \texttt{otter} across both immutable insert-on-miss workloads (\textbf{128.59M vs.\ 113.74M~ops/s} at $N=1\text{k}$; \textbf{56.29M vs.\ 9.12M~ops/s} at \texttt{cap=16384, N=100k}) and direct overwrite contention (\textbf{26.57M--32.51M} effective ops/s, $5.33\times\text{--}6.58\times$ \texttt{otter}), achieves higher matched-capacity Zipfian hit rates than \texttt{otter} across all six $(s, \text{cap})$ points ($+0.05$ to $+2.38\text{ pp}$), and delivers a $1.30\times$ end-to-end throughput advantage under an explicit 5~\textmu s backend miss penalty (\S 9.1, \S 9.6, \S 9.7).
 \end{abstract}
 
 \section{Background: The Hardware Model}
@@ -63,330 +63,186 @@ Modern multi-core processors organize memory into private L1 caches (typically 3
 
 The fundamental unit of coherency is the \textbf{cache line}, dependent on the target platform architecture (e.g., $L=64$ bytes on x86\_64, $L=128$ bytes on Apple Silicon). The CPU never fetches individual bytes; it fetches and writes back entire $L$-byte coherence lines.
 
-\subsection{The MESI Coherency Protocol}
+\subsection{Coherence and False Sharing}
 
-The MESI protocol (Modified, Exclusive, Shared, Invalid) was introduced by Papamarcos and Patel~\cite{mesi1984} to maintain coherency across private caches in a multi-processor system. The relevant state transitions are:
+We use MESI terminology (Modified, Exclusive, Shared, Invalid)~\cite{mesi1984} as an explanatory model for cache-coherence traffic on common shared-memory multiprocessors. The implementation depends only on the general property that writes to a shared coherence granule require exclusive ownership and invalidate copies held by other cores; exact protocol states and instruction costs are microarchitecture-specific.
 
-\begin{itemize}
-    \item A line held in \textbf{Shared} state by multiple cores transitions to \textbf{Invalid} in all other cores when any single core writes to it.
-    \item A write to an \textbf{Invalid} line requires a Read For Ownership (RFO)---a broadcast on the CPU interconnect requesting exclusive ownership from all other cores.
-\end{itemize}
-
-The critical consequence is \textbf{false sharing}~\cite{falsesharing1993}: if two independent variables, accessed concurrently by two different cores, reside on the same $L$-byte coherence line, a write by one core forces an RFO on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
+The critical consequence is \textbf{false sharing}~\cite{falsesharing1993}: if two independent variables, accessed concurrently by two different cores, reside on the same $L$-byte coherence line, a write by one core forces an ownership transfer on the other core's copy, even though the second core is accessing a logically unrelated variable. This is a pure hardware serialization artifact with no algorithmic solution other than spatial separation.
 
 \subsection{Atomics and Memory Ordering Cost}
 
-Atomic operations (\texttt{CAS}, fetch-and-add) on a memory location whose cache line is not in the M (Modified) state require:
-\begin{enumerate}
-    \item An MESI state transition to Exclusive via RFO.
-    \item The atomic read-modify-write in the modified cache line.
-\end{enumerate}
-
-Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on RFO round-trips. As core count $N$ grows, the wait time for the contested line degrades superlinearly due to RFO round-trip amplification~\cite{dice}, a fact formalized by Amdahl~\cite{amdahl1967}. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit~\cite{lockfree2004}.
+Atomic operations (\texttt{CAS}, fetch-and-add) on a shared memory location generally require exclusive ownership of the coherence line via an RFO transfer before executing the atomic read-modify-write. Under high concurrency, a single globally contested atomic (e.g., a global clock-hand pointer) causes every participating core to serialize on coherence round-trips~\cite{dice,amdahl1967}. The lock-free design methodology necessary to escape this bound is treated extensively by Herlihy and Shavit~\cite{lockfree2004}.
 
 \subsection{Research Question and Contributions}
-CLOCK, set associativity, compact signatures, and seqlocks are well-established primitives; \texttt{liteLRU} does not propose a new eviction policy. Instead, we investigate whether a bounded-probe, 64-way set-associative cache using bit-parallel recency tracking, padded seqlocks, and contention-aware admission can provide predictable concurrency costs without centralized locking in a garbage-collected runtime. Separating \textbf{Safety}, \textbf{Progress} (lock-free bounded-probe reads and retry-bounded, best-effort writes), and \textbf{Performance}, we make the following contributions:
+Set associativity, SWAR signatures, S3-FIFO queues, and stack-sharded counters are established systems building blocks; \texttt{liteLRU} contributes their lock-free, bit-parallel integration for managed runtimes. Specifically, we investigate whether a bounded-probe, 64-way set-associative cache using bit-sliced S3-FIFO state in 128-byte chunks, single-pointer immutable entries, and stack-sharded telemetry can simultaneously deliver lock-free throughput, scan resistance, and compact metadata in Go. Separating \textbf{Safety} (no torn payloads, invalid pointer exposure, unsynchronized mutation, or failed-read buffer corruption), \textbf{Progress} (lock-free bounded-probe reads and retry-bounded, best-effort writes), and \textbf{Performance}, we make four contributions:
 \begin{itemize}
-    \item \textbf{Contention-Bounded Set-Associative Mechanism:} A 64-way set associative architecture utilizing chunked bitmasks and hardware \texttt{CTZ}, eliminating global clock hands and open-addressed tombstone maintenance.
-    \item \textbf{Hybrid Memory Architecture:} Off-heap \texttt{mmap} allocation for pointer-free lock-free synchronization state (bitmasks, signatures, seqlocks) combined with on-heap \texttt{atomic.Pointer} SoA arrays to immutable values so the Go GC safely traces live strings, closures, and parameter slices.
-    \item \textbf{Padded Seqlocks:} A cache-line-aligned structural layout using monotonic 64-bit seqlocks that yields lock-free bounded-probe reads and eliminates false sharing across per-slot \texttt{slotState} sequence counters (and per-stripe \texttt{statStripe} counters).
-    \item \textbf{Load-Shedding Best-Effort Admission Protocol:} A contention-bounded, non-linearizable write protocol that caps per-claim ownership CAS retries to $R=10$ attempts (with post-claim signature-word CAS updates outside $R$); under sustained contention, admission or redundant updates may be dropped rather than spinning unboundedly.
+    \item \textbf{Bitmask S3-FIFO within 64-Way Chunks:} A lock-free S3-FIFO eviction engine (Small/Main partition mask \texttt{prob}, 2-bit bit-sliced saturating frequencies \texttt{f0}/\texttt{f1}, 128-bit resetting Ghost Bloom filter \texttt{ghost0}/\texttt{ghost1}, and dual 6-bit rotating hands \texttt{hand}/\texttt{handM}) packed alongside 64 byte signatures inside a single 128-byte off-heap \texttt{chunk} (2~B/slot), advancing via hardware \texttt{CTZ}.
+    \item \textbf{Single-Pointer Immutable Entries (Seqlock Elimination):} Collapsing the earlier 128-byte padded per-slot seqlocks and 4-slice SoA arrays into one \texttt{entries []atomic.Pointer[cacheEntry]} array (8~B/slot) pointing to immutable 64-byte \texttt{cacheEntry} snapshots (10~B/slot total fixed metadata vs.\ 162~B/slot in v1 on ARM64), eliminating multi-array L1D misses, seqlock retries, failed-read \texttt{dst} mutation, and any 64-bit generation wraparound assumption.
+    \item \textbf{Sub-Line Layout \& Stack-Sharded Telemetry:} Splitting read-mostly \texttt{sigs} $[0,64)$ from mutating control bitmasks $[64,128)$ inside every \texttt{chunk}, and sharding counters across 128 cache-line-padded \texttt{statStripe} slots indexed by 2~KB-aligned goroutine stack pointers (\texttt{sp >> 11}) rather than key hashes---preventing cross-core counter ping-pong on skewed hot keys.
+    \item \textbf{Load-Shedding Best-Effort Admission Protocol:} A contention-bounded, non-linearizable write protocol capping per-claim ownership CAS retries on $W_k$ to $R=10$ attempts (with post-claim signature-word CAS retries scoped outside $R$).
 \end{itemize}
 
-The rest of this paper is structured as follows: Section~\ref{sec:hybrid} details the hybrid memory architecture and 64-way set-associative SWAR design, Section~\ref{sec:related} discusses related work, Section~\ref{sec:soa} motivates the Structure-of-Arrays layout, and the remaining sections analyze the eviction algorithm, safety, and performance.
+The rest of this paper is structured as follows: Section~\ref{sec:hybrid} details the hybrid memory layout and SWAR filtering, Section~\ref{sec:related} discusses related work, Section~\ref{sec:soa} explains the control-plane vs.\ payload layout tradeoff, and the remaining sections analyze Bitmask S3-FIFO, correctness, coherence-line isolation, and evaluation.
 
-\section{Hybrid Memory Architecture and 64-Way Set Associative SWAR}
+\section{Hybrid Memory Architecture and GC Isolation}
 \label{sec:hybrid}
 
-Go's garbage collector (GC) is a concurrent tri-color mark-and-sweep~\cite{gogc2018}. It introduces three categories of tail-latency interference directly relevant to a cache implementation:
+Go's garbage collector is a concurrent tri-color mark-and-sweep~\cite{gogc2018}. An earlier \texttt{liteLRU} v1 prototype maintained off-heap \texttt{slotState} seqlocks (128~B/slot on ARM64) plus four separate heap \texttt{atomic.Pointer} arrays (\texttt{methods}, \texttt{paths}, \texttt{handlers}, \texttt{params} = 32~B/slot), bloating fixed metadata to 162~B/slot and requiring up to four wrapper allocations and dereferences per entry.
 
-\begin{itemize}
-    \item \textbf{Write Barrier Overhead.} The GC requires write barriers on every pointer store to maintain the tri-color invariant. For a structure that stores handler function pointers or string headers, every \texttt{Add} operation incurs GC bookkeeping cost proportional to the number of pointer-typed fields written.
-    \item \textbf{Stop-the-World Pauses.} While modern Go GC pause times are sub-millisecond, they are non-zero and non-deterministic. For a component targeting p99.9 tail latency in the low-microsecond range, any unpredictable pause invalidates latency guarantees.
-    \item \textbf{Mark-Phase Heap Pressure.} A cache holding thousands of string values generates a large root set for the GC to scan during the mark phase, increasing mark duration proportionally with capacity.
-\end{itemize}
-
-\texttt{liteLRU} addresses this through two non-trivial architectural changes:
+\texttt{liteLRU} v2 pairs compact off-heap control chunks (2~B/slot) with single-pointer immutable \texttt{cacheEntry} snapshots (8~B/slot array overhead) through three architectural choices:
 
 \begin{enumerate}
-    \item \textbf{64-Way Set Associativity over Hash Maps:} The prior open-addressed designs considered by \texttt{liteLRU} use tombstones or comparable reclamation mechanisms to preserve concurrent probe sequences. Their maintenance and reclamation costs complicate predictable deletion behavior under sustained eviction. \texttt{liteLRU} instead overwrites a victim in place within a fixed set. An incoming route hash is mathematically mapped to a specific 64-slot bucket (a "set"). 
-    \item \textbf{SWAR Signature Scanning:} To filter candidate slots within a 64-slot set before dereferencing heap pointers, \texttt{liteLRU} maintains a \texttt{uint64} signature word per 8 slots. Each byte in the word stores an 8-bit hash signature. SWAR-style scalar bitwise operations test eight 8-bit signatures per machine word, reducing pointer dereferences and branchy per-slot comparisons before full-key verification. Lookups are bounded by fixed 64-way associativity. Each SWAR byte match is verified with a full string comparison; false positives incur extra key comparisons across colliding slots, never an incorrect response. Layout-wise, \texttt{sigs} is a contiguous 64-byte \texttt{[8]atomic.Uint64} array placed at byte offset 32 inside each 128-byte \texttt{chunk} (following \texttt{valid}, \texttt{accessed}, \texttt{writing}, and an 8-byte pad). Because \texttt{chunks} is page-aligned via \texttt{mmap} and $\text{sizeof}(\texttt{chunk})=128$, \texttt{sigs} lies entirely within bytes $[32,96)$ of a single 128-byte coherence line on Apple Silicon (one fetch) and spans $[32,64)$ and $[64,96)$ on 64-byte x86\_64 lines (two fetches). Evictions are restricted to the local 64-slot set, overwriting pointers in place and eliminating tombstones entirely.
+    \item \textbf{64-Way Set Associativity over Hash Maps:} Prior open-addressed designs considered for \texttt{liteLRU} require tombstones or epoch reclamation to preserve concurrent probe sequences. \texttt{liteLRU} instead overwrites a victim in place within a fixed 64-slot bucket selected by \texttt{HashRoute(method, path) \& (numGroups - 1)} via zero-allocation 8B/4B string mixing (\texttt{mixString}).
+    \item \textbf{SWAR Signature Scanning:} Before dereferencing heap \texttt{cacheEntry} pointers, each \texttt{chunk} starts (bytes $[0,64)$) with \texttt{[8]atomic.Uint64} \texttt{sigs}, packing 64 non-zero 8-bit signatures (\texttt{sig8 = uint8(hash >> 32)}, clamped from 0 to 1). SWAR arithmetic tests 8~byte signatures per machine word gated by \texttt{validBits}; a byte match ($\sim 1/255$ per valid slot, $\sim 3.1\%$ per 8-slot word) triggers one \texttt{atomic.Pointer[cacheEntry]} load and full \texttt{(method, path)} string comparison. False positives never yield incorrect responses.
+    \item \textbf{Micro-Metadata Off-Heap vs.\ Immunized Payloads:} Each \texttt{chunk} occupies 128~bytes (\texttt{sigs} at $[0,64)$ and control masks + hands at $[64,128)$) inside page-aligned anonymous \texttt{mmap} memory, while \texttt{entries []atomic.Pointer[cacheEntry]} remains on the Go heap for safe GC tracing. Eliminating v1's 8.1~MiB of per-slot seqlocks leaves only 128~KiB of chunk control state at 65,536 slots, making Go runtime GC overhead near-minimal across pacing regimes (\S 9.12).
 \end{enumerate}
 
 \section{Related Work}
 \label{sec:related}
 
-The problem of concurrent cache design generally branches into two orthogonal domains: optimizing the eviction \textit{policy} for higher hit rates, and optimizing the concurrent \textit{mechanism} for lower CPU overhead. \texttt{liteLRU} is strictly a contribution to the latter.
+Concurrent cache design spans two complementary axes: the eviction \textit{policy} governing hit rates, and the concurrent \textit{mechanism} governing synchronization cost. \texttt{liteLRU} v2 advances the mechanism axis---executing \textbf{both} lookup filtering and S3-FIFO state transitions via lock-free 64-bit bitmasks without locks, global hands, or background eviction threads.
 
-\textbf{Concurrent CLOCK Mechanisms.} The closest published system to \texttt{liteLRU} is MemC3~\cite{memc3}, which optimized Memcached by introducing a concurrent CLOCK with 1-bit recency tags and optimistic locking to remove mutexes from the read path. \texttt{liteLRU} builds on this foundation by applying it to the Go runtime (off-heap mmap, zero-allocation SoA), but replaces MemC3's sequential bit-checks with bulk 64-bit bitmask evaluations via hardware \texttt{CTZ} intrinsics, drastically reducing eviction scan latency.
+\textbf{Concurrent CLOCK Mechanisms.} The closest published system to \texttt{liteLRU} is MemC3~\cite{memc3}, which introduced concurrent CLOCK with 1-bit recency tags and optimistic locking to remove mutexes from reads. Our v1 prototype adapted MemC3 to Go with off-heap seqlocks and bulk \texttt{CTZ} scans over 1-bit CLOCK masks, while v2 replaces seqlocks with single immutable \texttt{atomic.Pointer} snapshots and upgrades 1-bit CLOCK to multi-bit bit-sliced S3-FIFO inside the same 128-byte chunk.
 
-\textbf{Advanced Eviction Policies.} Recent systems like CAR, CLOCK-Pro~\cite{clockpro2005}, S3-FIFO~\cite{s3fifo2023}, and SIEVE~\cite{sieve2024} demonstrate that scan-resistant or frequency-aware eviction policies outperform 1-bit CLOCK~\cite{clock1969} on web workloads. These policy innovations are largely orthogonal to the mechanism: a SIEVE or S3-FIFO algorithm still requires a concurrent implementation strategy to scale across cores without locking.
+\textbf{S3-FIFO \& Scan-Resistant Policies.} Policies such as CAR, CLOCK-Pro~\cite{clockpro2005}, S3-FIFO~\cite{s3fifo2023}, and SIEVE~\cite{sieve2024} prevent one-hit scans from flushing hot sets. Production S3-FIFO caches like \texttt{otter}~\cite{otter} use ring buffers, mutex-guarded eviction queues, striped read buffers, and background draining. \texttt{liteLRU} v2 realizes S3-FIFO natively inside lock-free per-chunk bitmasks (\texttt{prob}, \texttt{f0}, \texttt{f1}, \texttt{hand}, \texttt{handM}, \texttt{ghost0}/\texttt{ghost1}) advancing inline via hardware \texttt{CTZ}.
 
-\textbf{Production Go Caches.} Existing Go caches like \texttt{freecache}, \texttt{bigcache}, and \texttt{ristretto} achieve high throughput via sharding and background eviction goroutines. \texttt{liteLRU} takes a different approach: rather than amortizing eviction cost over background threads or coarse-grained shard locks, \texttt{liteLRU} eliminates the locking overhead on lookups via bitmask mathematics and seqlocks, enabling lock-free bounded-probe reads with retry-bounded, best-effort writes.
+\textbf{Production Go Caches.} Existing Go caches like \texttt{freecache}, \texttt{bigcache}, and \texttt{ristretto} amortize eviction via sharding or background goroutines; \texttt{liteLRU} executes lock-free bounded-probe reads and retry-bounded ($R=10$) inline admissions.
 
-\section{Why Structure of Arrays over Array of Structs}
+\section{Control-Plane Bit-Slicing vs.\ Single-Pointer Snapshots}
 \label{sec:soa}
 
-\textit{Note on Set Associativity:} Software caches traditionally use open-addressed hash maps, whereas hardware L1/L2 caches use $N$-way set associativity. \texttt{liteLRU} applies this hardware-style set associative design in software to bypass the global locking overhead of hash maps entirely.
+\textit{Note on Set Associativity:} Software caches traditionally use open-addressed hash maps, whereas hardware L1/L2 caches use $N$-way set associativity. \texttt{liteLRU} applies hardware-style set associativity in software to eliminate global hash-table locking and tombstone chains entirely.
 
-
-The conventional cache entry is represented as an Array of Structs (AoS):
-
-\begin{lstlisting}[language=Go]
-// AoS: one struct per entry
-type Entry struct {
-    method  string     // 16 bytes (ptr + len)
-    path    string     // 16 bytes
-    handler uintptr    // 8 bytes
-    params  []Param    // 24 bytes
-}
-// In memory: [entry0 | entry1 | entry2 | ...]
-\end{lstlisting}
-
-Consider a \texttt{Get} operation that must validate $n$ candidate entries by comparing their \texttt{method} and \texttt{path} fields. In AoS, each entry occupies $\sim$64+ bytes. Accessing the \texttt{method} field of entry $i$ and entry $i+1$ requires fetching two separate $L$-byte cache lines. For $n$ entries, the cache-line cost is $n$ fetches just for a single field.
-
-The Structure of Arrays (SoA) alternative, widely employed in high-performance and SIMD-oriented computing~\cite{soasimd2009}, separates fields into parallel arrays (illustrated conceptually first, alongside the actual hardened \texttt{atomic.Pointer} Go fields):
+In our v1 prototype, we separated the four payload fields into four heap \texttt{atomic.Pointer} arrays (32~B/slot) protected by 128-byte padded \texttt{slotState} seqlocks (162~B/slot total on ARM64). Empirical ablation exposed a clear distinction between control-plane bit-slicing and payload SoA in Go:
 
 \begin{lstlisting}[language=Go]
-// Conceptual SoA layout (16-byte string headers, 8-byte function/pointer fields)
-methods  []string    // contiguous conceptual layout
-paths    []string
-handlers []uintptr
-
-// Actual hardened liteLRU Go representation: 8-byte single-word atomic.Pointer slices
+// v1 payload SoA (32 B/slot across 4 arrays + 128 B/slot seqlocks)
 methods  []atomic.Pointer[string]
 paths    []atomic.Pointer[string]
 handlers []atomic.Pointer[HandlerFunc]
 params   []atomic.Pointer[[]Param]
+
+// v2 split: bit-sliced control plane off-heap (2 B/slot) + single-pointer snapshot (8 B/slot)
+type cacheEntry struct { // 64 bytes immutable snapshot on Go heap
+    method  string
+    path    string
+    handler HandlerFunc
+    params  []Param
+}
+entries []atomic.Pointer[cacheEntry] // 8 pointers per 64B line, 16 per 128B line
 \end{lstlisting}
 
-In \texttt{liteLRU}'s actual Go implementation, each SoA slot element is a single 8-byte \texttt{atomic.Pointer}, packing 8 pointers per 64-byte cache line (16 per 128-byte line) and avoiding struct padding waste between heterogeneous fields when scanning candidate indices. Note that reading a string key still requires dereferencing the immutable \texttt{*string} pointer after a SWAR signature match, making SWAR pre-filtering crucial when chunks are densely populated.
+Placing signatures and S3-FIFO recency/frequency state in off-heap \texttt{uint64} bitmasks gives $64\times$ packing so aging, promotion, and \texttt{CTZ} selection touch only a single 128-byte chunk. Conversely, collapsing the four payload wrappers into one immutable 64-byte \texttt{cacheEntry} behind \texttt{entries []atomic.Pointer[cacheEntry]} packs 8 slot pointers per 64B line (16 per 128B line), shrinks fixed per-slot arrays by $16.2\times$ (10~B/slot vs.\ 162~B/slot on ARM64), turns four heap allocations per insert into one \texttt{cacheEntry} allocation, and eliminates the \texttt{Get} seqlock retry loop altogether. For $n$ matching candidates in a chunk, v2 fetches $\lceil (a + n \cdot 8\text{ B}) / L \rceil$ lines from \texttt{entries} plus only the matching \texttt{cacheEntry}.
 
-Formally, let $W_f$ be the width of field $f$ and $L$ be the target platform's coherence-line size. For AoS, the number of cache lines fetched to access field $f$ across $n$ consecutive entries depends heavily on padding and struct size. If $\text{sizeof}(\text{Entry}) \le L$ and the compiler naturally packs them, we approximate the cost as fetching one new cache line per entry:
+\section{Bitmask S3-FIFO: From One Bit to Bit-Sliced Chunk Queues}
 
-\begin{equation}
-\text{Lines}_{AoS}(n, f) \approx n
-\end{equation}
+\subsection{The Cost of Pointer-Based Queues}
 
-For SoA, values are packed contiguously. Accounting for an arbitrary unaligned start offset $a$ within a coherence line ($0 \le a < L$):
+Traditional LRU~\cite{lru1965} maintains doubly-linked lists requiring 8 pointer writes per promotion behind a mutex, while canonical S3-FIFO~\cite{s3fifo2023} maintains three concurrent queues (Small FIFO, Main FIFO, Ghost FIFO). Protecting linked structures with mutexes serializes accesses, and lock-free pointer queues require epoch-based reclamation or background drainer goroutines to reclaim removed nodes safely~\cite{lockfree2004}.
 
-\begin{equation}
-\text{Lines}_{SoA}(n, f) = \left\lceil \frac{a + n \cdot W_f}{L} \right\rceil
-\end{equation}
+\subsection{Bit-Sliced S3-FIFO Inside 128-Byte Chunks}
 
-Since $W_f \ll \text{sizeof}(\text{Entry})$ for any individual field, we have $\text{Lines}_{SoA}(n, f) \ll \text{Lines}_{AoS}(n, f)$ for sufficiently large $n > 1$.
-
-\section{Why Bitsets for Recency Tracking}
-
-\subsection{The Cost of Pointer-Based Recency}
-
-Traditional LRU~\cite{lru1965} tracks recency by maintaining a doubly-linked list ordered from Most Recently Used (MRU) to Least Recently Used (LRU). A cache hit requires:
-\begin{enumerate}
-    \item Unlinking the accessed node from its current position: 4 pointer writes.
-    \item Relinking it at the MRU head: 4 pointer writes.
-\end{enumerate}
-
-Each of these pointer writes on a concurrent system must be protected by a mutual exclusion lock, serializing all \texttt{Get} operations system-wide. Lock-free linked-list variants exist but require hazard pointers or epoch-based reclamation to prevent use-after-free races~\cite{lockfree2004}, reintroducing serialization on shared epoch counters.
-
-\subsection{CLOCK as an Approximation}
-
-The foundational CLOCK algorithm~\cite{clock1969} approximates LRU by abandoning exact recency ordering (later extended by scan-resistant designs such as CLOCK-Pro~\cite{clockpro2005}). Instead of tracking \textit{which} entry is least recently used, 1-bit CLOCK tracks \textit{whether} each entry has been accessed since the last eviction sweep---a single bit per entry.
+In v1, each chunk used a single bit $A_k$ (1-bit CLOCK~\cite{clock1969}), which lacked scan resistance (0/256 retained in \S 9.11) and collapsed to 0.00\% on a 65-key cyclic loop. \texttt{liteLRU} v2 embeds a full \textbf{S3-FIFO} replacement policy inside each 64-slot chunk's second 64~bytes ($[64,128)$) via orthogonal 64-bit masks and two 6-bit rotating hands (\texttt{hand}, \texttt{handM}):
 
 \begin{itemize}
-    \item Upon \texttt{Get}: the entry's reference bit is set to 1 via an atomic OR.
-    \item Upon eviction: a hand sweeps the array. Reference bit 1 is cleared to 0 (second chance). Reference bit 0 designates the eviction victim.
+    \item $V_k \in \{0,1\}^{64}$ (\texttt{valid}): bit $i = 1$ iff slot $i$ holds a published entry.
+    \item $P_k \in \{0,1\}^{64}$ (\texttt{prob}): bit $i = 1$ iff valid slot $i$ belongs to the Small probationary queue; $M_k = V_k \land \neg P_k$ is the Main protected queue.
+    \item $(F_{1,k}, F_{0,k}) \in \{0,1\}^{64} \times \{0,1\}^{64}$ (\texttt{f1}, \texttt{f0}): 2-bit bit-sliced saturating frequency ($00 \to 01 \to 11$). Reads skip atomic writes when the target frequency bit is already set.
+    \item $W_k \in \{0,1\}^{64}$ (\texttt{writing}): bit $i = 1$ iff a writer exclusively owns slot $i$.
+    \item $(G_{0,k}, G_{1,k})$ (\texttt{ghost0}, \texttt{ghost1}): a 128-bit double-hashed Ghost Bloom filter reset automatically when $\text{popcount}(\texttt{ghost0}) \ge 34$.
+    \item \texttt{hand}, \texttt{handM} $\in \{0 \dots 63\}$: rotating 6-bit offsets for Small and Main circular selection via hardware \texttt{CTZ}~\cite{inteltzcnt,armclz}.
 \end{itemize}
 
-This approximates LRU behavior without pointer manipulation, requiring only non-blocking atomic bitwise operations. Recent research such as S3-FIFO~\cite{s3fifo2023} and SIEVE~\cite{sieve2024} further refines the eviction policy. However, these works do not address the parallel execution cost of the eviction mechanism itself, which is the problem we solve.
+Upon eviction (\texttt{findVictim(k)}, \texttt{smallTarget = 4}), v2 checks empty slots ($\neg V_k \land \neg W_k$) first, then promotes touched Small entries across all 64 slots in $\mathcal{O}(1)$ via \texttt{hitSmall = (prob \& valid) \& f0} (clearing \texttt{prob}, \texttt{f0}, and \texttt{f1} on promoted slots), evicts unhit Small slots if $\text{popcount}(\texttt{prob}) \ge 4$ (recording their hashes into \texttt{ghost0}/\texttt{ghost1}), or else scans/ages only Main entries via \texttt{handM}. Ghost hits on admission enter Main directly ($P_k[i]=0$); cold misses enter Small ($P_k[i]=1$). Unsuccessful CAS/aging iterations are capped at $R=10$, returning \texttt{0xFFFFFFFF} to shed load under single-chunk saturation.
 
-\subsection{From One Bit to One 64-bit Integer}
+\subsection{Eliminating Global Locks and Shared Hands}
 
-Standard CLOCK still maintains a global clock-hand pointer---an atomic integer indicating the current sweep position. Every eviction increments this counter and examines a single entry. Under high concurrency, all evicting threads contend on this single atomic, creating repeated coherence ownership transfers under contention.
-
-The key observation: if we partition the cache into chunks of exactly 64 entries, the valid state and access state of all 64 entries in a chunk fit into two 64-bit integers:
-
-\begin{itemize}
-    \item $V_k \in \{0,1\}^{64}$: bit $i = 1$ iff slot $i$ holds a valid entry.
-    \item $A_k \in \{0,1\}^{64}$: bit $i = 1$ iff slot $i$ has been accessed since the last sweep.
-    \item $W_k \in \{0,1\}^{64}$: bit $i = 1$ iff a writer currently owns slot $i$ for mutation.
-\end{itemize}
-
-A slot is an eviction candidate if it is empty ($V_k[i] = 0$) or valid but unaccessed ($V_k[i] = 1 \land A_k[i] = 0$), provided it is not currently owned by a writer ($W_k[i] = 0$). The complete candidate set across all 64 slots is computed in a single bitwise expression:
-
-\begin{equation}
-C_k = \neg (V_k \land A_k) \land \neg W_k
-\end{equation}
-
-The index of the first candidate is extracted using the hardware Count Trailing Zeros (CTZ) instruction~\cite{inteltzcnt,armclz}. It is crucial to handle platform-specific zero behavior: on x86\_64, \texttt{TZCNT} returns 64 when the input is zero, whereas on ARM64, \texttt{RBIT} + \texttt{CLZ} requires an explicit branch or zero-check. When a non-zero candidate mask exists:
-
-\begin{equation}
-i^* = \text{CTZ}(C_k)
-\end{equation}
-
-This replaces an $\mathcal{O}(N)$ sequential scan over $N$ atomic loads with two register-width bitwise operations and one hardware intrinsic, bounding eviction search to a strict hardware-constant time within any chunk.
-
-If $C_k = 0$, it indicates either all valid slots in the current chunk have been recently accessed or free candidates are currently locked in $W_k$. The algorithm clears valid access bits via \texttt{chk.accessed.And(\textasciicircum validBits)} and retries up to $R=10$ iterations. We explicitly distinguish \textbf{CLOCK recency imprecision} from \textbf{ownership safety}: stale $A_k$ observations and bulk clearing affect only approximate victim preference, whereas exclusive slot ownership is enforced strictly by the $W_k[i]$ CAS ($0 \to 1$) before $V_k[i]$ or slot contents are mutated.
-
-\textbf{Writer Progress and Claim Protocol.}
-
-The eviction search process executes as follows:
-\begin{enumerate}
-    \item Extract candidate index $i = \text{CTZ}(C_k)$.
-    \item Execute an atomic Compare-And-Swap (CAS) to set $W_k[i] \leftarrow 1$.
-    \item If the CAS fails (another writer claimed it), restart at step 1 for the same chunk.
-    \item If $W_k[i] = 1$ is successfully claimed, proceed to step 1 of the concurrent Set Associative Write Consistency protocol defined in \S 6.
-\end{enumerate}
-
-To guarantee contention-bounded admission and bound the worst-case scenario where a chunk is pathologically saturated by concurrent writers (e.g., a Thundering Herd), \texttt{liteLRU} employs \textbf{Load-Shedding Eviction}. The \texttt{findVictim} loop attempts to claim a write-lock (\texttt{writing} bit) on an eviction candidate. If it fails to claim any slot after 10 retries, it returns a sentinel failure value (\texttt{0xFFFFFFFF}). The \texttt{Add} operation intercepts this sentinel and safely drops the cache admission. By sacrificing absolute admission under extreme contention, \texttt{liteLRU} bounds write-side work to a fixed number of CAS attempts; under sustained contention, admission may be dropped.
-
-\subsection{Eliminating the Global Clock Hand}
-
-Because \texttt{liteLRU} hashes each key to a fixed 64-slot set $k = h(r) \bmod N$, there is no shared global clock-hand atomic: each chunk maintains its own local $(V_k, A_k, W_k)$ bitmasks as an independent 64-way set hand. Both lookup (\texttt{Get}) and eviction (\texttt{Add}/\texttt{findVictim}) operate \textbf{strictly within chunk $k$} and never probe or spill into neighboring chunks, eliminating cross-chunk sweep contention while trading off strict per-set capacity limits (\S 9.11). 
+Because \texttt{liteLRU} hashes each key to a fixed 64-slot chunk $k = h(r) \bmod N$, both lookup (\texttt{Get}) and eviction (\texttt{Add}/\texttt{findVictim}) operate strictly within chunk $k$, removing cross-chunk contention while exposing per-set pressure ($P_k > 1$, \S 9.11).
 
 \section{Algorithm and Correctness}
 
 \subsection{State Definitions and Layout}
-The cache state is divided into global configuration, per-chunk metadata, and per-slot data:
 \begin{itemize}
-    \item \textbf{Global:} Total capacity $C$ and number of chunks $N = C/64$.
-    \item \textbf{Per-Chunk (off-heap \texttt{mmap}):} A \texttt{chunk} struct containing 64-bit masks $V_k$ (valid bits), $W_k$ (writing/ownership bits), $A_k$ (access/recency bits), and an array of 8 \texttt{uint64} SWAR signatures for fast scanning.
-    \item \textbf{Per-Slot:} A \texttt{slotState} (off-heap \texttt{mmap}, padded to the target platform's $L$-byte coherence stride) containing the monotonic 64-bit seqlock $S_i$, alongside Structure of Arrays (SoA) slices on the Go heap (\texttt{[]atomic.Pointer[string]}, \texttt{[]atomic.Pointer[HandlerFunc]}, \texttt{[]atomic.Pointer[[]Param]}) pointing to immutable key and payload objects.
+    \item \textbf{Global:} Power-of-two capacity $C \ge 64$, chunks $N = C/64$, and stack-sharded \texttt{stats [128]statStripe}.
+    \item \textbf{Per-Chunk (off-heap \texttt{mmap}, 128~B):} Sub-line 0 $[0,64)$ holds \texttt{sigs [8]atomic.Uint64}; Sub-line 1 $[64,128)$ holds \texttt{valid}, \texttt{prob}, \texttt{f0}, \texttt{f1}, \texttt{writing}, \texttt{ghost0}, \texttt{ghost1}, \texttt{hand}, and \texttt{handM} (2~B/slot).
+    \item \textbf{Per-Slot (Go heap, 8~B/slot):} \texttt{entries []atomic.Pointer[cacheEntry]}, where each 64-byte \texttt{cacheEntry} holds an immutable \texttt{(method, path, handler, params)} snapshot.
 \end{itemize}
 
 \subsection{API Semantics, State Machine, and Control Flow}
-\textbf{Best-Effort, Non-Linearizable Cache Semantics and Duplicate Keys.} \texttt{Add(key, value)} is a best-effort, non-linearizable cache insertion/update rather than a globally serialized upsert. If an existing valid entry for \texttt{key} is matched during the chunk scan, \texttt{Add} acquires exclusive slot ownership via $W_k[i]$ and updates the value in place under the seqlock; if $W_k[i]$ is already owned by another writer for that exact slot, \texttt{Add} sheds the redundant concurrent update. If no matching entry is found, \texttt{Add} claims a victim slot via \texttt{findVictim(k)}. Under simultaneous cold-start misses on the same key, two writers holding distinct $W_k$ bits can both insert into separate slots (e.g., Writer A in slot 4 with $v_A$, Writer B completing later in slot 12 with $v_B$). Because \texttt{Get} scans slots $0\dots 63$ in ascending order and sets $A_k$ only on the first clean match, \texttt{Get} returns $v_A$ from slot 4 even though Writer B completed later, and future fast-path updates target only slot 4. If slot 4 is subsequently evicted, the older duplicate in slot 12 can resurface (\textbf{stale duplicate resurrection}) until reclaimed by CLOCK sweeps. Callers requiring strict coherent per-key updates over mutable state must serialize writes externally.
+\textbf{Best-Effort, Non-Linearizable Cache Semantics and Duplicate Keys.} \texttt{Add} is a best-effort, non-linearizable cache insertion/update rather than a globally serialized upsert. Fast-path updates acquire $W_k[i]: 0 \to 1$ and store a new immutable \texttt{*cacheEntry} pointer (shedding redundant updates when $W_k[i]=1$). Concurrent cold misses on distinct $W_k$ bits can insert duplicate slots; \texttt{Get} returns the lowest-index match and never mutates caller buffer \texttt{dst} before full key verification succeeds, guaranteeing zero \texttt{dst} mutation on misses. An in-flight overwrite clearing $V_k[i]$ can transiently cause misses under concurrent updates.
 
-\textbf{Slot Publication State Machine.} Each slot transitions through \textbf{INVALID} ($V_k[i]=0$), \textbf{WRITING} ($W_k[i]=1, S_i \equiv 1 \pmod 2$), and \textbf{VALID} ($V_k[i]=1, S_i \equiv 0 \pmod 2$). \texttt{Clear()} acquires all 64 $W_k$ bits atomically via \texttt{CompareAndSwap(0, \textasciicircum uint64(0))} (retrying on failure after \texttt{w == 0}), clears $V_k/A_k/\text{sigs}$, and advances $S_i$ monotonically ($S_i+1 \to S_i+2$) rather than resetting to zero.
-
-\textbf{Get(key)}
-\begin{enumerate}
-    \item Hash the key to find chunk $k$, stripe index \texttt{hash \& 63}, and 8-bit signature \texttt{sig8}.
-    \item Scan the 8 SWAR signature words using byte-wise comparison.
-    \item For any candidate slot $i$ in ascending slot order, check $V_k[i]=1$.
-    \item Load $S_{i, \text{start}}$. If odd, skip slot (active write).
-    \item Perform full-key equality verification (\texttt{slotKeyMatches}) by loading \texttt{atomic.Pointer[string]} key fields (\texttt{methods[i]}, \texttt{paths[i]}) and comparing strings; if unequal, skip slot.
-    \item Load the single-word \texttt{atomic.Pointer} value pointers (\texttt{handlers[i]}, \texttt{params[i]}) and copy any \texttt{[]Param} into caller buffer \texttt{dst}.
-    \item Load $S_{i, \text{end}}$. If $S_{i, \text{start}} \neq S_{i, \text{end}}$, skip slot (concurrent write).
-    \item Check $A_k[i]$ and only if $A_k[i]=0$, atomically OR bit $i$ into $A_k$; increment hit counter and return.
-    \item If no slot matches cleanly, increment miss counter and return miss.
-\end{enumerate}
-
-\textbf{Add(key, value)}
-\begin{enumerate}
-    \item Hash the key to find chunk $k$ and \texttt{sig8}.
-    \item \textbf{Fast-path update:} Scan the 8 SWAR words for a valid matching slot bracketed by matching even seqlock reads ($S_{i,\text{start}} = S_{i,\text{end}}$). Claim $W_k[i]: 0 \to 1$ via CAS (retrying up to $R=10$ times on unrelated-slot $W_k$ interference; dropping if $W_k[i]=1$). Re-validate $(V_k[i]=1 \land \text{key matches})$ under $W_k[i]=1$. Advance $S_i \to S_i+1$, publish immutable value pointers, set $A_k[i]\leftarrow 1$ if unset, advance $S_i \to S_i+2$, release $W_k[i]\leftarrow 0$, and return.
-    \item \textbf{Eviction / admission:} Otherwise run \texttt{findVictim(k)}. If it returns \texttt{0xFFFFFFFF}, increment drops and return.
-    \item Clear $V_k[i] \leftarrow 0$ and store $S_i \leftarrow S_i + 1$ (odd).
-    \item Publish immutable \texttt{atomic.Pointer} key and value fields.
-    \item Update the SWAR signature byte via CAS, and set $A_k[i] \leftarrow 1$ (second-chance protection).
-    \item Close generation ($S_i \leftarrow S_i + 2$, even), publish $V_k[i] \leftarrow 1$ (visibility linearization point), and release $W_k[i] \leftarrow 0$.
-\end{enumerate}
-
-\textbf{findVictim(chunk k)}
-\begin{enumerate}
-    \item Retry loop bounded by $R=10$ failed iterations (\texttt{retries < 10}).
-    \item Load $V_k, A_k, W_k$ and compute $C_k = \neg(V_k \land A_k) \land \neg W_k$.
-    \item If $C_k \neq 0$, pick $i = \text{CTZ}(C_k)$ and attempt CAS $W_k[i]: 0 \to 1$ (ownership linearization point). Return slot $i$ on success; otherwise increment \texttt{retries}.
-    \item If $C_k = 0$, atomically clear valid access bits via \texttt{chk.accessed.And(\textasciicircum validBits)}, increment \texttt{retries}, yield via \texttt{runtime.Gosched()} if $W_k \neq 0$, and loop while \texttt{retries < 10}.
-    \item If 10 retries are exhausted, return \texttt{0xFFFFFFFF}.
-\end{enumerate}
-
-\textbf{Clear()}
-\begin{enumerate}
-    \item Iterate sequentially over chunks $k = 0 \dots N-1$.
-    \item Loop loading $w = W_k$: if $w \neq 0$, yield via \texttt{runtime.Gosched()} and retry; once $w=0$, execute atomic \texttt{CompareAndSwap(W\_k, 0, \textasciicircum uint64(0))} (retrying from step 2 if a racing writer acquires a bit before CAS completes).
-    \item Atomically clear chunk metadata via \texttt{chk.valid.Store(0)}, \texttt{chk.accessed.Store(0)}, and \texttt{chk.sigs[j].Store(0)} for all $j \in \{0 \dots 7\}$ (atomic stores).
-    \item Advance every slot $S_i \to S_i+1 \to S_i+2$ while storing \texttt{nil} into its four \texttt{atomic.Pointer} slices, release \texttt{chk.writing.Store(0)}, and finally zero all 64 \texttt{statStripe} counters.
-\end{enumerate}
-\textit{Progress Note on \texttt{Clear()}:} \texttt{Clear()} is blocking and not starvation-free under continuous concurrent writes; callers requiring deterministic completion under write load must externally quiesce writers.
-
-\textbf{Linearization Points and Stale Mask Snapshots.} Stale $A_k$ reads prior to the $W_k$ CAS affect only approximate CLOCK victim preference, whereas exclusive slot ownership is linearized solely at the successful $W_k$ CAS. Once $W_k[i]=1$ is held, no other writer or \texttt{Clear()} can mutate slot $i$, $V_k[i]$, or $S_i$ until $W_k[i]$ is released.
+\textbf{Slot Publication \& Operations.} On eviction/insert: acquire $W_k[i]: 0 \to 1$ in \texttt{findVictim}; clear $V_k[i]\leftarrow 0$; record unhit Small victim hashes into Ghost; store \texttt{entries[idx].Store(newEntry)}; CAS \texttt{sig8} into \texttt{chk.sigs}; set $P_k[i]$ via Ghost check; clear \texttt{f0}/\texttt{f1}; publish $V_k[i]\leftarrow 1$ (visibility linearization point); and release $W_k[i]\leftarrow 0$. \texttt{Get} scans active SWAR signature words matching \texttt{sig8}, loads \texttt{entries[idx].Load()}, verifies \texttt{method} and \texttt{path}, copies \texttt{params} into \texttt{dst} (0~allocs when \texttt{cap(dst) >= len(params)}), and calls write-avoiding \texttt{promoteFreq}. \texttt{Clear()} iterates chunks sequentially, acquires all 64 $W_k$ bits via \texttt{CompareAndSwap(0, \textasciicircum uint64(0))}, zeroes chunk masks/signatures and sets \texttt{entries[idx].Store(nil)}, then clears all 128 \texttt{statStripe} counters. \texttt{Clear()} guarantees per-chunk exclusive clearing rather than globally atomic cross-chunk clearing and can starve under continuous concurrent writes.
 
 \subsection{Go Memory Model Safety}
-
-Seqlock validation alone does not prevent multi-word struct tearing (e.g., 16-byte \texttt{string} or 24-byte \texttt{[]Param} headers) or Go data races if slice backing arrays are mutated in place before $S_{i,\text{end}}$ is checked. \texttt{liteLRU} therefore pairs off-heap synchronization metadata with single-word \texttt{atomic.Pointer} publication of immutable heap objects (\texttt{string}, \texttt{HandlerFunc}, freshly copied \texttt{[]Param}). All writers (\texttt{Add} fast path, \texttt{Add} eviction, and \texttt{Clear}) serialize per slot via $W_k[i]$, $S_i$ is a monotonic \texttt{atomic.Uint64} padded to $L$ bytes, and all synchronization relies on Go's sequentially consistent \texttt{sync/atomic} total order~\cite{gomem2024}.
+Every \texttt{*cacheEntry} (including a fresh \texttt{[]Param} copy if non-empty) is fully initialized before single-word \texttt{atomic.Pointer.Store} publication and never mutated afterward~\cite{gomem2024}. Storing \texttt{entries[idx]} strictly precedes \texttt{chk.sigs} CAS and \texttt{chk.valid.Or}, so readers load complete immutable snapshots while all writers serialize on $W_k[i]$.
 
 \subsection{Correctness Theorems}
 
-\textbf{Theorem 1 (Bounded-Probe Lock-Free Reads).} \textit{Any thread executing \texttt{Get} terminates in a bounded number of metadata probes (at most 8 SWAR words and 64 slots; per-candidate key comparison cost is $\mathcal{O}(|\text{key}|)$), regardless of the state or execution speed of concurrent writers.}
+\textbf{Theorem 1 (Bounded-Probe Lock-Free Reads).} \textit{Any thread executing \texttt{Get} terminates in a bounded number of metadata probes (at most 8 SWAR words and 64 slots; per-candidate key comparison cost is $\mathcal{O}(|\text{key}|)$), regardless of concurrent writers.}
 
-\textit{Proof:} \texttt{Get} contains no unbounded loops and never retries on seqlock conflict. It evaluates at most 8 SWAR words and 64 slot indices; for each matching byte it executes bounded atomic loads ($V_k$, $S_{i,\text{start}}$, single-word \texttt{atomic.Pointer} key/value pointers, $S_{i,\text{end}}$) and at most one full-key comparison before returning hit (with one optional atomic \texttt{Or} on $A_k$) or advancing to miss. $\square$
+\textit{Proof:} \texttt{Get} executes zero writer-wait or seqlock retry loops, checking \texttt{chk.valid}, at most 8 SWAR words, and matching candidate slots via \texttt{TrailingZeros64} with at most one \texttt{cacheEntry} load and key check per signature hit. $\square$
 
-\textbf{Theorem 2 (Bounded Ownership-Claim Retries).} \textit{Any \texttt{Add} execution decomposes as $T_{\mathrm{Add}} = T_{\mathrm{lookup}} + T_{\mathrm{claim}} + T_{\mathrm{publication}}$, where ownership-claim CAS retries on $W_k$ satisfy $N_{\mathrm{claim,retries}} \le R = 10$ per matched fast-path slot and $N_{\mathrm{claim,retries}} \le R = 10$ inside \texttt{findVictim} (so encountering $d \ge 0$ duplicate matching slots yields at most $R$ claim retries per matched slot plus at most $R$ in \texttt{findVictim}), whereas post-claim signature-word publication ($T_{\mathrm{publication}}$) is not bounded by $R$. Unlike \texttt{Get} and \texttt{Add}, \texttt{Clear()} is blocking and requires quiescent or bounded writer overlap on $W_k$ to terminate.}
+\textbf{Theorem 2 (Bounded Ownership-Claim Retries).} \textit{Any \texttt{Add} execution decomposes as $T_{\mathrm{Add}} = T_{\mathrm{lookup}} + T_{\mathrm{claim}} + T_{\mathrm{publication}}$, where ownership-claim CAS retries on $W_k$ satisfy $N_{\mathrm{claim,retries}} \le R = 10$ per matched fast-path slot and $N_{\mathrm{claim,retries}} \le R = 10$ inside \texttt{findVictim}, whereas post-claim signature-word publication ($T_{\mathrm{publication}}$) lies outside $R$. \texttt{Clear()} is blocking and non-atomic across chunks.}
 
-\textit{Proof:} In \texttt{findVictim}, every failed $W_k$ CAS and every $A_k$-clearing pass increments \texttt{retries}, returning \texttt{0xFFFFFFFF} once \texttt{retries >= 10} ($N_{\mathrm{claim,retries}} \le R = 10$). In the fast-path chunk scan, each matched duplicate candidate slot $i$ retries its $W_k$ CAS up to $R=10$ times on unrelated-slot interference (dropping immediately if $W_k[i]=1$ or on retry exhaustion, and continuing the scan only if the matched slot was evicted before $W_k[i]$ was acquired). Thus Theorem~2 bounds \textbf{per-claim ownership-acquisition retries} rather than deterministic wall-clock latency or total operation CAS count: OS scheduling, Go heap allocations for immutable wrappers/slices, scanning $d$ distinct matching duplicates, and post-claim \texttt{chk.sigs[sigWordIdx].CompareAndSwap} updates (which retry under concurrent writes to other slots in the same 8-byte word) lie outside $R$. \texttt{Clear()} instead retries its \texttt{w == 0} check and \texttt{CompareAndSwap(0, \textasciicircum uint64(0))} until acquiring the chunk. $\square$
+\textit{Proof:} Both \texttt{findVictim} and per-matched-slot fast-path $W_k$ acquisition increment \texttt{retries} on every failed CAS/aging pass and exit once \texttt{retries >= 10}, leaving OS scheduling, \texttt{cacheEntry} allocation, duplicate scan length $d$, and post-claim \texttt{chk.sigs[bit/8].CompareAndSwap} retries outside $R$. $\square$
 
-\textbf{Theorem 3 (Safety Invariant).} \textit{Assuming fewer than $2^{63}$ complete write generations occur to a single slot during one active \texttt{Get} probe (precluding 64-bit counter wraparound between $S_{i,\text{start}}$ and $S_{i,\text{end}}$), no two writers may simultaneously mutate the same slot, and an accepted read in \texttt{Get} observes a complete, untorn key/value snapshot from a single publication generation.}
+\textbf{Theorem 3 (Unconditional Snapshot Safety \& Clean Misses).} \textit{No two writers may simultaneously mutate the same slot; every accepted read in \texttt{Get} observes a complete, untorn snapshot without any 64-bit generation-wraparound assumption; and no miss mutates caller buffer \texttt{dst}.}
 
-\textit{Proof:} Mutual exclusion across all writers (\texttt{Add} fast path, \texttt{Add} eviction, and \texttt{Clear}) is enforced by $W_k[i]$ (acquired atomically via $W_k[i]:0\to 1$ CAS or all-ones \texttt{CompareAndSwap} in \texttt{Clear}). Under Go's sequentially consistent atomic order, writer generation $g$ stores all immutable \texttt{atomic.Pointer} fields while $S_i = 2g+1$ (odd), then stores $S_i \leftarrow 2g+2$ (even) before setting $V_k[i] \leftarrow 1$. Under the bounded-generation hypothesis ($<2^{63}$ complete writes during a single probe), observing $S_{i,\text{start}} = S_{i,\text{end}} = 2g+2$ brackets all \texttt{slotKeyMatches} and value pointer loads strictly within generation $2g+2$. Because every published target object is immutable after publication, the reader cannot observe torn headers or concurrent backing-array mutations. $\square$
+\textit{Proof:} Writer exclusion is enforced strictly by $W_k[i]$ ($0 \to 1$ CAS or all-ones CAS in \texttt{Clear()}). Because every published \texttt{cacheEntry} and its \texttt{[]Param} slice are immutable, concurrent \texttt{entries[idx].Load()} returns either \texttt{nil} or a live complete snapshot under Go's memory model with zero generation counters. \texttt{Get} verifies full key equality before touching \texttt{dst[:len(ep.params)]}. $\square$
 
-\section{Cache-Line Padding to Eliminate False Sharing}
+\section{Coherence-Line Layout and Stack-Sharded Telemetry}
 
-A naive implementation allocates seqlocks as a contiguous slice \texttt{[]atomic.Uint32}. Each \texttt{uint32} is 4 bytes, placing multiple seqlocks per cache line. By the MESI coherency protocol~\cite{mesi1984}, a write to slot $j$ invalidates the cache line holding multiple adjacent seqlocks across all other cores, inducing spurious RFOs even for logically independent operations. This is the false sharing pathology described by Bolosky and Scott~\cite{falsesharing1993}.
-
-\texttt{slotState} metadata is allocated in a page-aligned anonymous \texttt{mmap} region. For each supported platform, \texttt{liteLRU} selects a slot stride equal to the platform's verified coherence-line size $L$ (64 bytes for x86\_64, 128 bytes for Apple Silicon). Because the mapping base is page-aligned and each slot has stride $L$, distinct slot states begin on distinct coherence-line boundaries.
-
-\textbf{Theorem (Cache Line Isolation).} \textit{On a platform with coherence-line size $L$, if the base of the slot-state region is aligned to $L$ and each slot state has stride $L$, distinct slots occupy distinct coherence lines.}
-
-\textit{Proof.} Let $\text{addr}(S_i)$ denote the base address of the padded slot state for slot $i$. We define:
-
-\begin{lstlisting}[language=Go]
-// L is the verified coherence-line size for the target platform via build tags.
-type slotState struct {
-    seq atomic.Uint64 // 8 bytes
-    _   [L - 8]byte   // L-8 bytes padding
-}
-\end{lstlisting}
-
-Because the \texttt{mmap} allocation guarantees $\text{addr}(S_0) \pmod L = 0$ (page alignment implies $L$ alignment for $L \le 4096$), and $\text{addr}(S_{i+1}) = \text{addr}(S_i) + L$, adjacent \texttt{slotState} entries reside on disjoint, non-overlapping $L$-byte aligned cache lines. A write to $S_i$ can require coherence activity for its own line but does not require ownership transfer for a distinct \texttt{slotState} line. $\square$
-
-We explicitly clarify the \textbf{scope of padding isolation}: $L$-byte padding isolates distinct \texttt{slotState} sequence counters and distinct \texttt{statStripe} stats structs onto separate coherence lines. By contrast, all 64 slots belonging to the same chunk $k$ intentionally share the chunk's compact \texttt{uint64} bitmasks ($V_k$, $A_k$, $W_k$) and 8-word \texttt{sigs} array. Packing 64 slots into one \texttt{uint64} reduces metadata word count by $64\times$ compared to per-slot flags, trading intrachunk mask sharing for constant-width \texttt{CTZ} victim selection. \texttt{liteLRU} mitigates this concentration by checking \texttt{chk.accessed} before issuing an atomic \texttt{Or} on \texttt{Get} and bounding retry loops on shared chunk words to $R=10$. Similarly, sharded statistics use 64 padded \texttt{statStripe} structs indexed via \texttt{hash \& 63}, distributing---rather than eliminating---counter contention.
+Removing v1's 128-byte per-slot \texttt{slotState} seqlocks allows targeted coherence separation only where read/write traffic collides:
+\begin{enumerate}
+    \item \textbf{Sub-Line \texttt{chunk} Partitioning (128~B):} \texttt{TestLayoutInvariants} verifies $\text{sizeof}(\texttt{chunk})=128$, $\text{offsetof}(\texttt{sigs})=0$ (64~B), and $\text{offsetof}(\texttt{valid})=64$ (64~B). On x86\_64 ($L=64$), read-mostly \texttt{sigs} occupies a separate coherence line from mutating masks; on ARM64 ($L=128$), the entire 64-slot control plane fits in one line.
+    \item \textbf{Stack-Sharded \texttt{statStripe} Telemetry:} Rather than v1's \texttt{hash \& 63} indexing (which caused all 8 cores hitting the same hot key to bounce a single counter cache line), v2's \texttt{workerStripe()} hashes the caller goroutine's 2~KB-aligned stack pointer (\texttt{sp >> 11}) across 128 $L$-byte-padded \texttt{statStripe} structs. Concurrent cores hit disjoint stripes even on a single key (validated in Regime~A1, where unpadding drops throughput by \textbf{-15.4\%}, \S 9.4).
+\end{enumerate}
 
 \section{Benchmark Methodology and Artifacts}
 
-Standard Go micro-benchmarks use \texttt{b.RunParallel}, distributing $b.N$ iterations across goroutines via \texttt{pb.Next()}. While \texttt{b.RunParallel} amortizes synchronization over per-goroutine iteration batches rather than executing a shared atomic fetch-and-add on every call, it still adds harness overhead and reports only mean \texttt{ns/op} without latency percentiles. Running \texttt{BenchmarkParallelLRUCache} (\texttt{-count=5}) on the hardened race-free codebase (80\% \texttt{Get} / 20\% \texttt{Add}, 1024 capacity) yields medians of \textbf{80.99~ns/op} (1 core), \textbf{53.66~ns/op} (2 cores), \textbf{32.49~ns/op} (4 cores), and \textbf{35.15~ns/op} (8 cores, range 32.55--49.55~ns/op, reflecting heterogeneous P/E-core scheduling across Apple M2's 4 performance + 4 efficiency cores) with \textbf{0 allocs/op}.
+Standard Go micro-benchmarks use \texttt{b.RunParallel}, distributing $b.N$ iterations across goroutines via \texttt{pb.Next()}. While \texttt{b.RunParallel} amortizes synchronization over per-goroutine iteration batches rather than executing a shared atomic fetch-and-add on every call, it still adds harness overhead and reports only mean \texttt{ns/op} without latency percentiles. Running \texttt{BenchmarkParallelLRUCache} (\texttt{-count=5}) on \texttt{liteLRU} v2 (80\% \texttt{Get} / 20\% \texttt{Add}, 1024 capacity) yields medians of \textbf{44.04~ns/op} (1 core, range 42.51--44.75), \textbf{26.71~ns/op} (2 cores, range 24.97--34.92), \textbf{16.13~ns/op} (4 cores, range 15.69--19.08), and \textbf{17.88~ns/op} (8 cores, range 17.70--19.82, reflecting heterogeneous P/E-core scheduling across Apple M2's 4 performance + 4 efficiency cores), with \textbf{12 B/op} and \textbf{0 allocs/op} reported by \texttt{go test} (\texttt{Get} executes \texttt{0 B/op, 0 allocs/op}, while the 20\% \texttt{Add} mix averages $<0.5$ heap allocations per mixed op).
 
 Our custom evaluation suite (\texttt{benchmarks/hardened\_eval/main.go}, 10 independent runs reporting median and interquartile range [IQR]) complements \texttt{b.RunParallel} by running independent worker loops over pre-allocated key arrays with no shared iteration counter and recording sampled or standalone latency percentiles directly.
 
 \section{Evaluation}
 
-\textbf{Platform:} Apple M2 (8-core ARM64: 4 performance + 4 efficiency cores, 24 GB RAM, macOS 14.5, Go 1.25.7). Cache capacity 1024 unless stated otherwise. All core microbenchmark sections (\S\S~9.1--9.4, \S\S~9.6--9.7, \S\S~9.11--9.12) report \textbf{10-run medians (with IQR where noted)} on the hardened race-free codebase (\texttt{atomic.Pointer} SoA + $W_k$ serialization); \S\S~9.8--9.10 preserve the earlier pre-hardening \texttt{vegeta} HTTP snapshot (\texttt{f826423}).
+\textbf{Platform:} Apple M2 (8-core ARM64: 4 performance + 4 efficiency cores, 24 GB RAM, macOS 26.3, Go 1.25.7). Cache capacity 1024 unless stated otherwise. All core microbenchmark sections (\S\S~9.1--9.4, \S\S~9.6--9.7, \S\S~9.11--9.12) report \textbf{10-run medians (with IQR where noted)} on \texttt{liteLRU} v2 (Bitmask S3-FIFO + single \texttt{atomic.Pointer[cacheEntry]} + stack-sharded \texttt{statStripe}); \S\S~9.8--9.10 preserve the earlier pre-hardening \texttt{vegeta} HTTP snapshot (\texttt{f826423}).
 
 \subsection{Baseline Comparison}
 
-\textbf{Workload:} 8 concurrent workers, $1.6 \times 10^6$ total operations, 80\% \texttt{Get} / 20\% \texttt{Add}, paths drawn independently at random from a 1000-route uniform-pool mix (70\% over hot 200 keys, 30\% over 1000 keys; \texttt{benchmarks/hardened\_eval}). Measured over 10 runs on the hardened implementation against \texttt{otter} (\texttt{v1.2.4})~\cite{otter} and a lock-protected doubly-linked list \texttt{Mutex LRU}:
+\textbf{Workload:} 8 concurrent workers, $1.6 \times 10^6$ total operations, 80\% \texttt{Get} / 20\% \texttt{Add}, paths drawn independently at random from a 1000-route uniform-pool mix (70\% over hot 200 keys, 30\% over 1000 keys; \texttt{benchmarks/hardened\_eval}). Measured over 10 runs on \texttt{liteLRU} v2 against \texttt{otter} (\texttt{v1.2.4})~\cite{otter} and a lock-protected doubly-linked list \texttt{Mutex LRU}:
 
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
 \textbf{Cache Implementation} & \textbf{Median Ops/sec} & \textbf{IQR (Q1--Q3)} & \textbf{Median p50} & \textbf{Median p99} \\ \midrule
-\textbf{\texttt{liteLRU}}     & \textbf{21,596,758}     & 20.89M--22.70M        & 333 ns              & \textbf{1.69 \textmu s} \\
-\texttt{otter} (\texttt{v1.2.4}) & 15,694,884           & 15.12M--15.89M        & 292 ns              & 51.06 \textmu s     \\
-\texttt{Mutex LRU}            & 7,154,696               & 7.10M--7.26M          & \textbf{125 ns}     & 28.79 \textmu s     \\ \bottomrule
+\textbf{\texttt{liteLRU}}     & \textbf{51,316,763}     & 49.99M--51.91M        & 83 ns               & \textbf{500 ns} \\
+\texttt{otter} (\texttt{v1.2.4}) & 16,362,597           & 16.08M--16.65M        & \textbf{42 ns}      & 9.896 \textmu s     \\
+\texttt{Mutex LRU}            & 7,042,870               & 6.04M--7.17M          & 145 ns              & 25.00 \textmu s     \\ \bottomrule
 \end{tabular}
 \caption{Baseline 10-run median throughput and 1\% sampled latency percentiles (8 workers, 1.6M operations).}
 \end{table}
 
-Across 10 runs, hardened \texttt{liteLRU} delivers a \textbf{3.02$\times$} median throughput advantage over \texttt{Mutex LRU} and \textbf{1.38$\times$} over \texttt{otter} (\texttt{v1.2.4}), while keeping sampled p99 latency at 1.69~\textmu s (vs.\ 51.06~\textmu s for \texttt{otter} and 28.79~\textmu s for \texttt{Mutex LRU}).
+Across 10 runs, \texttt{liteLRU} v2 delivers a \textbf{7.29$\times$} median throughput advantage over \texttt{Mutex LRU} and \textbf{3.14$\times$} over \texttt{otter} (\texttt{v1.2.4}), while keeping sampled p99 latency at \textbf{500~ns} (vs.\ 9.896~\textmu s for \texttt{otter} and 25.00~\textmu s for \texttt{Mutex LRU}).
 
 \subsection{Throughput Scaling Under Contention}
 
-To measure multi-core scaling under high eviction and cache-miss churn on the hardened implementation, we scale a 1.6M operation \textbf{Zipfian} workload ($s=1.001$, $N=100{,}000$, capacity 1024, 80\% \texttt{Get} / 20\% \texttt{Add}) across 1 to 8 workers (10 runs per core count):
+To measure multi-core scaling under high eviction and cache-miss churn on \texttt{liteLRU} v2, we scale a 1.6M operation \textbf{Zipfian} workload ($s=1.001$, $N=100{,}000$, capacity 1024, 80\% \texttt{Get} / 20\% \texttt{Add}) across 1 to 8 workers (10 runs per core count):
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}rrrc@{}}
 \toprule
 \textbf{Cores} & \textbf{Median Ops/sec} & \textbf{IQR (Q1--Q3)} & \textbf{Scaling Factor} \\ \midrule
-1              & 10,874,389              & 10.61M--11.24M        & 1.00$\times$            \\
-2              & 18,176,343              & 16.98M--18.39M        & 1.67$\times$            \\
-4              & 21,363,718              & 19.53M--22.20M        & 1.96$\times$            \\
-8              & 23,338,813              & 22.78M--24.15M        & 2.15$\times$            \\ \bottomrule
+1              & 24,268,125              & 23.79M--24.49M        & 1.00$\times$            \\
+2              & 39,554,936              & 38.54M--41.30M        & 1.63$\times$            \\
+4              & 57,162,224              & 51.65M--70.91M        & 2.36$\times$            \\
+8              & 54,391,781              & 53.59M--62.67M        & 2.24$\times$            \\ \bottomrule
 \end{tabular}
 \caption{10-run Zipfian scaling under un-synchronized worker methodology ($s=1.001, N=100{,}000$).}
 \end{table}
 
-Scaling rises sharply to 2 cores (1.67$\times$) and tapers between 4 and 8 cores (1.96$\times$ to 2.15$\times$). Both hardware asymmetry (Apple M2 pairs 4 high-frequency performance cores with 4 slower efficiency cores above 4 threads) and shared chunk coherence traffic ($V_k, A_k, W_k$, hot seqlocks) contribute to this sub-linear curve.
+Scaling rises to 4 cores (\textbf{2.36$\times$}, 57.16M ops/s) and flattens slightly at 8 cores (54.39M ops/s, \textbf{2.24$\times$}). Both hardware asymmetry (Apple M2 pairs 4 performance cores with 4 slower efficiency cores above 4 threads) and hot-chunk atomic CAS traffic ($W_k$, \texttt{chk.sigs}, and bitmask updates under heavy Zipf skew) contribute to this sub-linear ceiling, achieving $2.33\times$ v1's 8-core Zipfian throughput (23.34M ops/s).
 
 \subsection{Latency Percentiles (ARM64)}
 
@@ -395,35 +251,35 @@ Scaling rises sharply to 2 cores (1.67$\times$) and tapers between 4 and 8 cores
 \begin{tabular}{@{}ccr@{}}
 \toprule
 \textbf{Percentile} & \textbf{Raw 10-Run Median} & \textbf{Raw Observed Range} \\ \midrule
-p50                 & 167~ns                     & 167--250~ns                 \\
-p99                 & 1{,}104~ns                 & 1.00--1.17~\textmu s        \\
-p99.9               & 3.21~\textmu s             & 1.75--10.38~\textmu s       \\
-Max                 & 5.97~ms                    & 4.34--9.74~ms               \\ \bottomrule
+p50                 & 83~ns                      & 83--125~ns                  \\
+p99                 & 500~ns                     & 459--583~ns                 \\
+p99.9               & 1.17~\textmu s             & 917~ns--3.58~\textmu s      \\
+Max                 & 5.80~ms                    & 3.25--17.24~ms              \\ \bottomrule
 \end{tabular}
-\caption{Raw latency percentiles over 10 uncached runs of \texttt{TestConcurrentLatency} (8 workers, 1.6M ops, median 17.87M ops/s). Per-sample \texttt{time.Now()} overhead adds $\sim$40~ns on ARM64; under an additive constant approximation, underlying operation medians are roughly 127~ns (p50), 1.06~\textmu s (p99), and 3.17~\textmu s (p99.9).}
+\caption{Raw latency percentiles over 10 uncached runs of \texttt{TestConcurrentLatency} (8 workers, 1.6M ops, median 31.86M ops/s, IQR 29.66M--33.26M). Per-sample \texttt{time.Now()} overhead adds $\sim$40~ns on ARM64; under an additive constant approximation, underlying operation medians are roughly 43~ns (p50), 460~ns (p99), and 1.13~\textmu s (p99.9).}
 \end{table}
 
-The observed maximum latency (4.34--9.74~ms) reflects Go goroutine/OS scheduling preemption on one or more workers rather than internal cache synchronization.
+The observed maximum latency (3.25--17.24~ms) reflects Go goroutine/OS scheduling preemption on one or more workers rather than internal cache synchronization.
 
-\subsection{Hardened Ablation Study}
+\subsection{Controlled Ablation Study}
 
-To isolate SWAR filtering, $L$-byte padding, and 64-way lock-free associativity \textbf{without allocation-placement confounding}, all three set-associative variants (\texttt{Full}, \texttt{No SWAR (mmap)}, \texttt{No Pad (mmap)}) allocate \texttt{states} and \texttt{chunks} via off-heap \texttt{mmap} and share identical 4-slice \texttt{atomic.Pointer} SoA fields (10 runs, capacity 1024, 8 workers): (A0) Zero-Overflow Pre-Warmed 100\% \texttt{Get} (960 keys, $\le 60$/chunk, 0 misses/evictions); (A1) Uniform-Pool 80/20 (1,000 keys; empirically audited at \texttt{minH=56, maxH=70}, 6/16 sets overflowing with 30 excess keys, 98.66\% hit rate, 17,214 misses, 353 drops); (B) Zipfian 80/20 ($N=100{,}000$, active eviction); and (C) Zipfian 50/50 ($N=100{,}000$, write-heavy). Note \texttt{Map+RWMutex*} omits per-read LRU promotion.
+To isolate SWAR filtering, $L$-byte padding on \texttt{statStripe}, and 64-way lock-free associativity \textbf{without allocation-placement confounding}, all three set-associative variants (\texttt{Full v2}, \texttt{No SWAR (mmap)}, \texttt{No Pad (mmap)}) allocate \texttt{chunks} via off-heap \texttt{mmap} and share identical \texttt{atomic.Pointer[cacheEntry]} slots (10 runs, capacity 1024, 8 workers): (A0) Zero-Overflow Pre-Warmed 100\% \texttt{Get} (960 keys, $\le 60$/chunk, 0 misses/evictions); (A1) Uniform-Pool 80/20 (1,000 keys; audited at \texttt{minH=52, maxH=77}, 7/16 sets overflowing with 32 excess keys, 98.74\% hit rate, 16,169 misses, 703 drops); (B) Zipfian 80/20 ($N=100{,}000$, active eviction); and (C) Zipfian 50/50 ($N=100{,}000$, write-heavy). Note \texttt{Map+RWMutex*} omits per-read LRU promotion.
 
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
 \textbf{Variant} & \textbf{A0: Zero-Overflow Get} & \textbf{A1: Uniform 80/20} & \textbf{B: Zipf 80/20} & \textbf{C: Zipf 50/50} \\ \midrule
-\textbf{Full \texttt{liteLRU}} & 27.85M & 22.50M & \textbf{27.97M} & \textbf{22.28M} \\
-No SWAR (\texttt{mmap}) & 18.85M (\textbf{-32.3\%}) & 22.94M (+2.0\%) & 12.68M (\textbf{-54.7\%}) & 11.38M (\textbf{-48.9\%}) \\
-No Pad (\texttt{mmap}) & \textbf{29.20M} (\textbf{+4.8\%}) & 22.64M (+0.6\%) & 26.41M (\textbf{-5.6\%}) & 22.03M (-1.1\%) \\
-True \texttt{MutexLRU} & 8.43M (\textbf{-69.7\%}) & 7.18M (\textbf{-68.1\%}) & 6.45M (\textbf{-76.9\%}) & 5.53M (\textbf{-75.2\%}) \\
-\texttt{Map+RWMutex*} & 11.76M (\textbf{-57.8\%}) & \textbf{24.04M} (+6.9\%) & 13.57M (\textbf{-51.5\%}) & 8.68M (\textbf{-61.0\%}) \\ \bottomrule
+\textbf{Full \texttt{liteLRU} v2} & 88.62M & \textbf{47.33M} & 42.71M & \textbf{30.55M} \\
+No SWAR (\texttt{mmap}) & 24.00M (\textbf{-72.9\%}) & 21.04M (\textbf{-55.5\%}) & 16.31M (\textbf{-61.8\%}) & 12.25M (\textbf{-59.9\%}) \\
+No Pad (\texttt{mmap}) & \textbf{97.08M} (\textbf{+9.5\%}) & 40.05M (\textbf{-15.4\%}) & \textbf{49.75M} (\textbf{+16.5\%}) & 30.43M (-0.4\%) \\
+True \texttt{MutexLRU} & 8.00M (\textbf{-91.0\%}) & 6.45M (\textbf{-86.4\%}) & 5.87M (\textbf{-86.3\%}) & 5.15M (\textbf{-83.1\%}) \\
+\texttt{Map+RWMutex*} & 13.75M (\textbf{-84.5\%}) & 22.35M (\textbf{-52.8\%}) & 13.38M (\textbf{-68.7\%}) & 8.22M (\textbf{-73.1\%}) \\ \bottomrule
 \end{tabular}
-\caption{Hardened 10-run median ablation with matched off-heap \texttt{mmap} placement across set-associative variants.}
+\caption{Controlled 10-run median ablation with matched off-heap \texttt{mmap} placement across v2 variants.}
 \end{table}
 
-Controlling placement and Regime~A set occupancy clarifies three findings: (1) even with zero misses/evictions in Regime~A0 (960 resident keys, 60/64 ways full), removing SWAR loses \textbf{-32.3\%} because linear probing traverses populated \texttt{*string} slots, while Zipfian miss/eviction churn widens that loss to \textbf{-54.7\%} and \textbf{-48.9\%}; (2) isolating padding stride within \texttt{mmap} shows a clean \textbf{+4.8\%} L1-density gain without padding in read-only A0 and a \textbf{-5.6\%} drop in active-eviction Regime~B (rather than the earlier +16.6\% heap/aliasing artifact); and (3) even simplified non-LRU \texttt{Map+RWMutex*} loses \textbf{-51.5\%} to \textbf{-61.0\%} under populated-set reads and Zipf churn, while \texttt{True MutexLRU} loses \textbf{-68.1\%} to \textbf{-76.9\%}.
+Controlling placement in v2 highlights the shift after removing per-slot seqlocks: (1) SWAR pre-filtering now speeds up \textbf{all four} regimes (removing SWAR drops throughput by \textbf{-72.9\%} on resident lookups in A0 and \textbf{-55.5\% to -61.8\%} in A1/B/C because scanning 60--64 pointers triggers dependent cache misses whereas SWAR checks 8 contiguous \texttt{uint64} words); (2) removing \texttt{statStripe} padding improves cache-resident lookups (+9.5\% in A0, +16.5\% in B) while degrading uniform hot-pool 80/20 (\textbf{-15.4\%} in A1) due to counter bouncing; and (3) \texttt{True MutexLRU} trails by \textbf{-83.1\% to -91.0\%}, while non-evicting \texttt{Map+RWMutex*} trails by \textbf{-52.8\% to -84.5\%}.
 
 \subsection{x86\_64 Smoke Test}
 
@@ -441,40 +297,44 @@ x86\_64               & 8              & 13{,}155{,}469                  \\ \bot
 
 \subsection{Zipfian Hit-Rate Evaluation (Matched Capacities)}
 
-Because \texttt{NewLRUCache} rounds requested capacities up to the next power of two (\texttt{nextPowerOfTwo}), evaluating arbitrary non-power-of-two sizes (25k, 50k, 75k, 95k) against an exact-capacity cache gives \texttt{liteLRU} 31\%--75\% more slots. To eliminate that confounding, we evaluate both caches at \textbf{matched power-of-two capacities} (16,384, 32,768, 65,536 --- corresponding to 16.4\%, 32.8\%, and 65.5\% of $N=100{,}000$) over 10 runs with a 20\% warmup phase:
+Because \texttt{NewLRUCache} rounds requested capacities up to the next power of two (\texttt{nextPowerOfTwo}), evaluating arbitrary non-power-of-two sizes against an exact-capacity cache gives \texttt{liteLRU} excess slots. To eliminate that confounding, we evaluate both caches at \textbf{matched power-of-two capacities} (16,384, 32,768, 65,536 --- corresponding to 16.4\%, 32.8\%, and 65.5\% of $N=100{,}000$) over 10 runs with a 20\% warmup phase (\texttt{hardened\_eval --only-zipf}):
 
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
 \textbf{Matched Capacity} & \textbf{\texttt{liteLRU} ($s=1.001$)} & \textbf{\texttt{otter} ($s=1.001$)} & \textbf{\texttt{liteLRU} ($s=0.800$)} & \textbf{\texttt{otter} ($s=0.800$)} \\ \midrule
-16,384 (16.4\%)           & 78.97\%                              & \textbf{80.62\%}                   & 55.25\%                              & \textbf{62.86\%}                   \\
-32,768 (32.8\%)           & 86.57\%                              & \textbf{87.37\%}                   & 69.58\%                              & \textbf{72.04\%}                   \\
-65,536 (65.5\%)           & 94.38\%                              & \textbf{94.70\%}                   & \textbf{87.19\%}                     & 87.02\%                            \\ \bottomrule
+16,384 (16.4\%)           & \textbf{83.05\%}                     & 80.67\%                            & \textbf{62.88\%}                     & 62.83\%                            \\
+32,768 (32.8\%)           & \textbf{88.89\%}                     & 87.38\%                            & \textbf{74.38\%}                     & 73.83\%                            \\
+65,536 (65.5\%)           & \textbf{95.12\%}                     & 94.70\%                            & \textbf{88.82\%}                     & 87.09\%                            \\ \bottomrule
 \end{tabular}
 \caption{Matched power-of-two Zipfian hit rates (median of 10 runs, $N=100{,}000$).}
 \end{table}
 
-At matched capacities, Otter's~\cite{otter} S3-FIFO policy outperforms 1-bit chunked CLOCK at tighter cache ratios (especially under flatter $s=0.800$ skew at 16.4\% capacity: 62.86\% vs.\ 55.25\%), where frequency filtering prevents one-hit tail churn. At high skew ($s=1.001$), \texttt{liteLRU} tracks within 0.32--1.65~pp of Otter, and matches Otter at 65.5\% capacity under $s=0.800$ (87.19\% vs.\ 87.02\%). \texttt{liteLRU}'s contribution is thus synchronization throughput and predictability rather than surpassing S3-FIFO eviction quality.
+Replacing v1's 1-bit CLOCK with Bitmask S3-FIFO + 128-slot Ghost Filter reverses Rev~4's eviction-quality deficit: \texttt{liteLRU} v2 now matches or exceeds \texttt{otter}~\cite{otter} at all six $(s,\text{cap})$ points (83.05\% vs.\ 80.67\% at $16\text{k}, s=1.001$, and 88.82\% vs.\ 87.09\% at $65\text{k}, s=0.800$).
 
-\subsection{Write-Heavy Workloads and Semantic-Equivalence Controls}
+\subsection{Write-Heavy Workloads, Semantic-Equivalence Controls, and Miss Penalty}
 
-We omit \texttt{ristretto} from this benchmark because, as documented in~\cite{otter}, it exhibits hit-rate degradation under extreme concurrent write pressure. Comparing write-heavy caches requires separating two distinct workloads (\texttt{benchmarks/hardened\_eval}, 10 runs, 8 workers, capacity 1024, Zipfian $s=1.001$): (1) \textbf{Direct overwrite contention} ($N=1{,}000$, 50/50 and 20/80 \texttt{Get}/\texttt{Add}), where \texttt{liteLRU} sheds 2.36\%--3.07\% of redundant same-slot overwrites via $W_k$ collision drops while \texttt{otter} queues all writes; and (2) \textbf{Immutable insert-on-miss maintenance} ($N=1{,}000$ and $N=5{,}000$), where workers invoke \texttt{Add}/\texttt{Set} only on misses (0.00\% miss drops for \texttt{liteLRU}).
+We omit \texttt{ristretto} from this benchmark because, as documented in~\cite{otter}, it exhibits hit-rate degradation under extreme concurrent write pressure. We separate three workloads (\texttt{benchmarks/hardened\_eval --only-write}, 10 runs, 8 workers, Zipfian $s=1.001$): (1) \textbf{Direct overwrite contention} (cap 1024, $N=1{,}000$, 50/50 and 20/80 \texttt{Get}/\texttt{Add}), where \texttt{liteLRU} sheds 4.67\%--5.30\% of redundant same-slot overwrites via $W_k$ drops while \texttt{otter} queues all writes; (2) \textbf{Immutable insert-on-miss maintenance} (cap 1024 with $N=1\text{k}, 5\text{k}$; cap 16,384 with $N=100\text{k}$), where workers call \texttt{Add}/\texttt{Set} only on misses (0.00\% miss drops; note \texttt{otter}'s async buffer transiently reaches \texttt{liveSize=1,850} at cap 1,024 and \texttt{liveSize=17,224} at cap 16,384); and (3) \textbf{Explicit backend miss-penalty control} ($T_{\mathrm{miss}} = 5\,\mu\text{s}$ per miss, cap 16,384, $N=100\text{k}$) reflecting $E[T] \approx h T_{\mathrm{hit}} + (1 - h) T_{\mathrm{miss}}$.
 
 \begin{table}[h]
 \centering
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
 \textbf{Workload} & \textbf{\texttt{liteLRU} Eff.\ (IQR)} & \textbf{Drops / Hit} & \textbf{\texttt{otter} (IQR) / Hit} & \textbf{Ratio} \\ \midrule
-Direct Overwrite 50/50 ($N=1\text{k}$) & \textbf{21.83M} (20.62--22.41M) & 2.36\% Adds / 99.53\% & 6.10M (5.94--6.24M) & \textbf{3.58$\times$} \\
-Direct Overwrite 20/80 ($N=1\text{k}$) & \textbf{19.20M} (18.11--19.68M) & 3.07\% Adds / 99.47\% & 3.93M (3.85--3.98M) & \textbf{4.89$\times$} \\
-Insert-on-Miss ($N=1\text{k}$) & 33.64M (21.29--34.61M) & 0.00\% miss / 99.94\% & \textbf{94.27M} / 99.94\% & 0.36$\times$ \\
-Insert-on-Miss ($N=5\text{k}$) & \textbf{15.63M} (14.90--15.86M) & 0.00\% miss / 75.34\% & 13.36M / \textbf{85.60\%} & \textbf{1.17$\times$} \\ \bottomrule
-\end{tabular}
-\caption{Write-heavy direct overwrite contention vs.\ immutable insert-on-miss semantic-equivalence controls (10-run medians).}
+Direct Overwrite 50/50 (cap 1k, $N=1\text{k}$) & \textbf{32.51M} (29.16--34.50M) & 4.67\% Adds / 99.14\% & 6.10M (5.75--6.22M) & \textbf{5.33$\times$} \\
+Direct Overwrite 20/80 (cap 1k, $N=1\text{k}$) & \textbf{26.57M} (25.44--27.18M) & 5.30\% Adds / 99.20\% & 4.04M (3.99--4.10M) & \textbf{6.58$\times$} \\
+Insert-on-Miss (cap 1k, $N=1\text{k}$) & \textbf{128.59M} (114.71--130.09M) & 0.00\% miss / 99.19\% & 113.74M / \textbf{99.94\%} & \textbf{1.13$\times$} \\
+Insert-on-Miss (cap 1k, $N=5\text{k}$) & \textbf{47.24M} (43.52--49.85M) & 0.00\% miss / 80.76\% & 13.11M / \textbf{85.81\%} & \textbf{3.60$\times$} \\
+Insert-on-Miss (cap 16k, $N=100\text{k}$) & \textbf{56.29M} (55.10--59.32M) & 0.00\% miss / \textbf{82.20\%} & 9.12M / 80.17\% & \textbf{6.17$\times$} \\
+Miss-Penalty $5\,\mu\text{s}$ (cap 16k, $N=100\text{k}$) & \textbf{4.51M} (4.36--4.96M) & 0.00\% miss / \textbf{79.83\%} & 3.47M / 79.18\% & \textbf{1.30$\times$} \\ \bottomrule
+\end{tabular}%
+}
+\caption{Write-heavy direct overwrite contention, immutable insert-on-miss controls, and $5\,\mu\text{s}$ backend miss-penalty benchmark (10-run medians).}
 \end{table}
 
-These controls pinpoint the competitive boundary cleanly: on ultra-read-dominated insert-on-miss caching at 99.94\% hit rate ($N=1\text{k}$), \texttt{otter}'s striped read-buffering outperforms \texttt{liteLRU} (94.27M vs.\ 33.64M ops/s, $0.36\times$). Once capacity-driven evictions reach $\sim$25\% ($N=5\text{k}$), \texttt{liteLRU} retakes throughput leadership (15.63M vs.\ 13.36M, $1.17\times$, 0.00\% miss drops) while \texttt{otter} retains higher hit rate (85.60\% vs.\ 75.34\%). Note that \S\S~9.8--9.10 below report the pre-hardening evaluation snapshot; end-to-end HTTP runs with CPU/allocation/GC profiling remain future work.
+Eliminating read-side seqlock RFOs flips v1's $N=1\text{k}$ insert-on-miss deficit ($0.36\times$) into a \textbf{1.13$\times$ lead} (128.59M vs.\ 113.74M ops/s). Under eviction churn, \texttt{liteLRU} v2 leads by \textbf{3.60$\times$} at cap~1,024/$N=5\text{k}$ and \textbf{6.17$\times$} at cap~16,384/$N=100\text{k}$ (with 82.20\% vs.\ 80.17\% hit rate), and sustains \textbf{4.51M vs.\ 3.47M ops/s} (\textbf{1.30$\times$}) when paying an explicit 5~\textmu s miss penalty. Note that \S\S~9.8--9.10 preserve the pre-hardening HTTP snapshot; end-to-end HTTP runs with v2 remain future work.
 
 \subsection{HTTP Router Integration (JSON Response Memoization)}
 
@@ -550,29 +410,29 @@ In this single-run historical measurement, caching route resolution lowered medi
 
 \subsection{Controlled Occupancy, Set Pressure, and Adversarial Stress Tests}
 
-To characterize \texttt{liteLRU}'s set-associative and 1-bit CLOCK failure modes quantitatively (\texttt{benchmarks/adversarial\_bench.go}, 1024-entry cache, 8 workers), we define per-chunk \textbf{set pressure} $P_k = H_k / 64$, where $H_k$ is the active working-set size hashing to chunk $k$:
+To characterize \texttt{liteLRU} v2's set-associative and Bitmask S3-FIFO behaviors quantitatively (\texttt{benchmarks/adversarial\_bench.go}, 1024-entry cache, 8 workers), we define per-chunk \textbf{set pressure} $P_k = H_k / 64$, where $H_k$ is the active working-set size hashing to chunk $k$:
 
 \begin{table}[h]
 \centering
 \begin{tabular}{@{}lll@{}}
 \toprule
 \textbf{Experiment} & \textbf{Configuration} & \textbf{Observed Result} \\ \midrule
-Single-set contention & 128 keys $\to$ chunk 0 (80/20) & 8.90M att.\ / 8.87M eff.\ ops/s; 1.58\% drops; 32.56\% hit \\
-Associativity boundary & 64 vs.\ 65 keys in chunk 0 & \textbf{100.00\%} hit at $H_0=64$ vs.\ \textbf{0.00\%} at $H_0=65$ \\
-Occupancy (100\% Get) & 1\% / 50\% / 100\% fill (pure lookup) & 94.81M / 13.33M / 17.29M ops/s \\
-Occupancy (80/20 Mixed) & 1\% / 50\% / 100\% fill (with writes) & 67.56M / 18.15M / 14.30M ops/s (99.31\%/99.90\%/96.75\% hit) \\
-Sequential scan $>$ cap & 256 hot + 2048 scan keys & \textbf{0/256 (0.00\%)} retained (not scan-resistant) \\
-Single-key upsert & 8 workers, 1.6M Adds to 1 key & 17.42M att.\ / 6.50M eff.\ ops/s; \textbf{62.68\%} shed \\
-Key length scaling & 100\% Get, 16/64/256/1024~B & 64.03M / 36.05M / 12.63M / 3.77M ops/s \\ \bottomrule
+Single-set contention & 128 keys $\to$ chunk 0 (80/20) & 14.08M att.\ / 13.98M eff.\ ops/s; 3.57\% drops; 45.90\% hit \\
+Associativity boundary & 64 vs.\ 65 keys in chunk 0 & \textbf{100.00\%} hit at $H_0=64$ vs.\ \textbf{96.83\%} at $H_0=65$ \\
+Occupancy (100\% Get) & 1\% / 50\% / 100\% fill (pure lookup) & 200.62M / 142.54M / 123.17M ops/s \\
+Occupancy (80/20 Mixed) & 1\% / 50\% / 100\% fill (with writes) & 64.40M / 63.89M / 55.93M ops/s (100/100/95.06\% hit) \\
+Sequential scan $>$ cap & 256 hot + 2048 scan keys & \textbf{256/256 (100.00\%)} retained (scan-resistant) \\
+Single-key upsert & 8 workers, 1.6M Adds to 1 key & 26.44M att.\ / 5.05M eff.\ ops/s; \textbf{80.90\%} shed \\
+Key length scaling & 100\% Get, 16/64/256/1024~B & 126.31M / 101.49M / 60.90M / 21.99M ops/s \\ \bottomrule
 \end{tabular}
-\caption{Controlled set pressure, occupancy decomposition (pure Get vs.\ mixed 80/20), scan resistance, and key-length scaling.}
+\caption{Controlled set pressure, occupancy decomposition (pure Get vs.\ mixed 80/20), scan resistance, and key-length scaling on v2.}
 \end{table}
 
-Three structural behaviors emerge: (1) for $P_k \le 1$ ($H_0=64$), the warmed chunk sustains 100.00\% hits, whereas $P_k > 1$ ($H_0=65$ cyclic) causes immediate 0.00\% thrashing even with 15 empty chunks (though non-cyclic random/skewed sets like 128 keys in chunk 0 retain 32.56\% hits); (2) decomposing 100\% Get vs.\ 80/20 mixed shows throughput dropping from 94.81M/67.56M (1\% fill, nearly empty chunks) to 13.33M--18.15M at 50\%--100\% fill as populated slots incur more key comparisons, SWAR false positives, and CLOCK sweeps; and (3) capacity-exceeding scans evict 100\% of hot items while extreme single-key contention sheds 62.68\% of redundant writes without livelock.
+Three structural improvements emerge over v1: (1) under $P_k = 1.016$ ($H_0=65$ cyclic), Bitmask S3-FIFO protects frequent items in Main and retains \textbf{96.83\%} hits instead of crashing to 0.00\%; (2) a capacity-exceeding 2048-key scan leaves \textbf{256/256 (100.00\%)} hot items intact vs.\ 0/256 under CLOCK; and (3) zero-write read paths keep 100\%-full lookup throughput at \textbf{123.17M ops/s}, while single-key upsert contention sheds 80.90\% of redundant overwrites without blocking.
 
 \subsection{Off-Heap Metadata vs.\ On-Heap Slices (GC Isolation)}
 
-To isolate off-heap \texttt{mmap} metadata placement from layout differences, we construct a paired on-heap baseline inside \texttt{hardened\_eval} Section~6 using an identical 4-slice \texttt{atomic.Pointer} SoA layout (\texttt{methods}, \texttt{paths}, \texttt{handlers}, \texttt{params}), identical \texttt{slotState} / \texttt{chunk} structs, and identical 512-byte churn every 8 ops, measured in fresh isolated subprocesses (\texttt{--gc-sub=...}) over 2.0-second windows with \texttt{runtime.KeepAlive} held through a post-run \texttt{runtime.GC()} cycle (65,536 slots, 8 workers):
+In v2, eliminating 128-byte per-slot \texttt{slotState} seqlocks leaves only \textbf{128~KiB} of off-heap \texttt{chunk} metadata at 65,536 slots (2~B/slot). We compare paired off-heap \texttt{mmap} vs.\ on-heap \texttt{chunks} slices using identical \texttt{atomic.Pointer[cacheEntry]} slots and 512-byte churn every 8 ops in isolated subprocesses (\texttt{--gc-sub=...}) over 2.0-second windows with \texttt{runtime.KeepAlive} held through post-run \texttt{runtime.GC()} (65,536 slots, 8 workers):
 
 \begin{table}[h]
 \centering
@@ -580,41 +440,36 @@ To isolate off-heap \texttt{mmap} metadata placement from layout differences, we
 \begin{tabular}{@{}llrrrrrrrr@{}}
 \toprule
 \textbf{Policy} & \textbf{Placement} & \textbf{Ops/sec} & \textbf{NumGC} & \textbf{Total Pause} & \textbf{Mean/GC} & \textbf{Live Obj} & \textbf{Live Alloc} & \textbf{Inuse} & \textbf{GCCPU} \\ \midrule
-\texttt{GOGC=100} & Off-heap \texttt{mmap} & 20,355,772 & 202 & 33.839~ms & \textbf{0.168~ms} & 195,987 & \textbf{6.17~MB} & \textbf{6.72~MB} & 0.16333 \\
-\texttt{GOGC=100} & On-heap Go slices & \textbf{23,859,037} & \textbf{89} & \textbf{22.232~ms} & 0.250~ms & 192,853 & 14.24~MB & 15.12~MB & \textbf{0.07072} \\
-\texttt{GOMEMLIMIT=64MiB} & Off-heap \texttt{mmap} & 25,792,229 & \textbf{83} & \textbf{16.659~ms} & 0.201~ms & 196,041 & \textbf{6.17~MB} & \textbf{7.15~MB} & \textbf{0.06478} \\
-\texttt{GOMEMLIMIT=64MiB} & On-heap Go slices & \textbf{27,411,542} & 104 & 20.169~ms & \textbf{0.194~ms} & 192,722 & 14.24~MB & 15.15~MB & 0.07702 \\
-Steady 100\% \texttt{Get} & Off-heap \texttt{mmap} & 45,601,614 & 20 & 5.630~ms & 0.281~ms & 192,421 & \textbf{6.10~MB} & \textbf{6.56~MB} & \textbf{0.01025} \\
-Steady 100\% \texttt{Get} & On-heap Go slices & \textbf{46,903,584} & 20 & \textbf{5.258~ms} & \textbf{0.263~ms} & 192,421 & 14.22~MB & 14.62~MB & 0.01208 \\ \bottomrule
+\texttt{GOGC=100} & Off-heap \texttt{mmap} & \textbf{29,259,716} & 417 & 44.659~ms & \textbf{0.107~ms} & 128,352 & \textbf{6.51~MB} & \textbf{9.05~MB} & 0.21368 \\
+\texttt{GOGC=100} & On-heap Go slices & 28,625,100 & \textbf{399} & \textbf{44.336~ms} & 0.111~ms & 128,284 & 6.63~MB & 9.28~MB & \textbf{0.20597} \\
+\texttt{GOMEMLIMIT=64MiB} & Off-heap \texttt{mmap} & 34,418,648 & \textbf{134} & \textbf{22.893~ms} & 0.171~ms & 128,227 & \textbf{6.50~MB} & 8.86~MB & \textbf{0.07611} \\
+\texttt{GOMEMLIMIT=64MiB} & On-heap Go slices & \textbf{36,956,350} & 145 & 22.948~ms & \textbf{0.158~ms} & 128,216 & 6.62~MB & \textbf{7.84~MB} & 0.07971 \\
+Steady 100\% \texttt{Get} & Off-heap \texttt{mmap} & 94,775,315 & 20 & \textbf{5.688~ms} & \textbf{0.284~ms} & 128,096 & \textbf{6.47~MB} & \textbf{7.11~MB} & 0.00607 \\
+Steady 100\% \texttt{Get} & On-heap Go slices & \textbf{101,546,499} & 20 & 6.249~ms & 0.312~ms & 128,093 & 6.60~MB & 7.20~MB & \textbf{0.00457} \\ \bottomrule
 \end{tabular}%
 }
-\caption{Paired GC isolation across \texttt{GOGC=100}, \texttt{GOGC=-1} + \texttt{GOMEMLIMIT=64MiB}, and zero-allocation steady-state \texttt{Get} (2.0-second isolated subprocess windows, 65,536 slots).}
+\caption{v2 GC isolation across \texttt{GOGC=100}, \texttt{GOGC=-1} + \texttt{GOMEMLIMIT=64MiB}, and zero-allocation steady-state \texttt{Get} (2.0-second windows, 65,536 slots).}
 \end{table}
 
-This matched isolation reveals three important findings that earlier mixed-layout GC tests obscured:
-\begin{enumerate}
-    \item \textbf{Post-GC live object count is identical; Go-heap footprint drops by 57\%.} Once dead churn is swept by post-run \texttt{runtime.GC()}, both placements retain essentially identical live heap objects (\textbf{192,421} vs.\ \textbf{192,421} in steady state), because metadata structs sit in contiguous single slices (plus chunk headers) rather than per-slot heap allocations; off-heap \texttt{mmap} shrinks live Go \texttt{HeapAlloc} by \textbf{8.1~MB} (6.10~MB vs.\ 14.22~MB, \textbf{-57\%}). Earlier apparent \texttt{HeapObjects} differences (228k vs.\ 600k) were transient unswept churn sampled mid-cycle.
-    \item \textbf{\texttt{GOGC=100} vs.\ \texttt{GOMEMLIMIT} trigger inversion.} Under proportional \texttt{GOGC=100}, shrinking the live Go heap from 14.24~MB to 6.17~MB lowers Go's next-GC trigger proportionally, triggering \textbf{2.27$\times$ more frequent} GC cycles (202 vs.\ 89) and higher GC CPU fraction (0.16333 vs.\ 0.07072), lowering churn-heavy throughput (20.36M vs.\ 23.86M ops/s) despite shorter per-GC STW pauses (0.168~ms vs.\ 0.250~ms). Under fixed \texttt{GOMEMLIMIT=64MiB} (\texttt{GOGC=-1}), the 8.1~MB extra off-heap headroom reverses trigger frequency in \texttt{liteLRU}'s favor (\textbf{83 vs.\ 104 cycles}, \textbf{16.659~ms vs.\ 20.169~ms} total pause, and lower GC CPU 0.06478 vs.\ 0.07702).
-    \item \textbf{Steady-state read overhead.} In zero-allocation 100\% \texttt{Get} with 20 forced \texttt{runtime.GC()} sweeps (36--40 total mallocs), on-heap slices edge out \texttt{mmap} slightly (46.90M vs.\ 45.60M ops/s) because Go slice accesses avoid the C-style \texttt{mmap} pointer arithmetic / page fault / TLB separation overhead, while off-heap placement maintains its 8.12~MB Go-heap footprint reduction (6.10~MB vs.\ 14.22~MB) and lower \texttt{GCCPUFrac} (0.01025 vs.\ 0.01208).
-\end{enumerate}
+Removing per-slot seqlocks narrows the Go-heap delta to 128~KiB (6.47~MB vs.\ 6.60~MB, live objects 128,096 vs.\ 128,093), eliminating v1's $2.27\times$ \texttt{GOGC=100} GC amplification (417 vs.\ 399 cycles, 44.66 vs.\ 44.34~ms pause) while cutting \texttt{GOMEMLIMIT=64MiB} GC cycles by 7.6\% (134 vs.\ 145). We emphasize that \texttt{GOMEMLIMIT} governs Go's managed runtime heap accounting, not physical OS RSS: anonymous \texttt{mmap} still consumes physical RAM pages outside \texttt{runtime.MemStats}.
 
 \section{Discussion and Limitations}
 
-\textbf{Best-Effort, Non-Linearizable Admission \& Stale Duplicate Resurrection.} Concurrent cold misses on the same key can place duplicates in distinct slots; \texttt{Get} returns the lowest-index match rather than necessarily the latest writer, and updates mutate only the lowest-index match, so evicting it can briefly resurrect an older duplicate at a higher index until CLOCK reclaims it. Callers requiring linearizable upserts must serialize writes externally.
+\textbf{Best-Effort, Non-Linearizable Admission \& Stale Duplicate Resurrection.} Concurrent cold misses on the same key can place duplicates in distinct slots; \texttt{Get} returns the lowest-index match rather than necessarily the latest writer, updates target only that match, and extreme single-key contention sheds up to 80.90\% of redundant overwrites. \texttt{liteLRU} must be treated as a best-effort cache for immutable, idempotent, or staleness-tolerant workloads rather than a strictly serializable map.
 
-\textbf{Blocking \texttt{Clear()} Under Continuous Writes.} Because \texttt{Clear()} polls for $W_k=0$, executes \texttt{CompareAndSwap(0, \textasciicircum uint64(0))}, and zeroes signatures via atomic \texttt{chk.sigs[j].Store(0)}, continuous concurrent writes can starve \texttt{Clear()}; callers needing deterministic teardown must externally quiesce writers.
+\textbf{Blocking \texttt{Clear()} Under Continuous Writes.} Because \texttt{Clear()} polls per chunk for $W_k=0$, executes \texttt{CompareAndSwap(0, \textasciicircum uint64(0))}, and releases chunk 0 before locking chunk 1, \texttt{Clear()} is non-atomic across chunks and can starve under continuous concurrent writes.
 
-\textbf{Memory Overhead.} The tradeoff for $L$-byte padded seqlocks and SoA alignment is increased memory overhead per slot compared to dense tag-based implementations like MemC3. On x86\_64 ($L=64$), fixed per-slot arrays require 96 bytes/slot (64 bytes for \texttt{slotState} + 32 bytes for the four 8-byte \texttt{atomic.Pointer} SoA slices), totaling \textbf{\textasciitilde 96 MB} per million slots before heap-allocated key/payload objects. On Apple Silicon ($L=128$), the 128-byte \texttt{slotState} padding brings fixed array overhead to 160 bytes/slot (\textbf{\textasciitilde 160 MB} per million slots before chunk metadata and key/payload objects), compared to \texttt{otter}'s \textbf{\textasciitilde 120 MB} per million entries.
+\textbf{Memory Overhead (16.2$\times$ Reduction in Fixed Arrays).} Replacing 128-byte padded \texttt{slotState} seqlocks and 4 SoA pointer arrays with \texttt{entries []atomic.Pointer[cacheEntry]} (8~B/slot) plus 128-byte \texttt{chunk} metadata (2~B/slot) reduces fixed per-slot arrays on ARM64 ($L=128$) from 162~B/slot to \textbf{10~B/slot} (\textasciitilde 10~MB per million slots), plus one 64~B \texttt{cacheEntry} per populated slot (\textasciitilde 74~MB per million populated entries vs.\ \textasciitilde 120~MB for \texttt{otter}) and a fixed 16~KiB \texttt{[128]statStripe} array per cache.
 
-\textbf{Hit Rate vs.\ True LRU and S3-FIFO.} The Chunked Bitmask algorithm is a 1-bit CLOCK approximation of LRU~\cite{lru1965,clock1969}. As shown in \S\S~9.6 and~9.11, sequential scans larger than capacity evict hot items, workloads exceeding 64 active keys in one set suffer collision evictions even at low global occupancy, and S3-FIFO achieves higher hit rates at tighter capacities or flatter Zipf skew ($s=0.800$). In immutable insert-on-miss controls (\S~9.7b), \texttt{otter} maintains its throughput advantage at 1,000 hot keys where misses vanish, while \texttt{liteLRU} leads once working sets exceed capacity (\texttt{15.63M} vs.\ \texttt{13.36M} ops/s at $N=5,000$).
+\textbf{Set-Associative Capacity Boundaries vs.\ Global Policies.} Per-chunk Bitmask S3-FIFO preserves 100.00\% scan retention (\S 9.11) and beats \texttt{otter} on Zipfian hit rates across all matched capacities (\S 9.6). Nevertheless, extreme hash skew landing $\gg 64$ hot keys into a single chunk ($H_k > 64$, e.g.\ 128 hot keys in one set) will evict entries locally even if sibling chunks are under-utilized.
 
-\textbf{Fixed Capacity.} The cache does not resize and rounds requested capacities up to powers of two (\texttt{nextPowerOfTwo}, minimum 64), requiring callers to provision capacity upfront.
+\textbf{Fixed Capacity \& Scoped Bounds.} The cache does not resize and rounds capacity up to powers of two (\texttt{nextPowerOfTwo}, minimum 64). Ownership claim retries on $W_k$ are bounded by $R=10$; post-claim \texttt{chk.sigs} CAS lies outside $R$ (Theorem~2).
 
-\textbf{Zero-Allocation Scope.} \texttt{Get} guarantees \textbf{0 heap allocations} (verified via \texttt{testing.AllocsPerRun}) on misses and on hits when supplied a caller \texttt{dst} buffer with \texttt{cap(dst) >= len(params)} (including \texttt{nil} when \texttt{len(params) == 0}). \texttt{Add} allocates immutable \texttt{*string} / \texttt{*HandlerFunc} wrappers on miss admissions and fresh \texttt{[]Param} slices when \texttt{len(params) > 0} to preserve race-free single-word \texttt{atomic.Pointer} publication.
+\textbf{Zero-Allocation Scope.} \texttt{Get} guarantees \textbf{0 heap allocations} (verified via \texttt{testing.AllocsPerRun}) and never mutates caller slice \texttt{dst} on misses, hitting 0~allocs whenever \texttt{cap(dst) >= len(params)}. \texttt{Add} allocates one immutable 64~B \texttt{cacheEntry} (plus fresh \texttt{[]Param} storage when non-empty) on publication.
 
 \section{Conclusion}
 
-We have presented the hardware-grounded derivation of each principal design decision in \texttt{liteLRU}: off-heap \texttt{mmap} allocation for synchronization metadata combined with single-word \texttt{atomic.Pointer} SoA arrays to immutable Go heap payloads~\cite{gogc2018,gomem2024}; SoA layout to maximize cache-line occupancy per field access~\cite{soasimd2009}; bitset-encoded recency state enabling bulk $\mathcal{O}(1)$ evaluation via hardware \texttt{CTZ} intrinsics~\cite{inteltzcnt,armclz}; monotonic 64-bit Seqlocks~\cite{seqlockoriginal} with $L$-byte cache-line padding~\cite{falsesharing1993,mesi1984} across \texttt{slotState} and \texttt{statStripe} structs; and explicit $W_k$ serialization with bounded per-claim retry ($R=10$) admission load-shedding. The resulting architecture delivers race-free concurrency, 19.20M--21.83M effective ops/sec under write-heavy Zipf workloads, and 1.687~$\mu$s 10-run median sampled raw p99 latency on the baseline harness (\S 9.1, \S 9.7), while openly characterizing non-linearizable writes, \texttt{GOGC=100} vs.\ \texttt{GOMEMLIMIT} GC-trigger tradeoffs, set pressure, and 1-bit CLOCK hit-rate limits (\S 9.6, \S 9.11, \S 9.12).
+We have presented the architecture and evaluation of \texttt{liteLRU} v2: compact off-heap \texttt{chunk} SWAR signatures and Bitmask S3-FIFO state (2~B/slot) paired with single-pointer immutable heap snapshots (\texttt{entries []atomic.Pointer[cacheEntry]}, 8~B/slot)~\cite{gogc2018,gomem2024}, hardware \texttt{CTZ} eviction without background threads~\cite{inteltzcnt,armclz}, stack-sharded $L$-byte-padded telemetry~\cite{falsesharing1993,mesi1984}, and $R=10$ bounded ownership claims. Across 10-run evaluations (\S\S~9.1--9.7, \S\S~9.11--9.12), \texttt{liteLRU} v2 outperforms \texttt{otter v1.2.4} on both read-dominated (128.59M vs.\ 113.74M ops/s, $1.13\times$) and evicting (47.24M--56.29M vs.\ 9.12M--13.11M ops/s, $3.60\times\text{--}6.17\times$) workloads---including with an explicit 5~\textmu s miss penalty ($1.30\times$)---while achieving 100.00\% scan retention, higher matched Zipfian hit rates, and 500~ns sampled p99 latency on the uniform baseline.
 
 \bibliographystyle{plain}
 \bibliography{references}
@@ -624,16 +479,16 @@ We have presented the hardware-grounded derivation of each principal design deci
 \begin{itemize}
     \item \textbf{Platform Architecture}: Apple Silicon M2 (8 cores: 4 performance + 4 efficiency cores; $L=128$). At \texttt{GOMAXPROCS=8}, heterogeneous P/E scheduling introduces natural run-to-run variance (\S 8, \S 9.2).
     \item \textbf{Go Version}: \texttt{go1.25.7 darwin/arm64}
-    \item \textbf{macOS Version}: macOS 14.5
+    \item \textbf{macOS Version}: macOS 26.3
     \item \textbf{Machine RAM}: 24GB (\texttt{hw.memsize = 25769803776})
     \item \textbf{Comparator}: \texttt{github.com/maypok86/otter v1.2.4}
-    \item \textbf{Hardened Evaluation}: \S\S~8 (\texttt{-count=5}), 9.1--9.4, 9.6--9.7 (10 runs, median + IQR), and 9.11--9.12 were measured on the hardened race-free codebase.
+    \item \textbf{v2 Evaluation}: \S\S~8 (\texttt{-count=5}), 9.1--9.4, 9.6--9.7 (10 runs, median + IQR), and 9.11--9.12 were measured on \texttt{liteLRU} v2.
     \item \textbf{Historical Snapshot}: Commit \texttt{f826423} (\S\S~9.8--9.10 with \texttt{capacity=75000} rounded to 131,072 slots; \texttt{benchmarks/ablation/} holds an earlier hash-map ablation harness)
     \item \textbf{Commands}:
     \begin{itemize}
-        \item Verification: \texttt{go test -v -race ./...}
+        \item Verification: \texttt{go vet ./... \&\& go test -v -race -count=1 ./...}
         \item Latency \& parallel Go harnesses: \texttt{go test -v -count=10 -run=TestConcurrentLatency .} and \texttt{go test -run=\^{}\$ -bench=BenchmarkParallelLRUCache -benchmem -cpu=1,2,4,8 -count=5 .}
-        \item Benchmarks (\texttt{cd benchmarks}): \texttt{go run ./hardened\_eval}, \texttt{go run ./hardened\_eval --only-ablation}, \texttt{go run ./hardened\_eval --only-write}, \texttt{go run ./hardened\_eval --only-gc}, \texttt{go run adversarial\_bench.go}, \texttt{go run zipf\_bench.go}, \texttt{go run zipf\_low\_skew\_bench.go}
+        \item Benchmarks (\texttt{cd benchmarks}): \texttt{go run ./hardened\_eval} (or scoped \texttt{--only-baseline}, \texttt{--only-ablation}, \texttt{--only-scale}, \texttt{--only-write}, \texttt{--only-zipf}, \texttt{--only-gc}), \texttt{go run adversarial\_bench.go}
     \end{itemize}
 \end{itemize}
 
