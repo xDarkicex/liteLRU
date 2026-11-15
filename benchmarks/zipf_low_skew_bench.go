@@ -55,10 +55,12 @@ func main() {
 		ops[i] = strconv.Itoa(rank)
 	}
 
-	capacities := []int{25000, 50000, 75000, 95000}
+	// Exact power-of-two capacities so liteLRU (which rounds capacity via nextPowerOfTwo)
+	// and Otter receive strictly identical entry capacities against the 100,000-key universe.
+	capacities := []int{16384, 32768, 65536}
 
 	for _, cap := range capacities {
-		fmt.Printf("\n=== Cache Capacity: %d (%.0f%% of working set) ===\n", cap, float64(cap)/float64(workingSetSize)*100)
+		fmt.Printf("\n=== Cache Capacity: %d (%.1f%% of 100k universe) ===\n", cap, float64(cap)/float64(workingSetSize)*100)
 
 		// 1. liteLRU
 		lite := liteLRU.NewLRUCache(cap, 5)
@@ -115,7 +117,7 @@ func main() {
 						otterHits.Add(1)
 					} else {
 						otterMisses.Add(1)
-						otterCache.Set(key, nil, nil)
+						otterCache.Set(key, nil)
 					}
 				}
 				wg.Done()

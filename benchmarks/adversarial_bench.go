@@ -99,43 +99,69 @@ func main() {
 		c.Close()
 	}
 
-	// 3. Controlled occupancy (1%, 50%, 100%)
+	// 3. Controlled occupancy (1%, 50%, 100%) - separating 100% Get vs 80/20 Get/Add
 	for _, occPct := range []int{1, 50, 100} {
-		c := liteLRU.NewLRUCache(1024, 10)
 		nFill := 1024 * occPct / 100
 		if nFill < 1 {
 			nFill = 1
 		}
+		const workers = 8
+		const opsPerWorker = 200000
+		totalOps := workers * opsPerWorker
+
+		// 3a. Lookup-only (100% Get)
+		cGet := liteLRU.NewLRUCache(1024, 10)
 		keys := make([]string, nFill)
 		for i := 0; i < nFill; i++ {
 			keys[i] = fmt.Sprintf("/occ/%d", i)
-			c.Add("GET", keys[i], nil, nil)
+			cGet.Add("GET", keys[i], nil, nil)
 		}
-		const workers = 8
-		const opsPerWorker = 200000
-		start := time.Now()
-		var wg sync.WaitGroup
-		wg.Add(workers)
+		startGet := time.Now()
+		var wgGet sync.WaitGroup
+		wgGet.Add(workers)
 		for w := 0; w < workers; w++ {
 			go func(id int) {
-				defer wg.Done()
+				defer wgGet.Done()
+				for i := 0; i < opsPerWorker; i++ {
+					cGet.Get("GET", keys[(id*17+i)%len(keys)], nil)
+				}
+			}(w)
+		}
+		wgGet.Wait()
+		durGet := time.Since(startGet)
+		cGet.Close()
+
+		// 3b. Mixed (80/20 Get/Add)
+		cMix := liteLRU.NewLRUCache(1024, 10)
+		for i := 0; i < nFill; i++ {
+			cMix.Add("GET", keys[i], nil, nil)
+		}
+		startMix := time.Now()
+		var wgMix sync.WaitGroup
+		wgMix.Add(workers)
+		for w := 0; w < workers; w++ {
+			go func(id int) {
+				defer wgMix.Done()
 				for i := 0; i < opsPerWorker; i++ {
 					k := keys[(id*17+i)%len(keys)]
 					if i%5 != 0 {
-						c.Get("GET", k, nil)
+						cMix.Get("GET", k, nil)
 					} else {
-						c.Add("GET", k, nil, nil)
+						cMix.Add("GET", k, nil, nil)
 					}
 				}
 			}(w)
 		}
-		wg.Wait()
-		dur := time.Since(start)
-		_, _, drops, ratio := c.Stats()
-		totalOps := workers * opsPerWorker
-		fmt.Printf("\n[3] Occupancy %3d%% (%4d keys, 80/20 Get/Add): %d ops/s | Drops: %d | Hit Rate: %.2f%%\n",
-			occPct, nFill, int(float64(totalOps)/dur.Seconds()), drops, ratio*100)
-		c.Close()
+		wgMix.Wait()
+		durMix := time.Since(startMix)
+		_, _, drops, ratio := cMix.Stats()
+		cMix.Close()
+
+		fmt.Printf("\n[3] Occupancy %3d%% (%4d keys): 100%% Get = %d ops/s | 80/20 Get/Add = %d ops/s (Drops: %d, Hit: %.2f%%)\n",
+			occPct, nFill,
+			int(float64(totalOps)/durGet.Seconds()),
+			int(float64(totalOps)/durMix.Seconds()),
+			drops, ratio*100)
 	}
 
 	// 4. Sequential scan larger than capacity (scan resistance)
