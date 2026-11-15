@@ -7,7 +7,10 @@ import (
 	"math"
 	"math/bits"
 	"math/rand"
+	"os"
+	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"sync"
@@ -17,6 +20,7 @@ import (
 
 	"github.com/maypok86/otter"
 	"github.com/xDarkicex/liteLRU"
+	"github.com/xDarkicex/memory"
 )
 
 // --- Summary stats helpers ---
@@ -194,27 +198,51 @@ type unpaddedChunk struct {
 	sigs     [8]atomic.Uint64
 }
 
+func mmapSliceLocal[T any](n int) ([]T, []byte) {
+	var zero T
+	slab, err := memory.MmapAnonymous(int(unsafe.Sizeof(zero)) * n)
+	if err != nil {
+		panic(err)
+	}
+	return unsafe.Slice((*T)(unsafe.Pointer(unsafe.SliceData(slab))), n), slab
+}
+
 type noSWARCache struct {
-	methods   []atomic.Pointer[string]
-	paths     []atomic.Pointer[string]
-	handlers  []atomic.Pointer[liteLRU.HandlerFunc]
-	params    []atomic.Pointer[[]liteLRU.Param]
-	states    []paddedSlot
-	chunks    []paddedChunk
-	numGroups uint32
-	stats     [64]paddedStripe
+	methods    []atomic.Pointer[string]
+	paths      []atomic.Pointer[string]
+	handlers   []atomic.Pointer[liteLRU.HandlerFunc]
+	params     []atomic.Pointer[[]liteLRU.Param]
+	states     []paddedSlot
+	chunks     []paddedChunk
+	statesSlab []byte
+	chunksSlab []byte
+	numGroups  uint32
+	stats      [64]paddedStripe
 }
 
 func newNoSWARCache(cap int) *noSWARCache {
 	ng := uint32(cap / 64)
+	states, statesSlab := mmapSliceLocal[paddedSlot](cap)
+	chunks, chunksSlab := mmapSliceLocal[paddedChunk](int(ng))
 	return &noSWARCache{
-		methods:   make([]atomic.Pointer[string], cap),
-		paths:     make([]atomic.Pointer[string], cap),
-		handlers:  make([]atomic.Pointer[liteLRU.HandlerFunc], cap),
-		params:    make([]atomic.Pointer[[]liteLRU.Param], cap),
-		states:    make([]paddedSlot, cap),
-		chunks:    make([]paddedChunk, ng),
-		numGroups: ng,
+		methods:    make([]atomic.Pointer[string], cap),
+		paths:      make([]atomic.Pointer[string], cap),
+		handlers:   make([]atomic.Pointer[liteLRU.HandlerFunc], cap),
+		params:     make([]atomic.Pointer[[]liteLRU.Param], cap),
+		states:     states,
+		chunks:     chunks,
+		statesSlab: statesSlab,
+		chunksSlab: chunksSlab,
+		numGroups:  ng,
+	}
+}
+
+func (c *noSWARCache) Close() {
+	if c.statesSlab != nil {
+		memory.Munmap(c.statesSlab)
+	}
+	if c.chunksSlab != nil {
+		memory.Munmap(c.chunksSlab)
 	}
 }
 
@@ -342,31 +370,46 @@ func (c *noSWARCache) Add(method, path string) {
 	chk.writing.And(^mask)
 }
 
-type noPadOnHeapCache struct {
-	methods   []atomic.Pointer[string]
-	paths     []atomic.Pointer[string]
-	handlers  []atomic.Pointer[liteLRU.HandlerFunc]
-	params    []atomic.Pointer[[]liteLRU.Param]
-	states    []unpaddedSlot
-	chunks    []unpaddedChunk
-	numGroups uint32
-	stats     [64]unpaddedStripe
+type noPadMmapCache struct {
+	methods    []atomic.Pointer[string]
+	paths      []atomic.Pointer[string]
+	handlers   []atomic.Pointer[liteLRU.HandlerFunc]
+	params     []atomic.Pointer[[]liteLRU.Param]
+	states     []unpaddedSlot
+	chunks     []unpaddedChunk
+	statesSlab []byte
+	chunksSlab []byte
+	numGroups  uint32
+	stats      [64]unpaddedStripe
 }
 
-func newNoPadOnHeapCache(cap int) *noPadOnHeapCache {
+func newNoPadMmapCache(cap int) *noPadMmapCache {
 	ng := uint32(cap / 64)
-	return &noPadOnHeapCache{
-		methods:   make([]atomic.Pointer[string], cap),
-		paths:     make([]atomic.Pointer[string], cap),
-		handlers:  make([]atomic.Pointer[liteLRU.HandlerFunc], cap),
-		params:    make([]atomic.Pointer[[]liteLRU.Param], cap),
-		states:    make([]unpaddedSlot, cap),
-		chunks:    make([]unpaddedChunk, ng),
-		numGroups: ng,
+	states, statesSlab := mmapSliceLocal[unpaddedSlot](cap)
+	chunks, chunksSlab := mmapSliceLocal[unpaddedChunk](int(ng))
+	return &noPadMmapCache{
+		methods:    make([]atomic.Pointer[string], cap),
+		paths:      make([]atomic.Pointer[string], cap),
+		handlers:   make([]atomic.Pointer[liteLRU.HandlerFunc], cap),
+		params:     make([]atomic.Pointer[[]liteLRU.Param], cap),
+		states:     states,
+		chunks:     chunks,
+		statesSlab: statesSlab,
+		chunksSlab: chunksSlab,
+		numGroups:  ng,
 	}
 }
 
-func (c *noPadOnHeapCache) Get(method, path string) bool {
+func (c *noPadMmapCache) Close() {
+	if c.statesSlab != nil {
+		memory.Munmap(c.statesSlab)
+	}
+	if c.chunksSlab != nil {
+		memory.Munmap(c.chunksSlab)
+	}
+}
+
+func (c *noPadMmapCache) Get(method, path string) bool {
 	h := hashRoute(method, path)
 	group := uint32(h % uint64(c.numGroups))
 	chk := &c.chunks[group]
@@ -414,7 +457,7 @@ func (c *noPadOnHeapCache) Get(method, path string) bool {
 	return false
 }
 
-func (c *noPadOnHeapCache) Add(method, path string) {
+func (c *noPadMmapCache) Add(method, path string) {
 	h := hashRoute(method, path)
 	group := uint32(h % uint64(c.numGroups))
 	chk := &c.chunks[group]
@@ -446,6 +489,8 @@ func (c *noPadOnHeapCache) Add(method, path string) {
 			if mp == nil || pp == nil || *mp != method || *pp != path {
 				continue
 			}
+			_ = c.handlers[idx].Load()
+			_ = c.params[idx].Load()
 			if c.states[idx].seq.Load() != seq1 {
 				continue
 			}
@@ -511,6 +556,8 @@ func (c *noPadOnHeapCache) Add(method, path string) {
 	m, p := method, path
 	c.methods[victim].Store(&m)
 	c.paths[victim].Store(&p)
+	c.handlers[victim].Store(nil)
+	c.params[victim].Store(nil)
 	sigWordIdx := bit / 8
 	sigShift := (bit % 8) * 8
 	for {
@@ -526,10 +573,13 @@ func (c *noPadOnHeapCache) Add(method, path string) {
 	chk.writing.And(^mask)
 }
 
-// paddedOnHeapCache: identical to hardened liteLRU (128B padded), except states/chunks live on Go heap (no mmap).
+// paddedOnHeapCache: identical to hardened liteLRU (128B padded + all 4 SoA pointer slices),
+// except states/chunks live on Go heap (no mmap).
 type paddedOnHeapCache struct {
 	methods   []atomic.Pointer[string]
 	paths     []atomic.Pointer[string]
+	handlers  []atomic.Pointer[liteLRU.HandlerFunc]
+	params    []atomic.Pointer[[]liteLRU.Param]
 	states    []paddedSlot
 	chunks    []paddedChunk
 	numGroups uint32
@@ -541,6 +591,8 @@ func newPaddedOnHeapCache(cap int) *paddedOnHeapCache {
 	return &paddedOnHeapCache{
 		methods:   make([]atomic.Pointer[string], cap),
 		paths:     make([]atomic.Pointer[string], cap),
+		handlers:  make([]atomic.Pointer[liteLRU.HandlerFunc], cap),
+		params:    make([]atomic.Pointer[[]liteLRU.Param], cap),
 		states:    make([]paddedSlot, cap),
 		chunks:    make([]paddedChunk, ng),
 		numGroups: ng,
@@ -579,6 +631,8 @@ func (c *paddedOnHeapCache) Get(method, path string) bool {
 			if mp == nil || pp == nil || *mp != method || *pp != path {
 				continue
 			}
+			_ = c.handlers[idx].Load()
+			_ = c.params[idx].Load()
 			if c.states[idx].seq.Load() != seq1 {
 				continue
 			}
@@ -625,6 +679,8 @@ func (c *paddedOnHeapCache) Add(method, path string) {
 			if mp == nil || pp == nil || *mp != method || *pp != path {
 				continue
 			}
+			_ = c.handlers[idx].Load()
+			_ = c.params[idx].Load()
 			if c.states[idx].seq.Load() != seq1 {
 				continue
 			}
@@ -690,6 +746,8 @@ func (c *paddedOnHeapCache) Add(method, path string) {
 	m, p := method, path
 	c.methods[victim].Store(&m)
 	c.paths[victim].Store(&p)
+	c.handlers[victim].Store(nil)
+	c.params[victim].Store(nil)
 	sigWordIdx := bit / 8
 	sigShift := (bit % 8) * 8
 	for {
@@ -793,16 +851,193 @@ func runNoSample5050(ops []string, workers int, getFn, addFn func(string)) float
 	return float64(len(ops)) / time.Since(start).Seconds()
 }
 
+func runPureGet(ops []string, workers int, getFn func(string)) float64 {
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	perWorker := len(ops) / workers
+	start := time.Now()
+	for w := 0; w < workers; w++ {
+		go func(id int) {
+			defer wg.Done()
+			s := id * perWorker
+			e := s + perWorker
+			for i := s; i < e; i++ {
+				getFn(ops[i])
+			}
+		}(w)
+	}
+	wg.Wait()
+	return float64(len(ops)) / time.Since(start).Seconds()
+}
+
+func runGCSub(mode string) {
+	// Split "useMmap:policy"
+	// Policies: gogc100, memlimit64, steady
+	useMmap := mode[0] == '1'
+	policy := mode[2:]
+
+	if policy == "memlimit64" {
+		debug.SetGCPercent(-1)
+		debug.SetMemoryLimit(64 << 20)
+	} else {
+		debug.SetGCPercent(100)
+	}
+
+	var offHeap *liteLRU.LRUCache
+	var onHeap *paddedOnHeapCache
+	if useMmap {
+		offHeap = liteLRU.NewLRUCache(65536, 10)
+		defer offHeap.Close()
+	} else {
+		onHeap = newPaddedOnHeapCache(65536)
+	}
+
+	// Pre-populate 65,536 identical entries
+	preKeys := make([]string, 65536)
+	for i := 0; i < 65536; i++ {
+		preKeys[i] = "/gc/" + strconv.Itoa(i)
+		if useMmap {
+			offHeap.Add("GET", preKeys[i], nil, nil)
+		} else {
+			onHeap.Add("GET", preKeys[i])
+		}
+	}
+
+	runtime.GC()
+	var mBefore, mMid, mLive runtime.MemStats
+	runtime.ReadMemStats(&mBefore)
+
+	const window = 2 * time.Second
+	var opsTotal atomic.Uint64
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+
+	if policy == "steady" {
+		// Zero-allocation steady-state lookup + 20 forced runtime.GC() cycles
+		wg.Add(8)
+		st := time.Now()
+		for w := 0; w < 8; w++ {
+			go func(id int) {
+				defer wg.Done()
+				var n uint64
+				idx := id * 997
+				for !stop.Load() {
+					k := preKeys[idx&65535]
+					if useMmap {
+						offHeap.Get("GET", k, nil)
+					} else {
+						onHeap.Get("GET", k)
+					}
+					idx += 131
+					n++
+				}
+				opsTotal.Add(n)
+			}(w)
+		}
+		for g := 0; g < 20; g++ {
+			time.Sleep(window / 20)
+			runtime.GC()
+		}
+		stop.Store(true)
+		wg.Wait()
+		dur := time.Since(st)
+		runtime.ReadMemStats(&mMid)
+		runtime.GC()
+		runtime.ReadMemStats(&mLive)
+		runtime.KeepAlive(offHeap)
+		runtime.KeepAlive(onHeap)
+		runtime.KeepAlive(preKeys)
+		numGC := mMid.NumGC - mBefore.NumGC
+		pauseMs := float64(mMid.PauseTotalNs-mBefore.PauseTotalNs) / 1e6
+		meanMs := 0.0
+		if numGC > 0 {
+			meanMs = pauseMs / float64(numGC)
+		}
+		fmt.Printf("%-26s | ops/s=%9.0f | NumGC=%3d | Pause=%.3fms (mean %.3fms) | HeapAlloc=%.2fMB | HeapInuse=%.2fMB | HeapObjLive=%7d | Mallocs=%8d | TotalAlloc=%.2fMB | GCCPU=%.5f\n",
+			mode, float64(opsTotal.Load())/dur.Seconds(), numGC, pauseMs, meanMs,
+			float64(mLive.HeapAlloc)/(1<<20), float64(mLive.HeapInuse)/(1<<20),
+			mLive.HeapObjects, mMid.Mallocs-mBefore.Mallocs,
+			float64(mMid.TotalAlloc-mBefore.TotalAlloc)/(1<<20), mMid.GCCPUFraction)
+		return
+	}
+
+	// Equal-duration 2s churn window (80/20 Get/Add + 512B allocation every 8 ops)
+	wg.Add(8)
+	st := time.Now()
+	for w := 0; w < 8; w++ {
+		go func(id int) {
+			defer wg.Done()
+			var sink []byte
+			var n uint64
+			for i := 0; !stop.Load(); i++ {
+				k := preKeys[(id*997+i)&65535]
+				if i%5 == 0 {
+					if useMmap {
+						offHeap.Add("GET", k, nil, nil)
+					} else {
+						onHeap.Add("GET", k)
+					}
+				} else {
+					if useMmap {
+						offHeap.Get("GET", k, nil)
+					} else {
+						onHeap.Get("GET", k)
+					}
+				}
+				if i%8 == 0 {
+					sink = make([]byte, 512)
+					sink[0] = byte(i)
+				}
+				n++
+			}
+			runtime.KeepAlive(sink)
+			opsTotal.Add(n)
+		}(w)
+	}
+	time.Sleep(window)
+	stop.Store(true)
+	wg.Wait()
+	dur := time.Since(st)
+	runtime.ReadMemStats(&mMid)
+	runtime.GC()
+	runtime.ReadMemStats(&mLive)
+	runtime.KeepAlive(offHeap)
+	runtime.KeepAlive(onHeap)
+	runtime.KeepAlive(preKeys)
+	numGC := mMid.NumGC - mBefore.NumGC
+	pauseMs := float64(mMid.PauseTotalNs-mBefore.PauseTotalNs) / 1e6
+	meanMs := 0.0
+	if numGC > 0 {
+		meanMs = pauseMs / float64(numGC)
+	}
+	fmt.Printf("%-26s | ops/s=%9.0f | NumGC=%3d | Pause=%.3fms (mean %.3fms) | HeapObjMid=%7d | HeapObjLive=%7d | LiveAlloc=%.2fMB | Inuse=%.2fMB | Mallocs=%8d | Frees=%8d | TotalAlloc=%.2fMB | GCCPU=%.5f\n",
+		mode, float64(opsTotal.Load())/dur.Seconds(), numGC, pauseMs, meanMs,
+		mMid.HeapObjects, mLive.HeapObjects,
+		float64(mLive.HeapAlloc)/(1<<20), float64(mLive.HeapInuse)/(1<<20),
+		mMid.Mallocs-mBefore.Mallocs, mMid.Frees-mBefore.Frees,
+		float64(mMid.TotalAlloc-mBefore.TotalAlloc)/(1<<20), mMid.GCCPUFraction)
+}
+
 func main() {
+	onlyBaseline := flag.Bool("only-baseline", false, "run only section 1 baseline")
 	onlyAblation := flag.Bool("only-ablation", false, "run only section 2 hardened ablation")
+	onlyWrite := flag.Bool("only-write", false, "run only section 4 write-heavy + semantic-equivalence controls")
+	onlyGC := flag.Bool("only-gc", false, "run only section 6 isolated GC suite")
+	gcSub := flag.String("gc-sub", "", "internal subprocess GC benchmark mode")
 	flag.Parse()
+
+	if *gcSub != "" {
+		runGCSub(*gcSub)
+		return
+	}
 
 	const runs = 10
 	const numKeys = 1000
 	const numOps = 1600000
 	const capacity = 1024
 
-	// Deterministic 80/20 uniform-pool workload (70% hot 200 keys, 30% 1000 keys).
+	// Deterministic 80/20 uniform-pool workload (70% hot 200 keys, 30% 1000 keys),
+	// sampled independently of op index i so i%5 Get/Add does not alias keys mod 5.
 	rng := rand.New(rand.NewSource(42))
 	keys := make([]string, numKeys)
 	for i := 0; i < numKeys; i++ {
@@ -811,13 +1046,15 @@ func main() {
 	uniformOps := make([]string, numOps)
 	for i := 0; i < numOps; i++ {
 		if rng.Float64() < 0.7 {
-			uniformOps[i] = keys[i%200]
+			uniformOps[i] = keys[rng.Intn(200)]
 		} else {
-			uniformOps[i] = keys[i%numKeys]
+			uniformOps[i] = keys[rng.Intn(numKeys)]
 		}
 	}
 
-	if !*onlyAblation {
+	onlyAll := !*onlyBaseline && !*onlyAblation && !*onlyWrite && !*onlyGC
+
+	if onlyAll || *onlyBaseline {
 		fmt.Println("=== 1. BASELINE (10 runs, median + IQR) ===")
 		var lOps, oOps, mOps []float64
 		var lp50, lp99, op50, op99, mp50, mp99 []time.Duration
@@ -857,145 +1094,309 @@ func main() {
 		zipfOps[i] = strconv.FormatUint(zipf100k.Uint64(), 10)
 	}
 
-	runAblation := func(label string, ops []string, runner func([]string, int, func(string), func(string)) float64) {
-		fmt.Printf("\n--- %s ---\n", label)
-		var aFull, aNoSWAR, aNoPad, aMutexLRU, aRWMap []float64
-		for r := 0; r < runs; r++ {
-			fc := liteLRU.NewLRUCache(capacity, 10)
-			aFull = append(aFull, runner(ops, 8, func(k string) { fc.Get("GET", k, nil) }, func(k string) { fc.Add("GET", k, nil, nil) }))
-			fc.Close()
-
-			ns := newNoSWARCache(capacity)
-			aNoSWAR = append(aNoSWAR, runner(ops, 8, func(k string) { ns.Get("GET", k) }, func(k string) { ns.Add("GET", k) }))
-
-			np := newNoPadOnHeapCache(capacity)
-			aNoPad = append(aNoPad, runner(ops, 8, func(k string) { np.Get("GET", k) }, func(k string) { np.Add("GET", k) }))
-
-			mc := newMutexLRU(capacity)
-			aMutexLRU = append(aMutexLRU, runner(ops, 8, func(k string) { mc.Get(k) }, func(k string) { mc.Add(k, 1) }))
-
-			rw := newRWMapCache(capacity)
-			aRWMap = append(aRWMap, runner(ops, 8, func(k string) { rw.Get(k) }, func(k string) { rw.Add(k) }))
+	if onlyAll || *onlyAblation {
+		// Measure exact per-chunk occupancy and miss/drop behavior of Regime A (1000 keys into 16 sets).
+		var bucketCounts [16]int
+		for _, k := range keys {
+			bucketCounts[hashRoute("GET", k)%16]++
 		}
-		fm, fq1, fq3 := medianAndIQR(aFull)
-		nsm, nsq1, nsq3 := medianAndIQR(aNoSWAR)
-		npm, npq1, npq3 := medianAndIQR(aNoPad)
-		mlm, mlq1, mlq3 := medianAndIQR(aMutexLRU)
-		rwm, rwq1, rwq3 := medianAndIQR(aRWMap)
-		fmt.Printf("Full hardened: med=%.0f (IQR %.0f-%.0f)\n", fm, fq1, fq3)
-		fmt.Printf("No SWAR:       med=%.0f (IQR %.0f-%.0f) [%.1f%%]\n", nsm, nsq1, nsq3, (nsm-fm)/fm*100)
-		fmt.Printf("No Padding:    med=%.0f (IQR %.0f-%.0f) [%.1f%%]\n", npm, npq1, npq3, (npm-fm)/fm*100)
-		fmt.Printf("True MutexLRU: med=%.0f (IQR %.0f-%.0f) [%.1f%%]\n", mlm, mlq1, mlq3, (mlm-fm)/fm*100)
-		fmt.Printf("Map+RWMutex*:  med=%.0f (IQR %.0f-%.0f) [%.1f%%]\n", rwm, rwq1, rwq3, (rwm-fm)/fm*100)
-	}
+		minH, maxH, overChunks, overKeys := 1000, 0, 0, 0
+		for _, cnt := range bucketCounts {
+			if cnt < minH {
+				minH = cnt
+			}
+			if cnt > maxH {
+				maxH = cnt
+			}
+			if cnt > 64 {
+				overChunks++
+				overKeys += cnt - 64
+			}
+		}
+		diagCache := liteLRU.NewLRUCache(capacity, 10)
+		runNoSample(uniformOps, 8, func(k string) { diagCache.Get("GET", k, nil) }, func(k string) { diagCache.Add("GET", k, nil, nil) })
+		hitsA, missesA, dropsA, ratioA := diagCache.Stats()
+		diagCache.Close()
 
-	fmt.Println("\n=== 2. HARDENED ABLATION (10 runs, median + IQR, no sampling) ===")
-	runAblation("80/20 Uniform-Pool (1000 keys, cap=1024, low eviction)", uniformOps, runNoSample)
-	runAblation("80/20 Zipfian (100k keys, cap=1024, active eviction)", zipfOps, runNoSample)
-	runAblation("50/50 Zipfian (100k keys, cap=1024, write-heavy)", zipfOps, runNoSample5050)
+		// Construct Regime A0: guaranteed <=64 keys per chunk (zero set overflow, pre-warmed 100%).
+		const perChunkResident = 60
+		var perChunkKeys [16][]string
+		var residentKeys []string
+		for idx := 0; len(residentKeys) < 16*perChunkResident; idx++ {
+			k := fmt.Sprintf("GET:/resident/%d", idx)
+			g := hashRoute("GET", k) % 16
+			if len(perChunkKeys[g]) < perChunkResident {
+				perChunkKeys[g] = append(perChunkKeys[g], k)
+				residentKeys = append(residentKeys, k)
+			}
+		}
+		resOps := make([]string, numOps)
+		for i := 0; i < numOps; i++ {
+			resOps[i] = residentKeys[i%len(residentKeys)]
+		}
+
+		runAblation := func(label string, ops []string, prewarm []string, pureGet bool, runner func([]string, int, func(string), func(string)) float64) {
+			fmt.Printf("\n--- %s ---\n", label)
+			var aFull, aNoSWAR, aNoPad, aMutexLRU, aRWMap []float64
+			for r := 0; r < runs; r++ {
+				fc := liteLRU.NewLRUCache(capacity, 10)
+				for _, pk := range prewarm {
+					fc.Add("GET", pk, nil, nil)
+				}
+				if pureGet {
+					aFull = append(aFull, runPureGet(ops, 8, func(k string) { fc.Get("GET", k, nil) }))
+				} else {
+					aFull = append(aFull, runner(ops, 8, func(k string) { fc.Get("GET", k, nil) }, func(k string) { fc.Add("GET", k, nil, nil) }))
+				}
+				fc.Close()
+
+				ns := newNoSWARCache(capacity)
+				for _, pk := range prewarm {
+					ns.Add("GET", pk)
+				}
+				if pureGet {
+					aNoSWAR = append(aNoSWAR, runPureGet(ops, 8, func(k string) { ns.Get("GET", k) }))
+				} else {
+					aNoSWAR = append(aNoSWAR, runner(ops, 8, func(k string) { ns.Get("GET", k) }, func(k string) { ns.Add("GET", k) }))
+				}
+				ns.Close()
+
+				np := newNoPadMmapCache(capacity)
+				for _, pk := range prewarm {
+					np.Add("GET", pk)
+				}
+				if pureGet {
+					aNoPad = append(aNoPad, runPureGet(ops, 8, func(k string) { np.Get("GET", k) }))
+				} else {
+					aNoPad = append(aNoPad, runner(ops, 8, func(k string) { np.Get("GET", k) }, func(k string) { np.Add("GET", k) }))
+				}
+				np.Close()
+
+				mc := newMutexLRU(capacity)
+				for _, pk := range prewarm {
+					mc.Add(pk, 1)
+				}
+				if pureGet {
+					aMutexLRU = append(aMutexLRU, runPureGet(ops, 8, func(k string) { mc.Get(k) }))
+				} else {
+					aMutexLRU = append(aMutexLRU, runner(ops, 8, func(k string) { mc.Get(k) }, func(k string) { mc.Add(k, 1) }))
+				}
+
+				rw := newRWMapCache(capacity)
+				for _, pk := range prewarm {
+					rw.Add(pk)
+				}
+				if pureGet {
+					aRWMap = append(aRWMap, runPureGet(ops, 8, func(k string) { rw.Get(k) }))
+				} else {
+					aRWMap = append(aRWMap, runner(ops, 8, func(k string) { rw.Get(k) }, func(k string) { rw.Add(k) }))
+				}
+			}
+			fm, fq1, fq3 := medianAndIQR(aFull)
+			nsm, nsq1, nsq3 := medianAndIQR(aNoSWAR)
+			npm, npq1, npq3 := medianAndIQR(aNoPad)
+			mlm, mlq1, mlq3 := medianAndIQR(aMutexLRU)
+			rwm, rwq1, rwq3 := medianAndIQR(aRWMap)
+			fmt.Printf("Full hardened: med=%.0f (IQR %.0f-%.0f)\n", fm, fq1, fq3)
+			fmt.Printf("No SWAR(mmap): med=%.0f (IQR %.0f-%.0f) [%.1f%%]\n", nsm, nsq1, nsq3, (nsm-fm)/fm*100)
+			fmt.Printf("No Pad (mmap): med=%.0f (IQR %.0f-%.0f) [%.1f%%]\n", npm, npq1, npq3, (npm-fm)/fm*100)
+			fmt.Printf("True MutexLRU: med=%.0f (IQR %.0f-%.0f) [%.1f%%]\n", mlm, mlq1, mlq3, (mlm-fm)/fm*100)
+			fmt.Printf("Map+RWMutex*:  med=%.0f (IQR %.0f-%.0f) [%.1f%%]\n", rwm, rwq1, rwq3, (rwm-fm)/fm*100)
+		}
+
+		fmt.Println("\n=== 2. HARDENED ABLATION (10 runs, median + IQR, identical mmap placement across Full/NoSWAR/NoPad) ===")
+		fmt.Printf("Regime A diagnostics (1000 keys in 16 sets): minH=%d maxH=%d overChunks=%d/16 overflowKeys=%d | hits=%d misses=%d (hitRate=%.2f%%) drops=%d\n",
+			minH, maxH, overChunks, overKeys, hitsA, missesA, ratioA*100, dropsA)
+		runAblation("Regime A0: Zero-Overflow Pre-Warmed 100% Get (960 keys, <=60/chunk, 0 misses/evictions)", resOps, residentKeys, true, nil)
+		runAblation("Regime A1: 80/20 Uniform-Pool (1000 keys, cap=1024)", uniformOps, nil, false, runNoSample)
+		runAblation("Regime B: 80/20 Zipfian (100k keys, cap=1024, active eviction)", zipfOps, nil, false, runNoSample)
+		runAblation("Regime C: 50/50 Zipfian (100k keys, cap=1024, write-heavy)", zipfOps, nil, false, runNoSample5050)
+	}
 
 	if *onlyAblation {
 		return
 	}
 
-	fmt.Println("\n=== 3. ZIPFIAN SCALING (10 runs, s=1.001, N=100k, cap=1024) ===")
-	var base1Core float64
-	for _, cores := range []int{1, 2, 4, 8} {
-		var vals []float64
-		for r := 0; r < runs; r++ {
-			c := liteLRU.NewLRUCache(capacity, 10)
-			vals = append(vals, runNoSample(zipfOps, cores, func(k string) { c.Get("GET", k, nil) }, func(k string) { c.Add("GET", k, nil, nil) }))
-			c.Close()
+	if onlyAll {
+		fmt.Println("\n=== 3. ZIPFIAN SCALING (10 runs, s=1.001, N=100k, cap=1024) ===")
+		var base1Core float64
+		for _, cores := range []int{1, 2, 4, 8} {
+			var vals []float64
+			for r := 0; r < runs; r++ {
+				c := liteLRU.NewLRUCache(capacity, 10)
+				vals = append(vals, runNoSample(zipfOps, cores, func(k string) { c.Get("GET", k, nil) }, func(k string) { c.Add("GET", k, nil, nil) }))
+				c.Close()
+			}
+			m, q1, q3 := medianAndIQR(vals)
+			if cores == 1 {
+				base1Core = m
+			}
+			fmt.Printf("%d cores: med=%.0f (IQR %.0f-%.0f) [%.2fx]\n", cores, m, q1, q3, m/base1Core)
 		}
-		m, q1, q3 := medianAndIQR(vals)
-		if cores == 1 {
-			base1Core = m
-		}
-		fmt.Printf("%d cores: med=%.0f (IQR %.0f-%.0f) [%.2fx]\n", cores, m, q1, q3, m/base1Core)
 	}
 
-	fmt.Println("\n=== 4. WRITE-HEAVY ZIPF (10 runs, N=1000, cap=1024) ===")
-	for _, mix := range []struct {
-		name   string
-		getPct int
-	}{{"50/50", 50}, {"20/80", 20}} {
-		type op struct {
-			isGet bool
-			k     string
-		}
-		zr := rand.New(rand.NewSource(42))
-		z := rand.NewZipf(zr, 1.001, 1, 999)
-		ks := make([]string, 1000)
-		for i := range ks {
-			ks[i] = strconv.Itoa(i)
-		}
-		wOps := make([]op, numOps)
-		addCount := 0
-		for i := range wOps {
-			g := zr.Intn(100) < mix.getPct
-			if !g {
-				addCount++
+	if onlyAll || *onlyWrite {
+		fmt.Println("\n=== 4. WRITE-HEAVY ZIPF & SEMANTIC-EQUIVALENCE CONTROLS (10 runs, cap=1024) ===")
+		fmt.Println("--- 4a. Direct Overwrite / Value-Update Contention (N=1000) ---")
+		for _, mix := range []struct {
+			name   string
+			getPct int
+		}{{"50/50", 50}, {"20/80", 20}} {
+			type op struct {
+				isGet bool
+				k     string
 			}
-			wOps[i] = op{isGet: g, k: ks[z.Uint64()]}
-		}
-		var lAtt, lEff, lDropPct, lHit, oOpsW []float64
-		for r := 0; r < runs; r++ {
-			lc := liteLRU.NewLRUCache(capacity, 10)
-			var wg sync.WaitGroup
-			wg.Add(8)
-			chunk := numOps / 8
-			st := time.Now()
-			for w := 0; w < 8; w++ {
-				go func(s, e int) {
-					defer wg.Done()
-					for i := s; i < e; i++ {
-						if wOps[i].isGet {
-							lc.Get("GET", wOps[i].k, nil)
-						} else {
-							lc.Add("GET", wOps[i].k, nil, nil)
+			zr := rand.New(rand.NewSource(42))
+			z := rand.NewZipf(zr, 1.001, 1, 999)
+			ks := make([]string, 1000)
+			for i := range ks {
+				ks[i] = strconv.Itoa(i)
+			}
+			wOps := make([]op, numOps)
+			addCount := 0
+			for i := range wOps {
+				g := zr.Intn(100) < mix.getPct
+				if !g {
+					addCount++
+				}
+				wOps[i] = op{isGet: g, k: ks[z.Uint64()]}
+			}
+			var lAtt, lEff, lDropPct, lHit, oOpsW []float64
+			for r := 0; r < runs; r++ {
+				lc := liteLRU.NewLRUCache(capacity, 10)
+				var wg sync.WaitGroup
+				wg.Add(8)
+				chunk := numOps / 8
+				st := time.Now()
+				for w := 0; w < 8; w++ {
+					go func(s, e int) {
+						defer wg.Done()
+						for i := s; i < e; i++ {
+							if wOps[i].isGet {
+								lc.Get("GET", wOps[i].k, nil)
+							} else {
+								lc.Add("GET", wOps[i].k, nil, nil)
+							}
 						}
-					}
-				}(w*chunk, (w+1)*chunk)
-			}
-			wg.Wait()
-			dur := time.Since(st).Seconds()
-			_, _, drops, ratio := lc.Stats()
-			lc.Close()
-			lAtt = append(lAtt, float64(numOps)/dur)
-			lEff = append(lEff, float64(numOps-int(drops))/dur)
-			lDropPct = append(lDropPct, float64(drops)/float64(addCount)*100)
-			lHit = append(lHit, ratio*100)
+					}(w*chunk, (w+1)*chunk)
+				}
+				wg.Wait()
+				dur := time.Since(st).Seconds()
+				_, _, drops, ratio := lc.Stats()
+				lc.Close()
+				lAtt = append(lAtt, float64(numOps)/dur)
+				lEff = append(lEff, float64(numOps-int(drops))/dur)
+				lDropPct = append(lDropPct, float64(drops)/float64(addCount)*100)
+				lHit = append(lHit, ratio*100)
 
-			oc, _ := otter.MustBuilder[string, any](capacity).Build()
-			wg.Add(8)
-			st = time.Now()
-			for w := 0; w < 8; w++ {
-				go func(s, e int) {
-					defer wg.Done()
-					for i := s; i < e; i++ {
-						if wOps[i].isGet {
-							oc.Get(wOps[i].k)
-						} else {
-							oc.Set(wOps[i].k, nil)
+				oc, _ := otter.MustBuilder[string, any](capacity).Build()
+				wg.Add(8)
+				st = time.Now()
+				for w := 0; w < 8; w++ {
+					go func(s, e int) {
+						defer wg.Done()
+						for i := s; i < e; i++ {
+							if wOps[i].isGet {
+								oc.Get(wOps[i].k)
+							} else {
+								oc.Set(wOps[i].k, nil)
+							}
 						}
-					}
-				}(w*chunk, (w+1)*chunk)
+					}(w*chunk, (w+1)*chunk)
+				}
+				wg.Wait()
+				dur = time.Since(st).Seconds()
+				oc.Close()
+				oOpsW = append(oOpsW, float64(numOps)/dur)
 			}
-			wg.Wait()
-			dur = time.Since(st).Seconds()
-			oc.Close()
-			oOpsW = append(oOpsW, float64(numOps)/dur)
+			am, aq1, aq3 := medianAndIQR(lAtt)
+			em, eq1, eq3 := medianAndIQR(lEff)
+			dm, _, _ := medianAndIQR(lDropPct)
+			hm, _, _ := medianAndIQR(lHit)
+			omw, oq1w, oq3w := medianAndIQR(oOpsW)
+			fmt.Printf("%s: liteAtt=%.0f (%.0f-%.0f) | liteEff=%.0f (%.0f-%.0f) | drop=%.2f%% | hit=%.2f%% | otter=%.0f (%.0f-%.0f) | effAdv=%.2fx\n",
+				mix.name, am, aq1, aq3, em, eq1, eq3, dm, hm, omw, oq1w, oq3w, em/omw)
 		}
-		am, aq1, aq3 := medianAndIQR(lAtt)
-		em, eq1, eq3 := medianAndIQR(lEff)
-		dm, _, _ := medianAndIQR(lDropPct)
-		hm, _, _ := medianAndIQR(lHit)
-		omw, oq1w, oq3w := medianAndIQR(oOpsW)
-		fmt.Printf("%s: liteAtt=%.0f (%.0f-%.0f) | liteEff=%.0f (%.0f-%.0f) | drop=%.2f%% | hit=%.2f%% | otter=%.0f (%.0f-%.0f) | effAdv=%.2fx\n",
-			mix.name, am, aq1, aq3, em, eq1, eq3, dm, hm, omw, oq1w, oq3w, em/omw)
+
+		fmt.Println("--- 4b. Immutable Insert-on-Miss Working-Set Maintenance ---")
+		for _, wsSize := range []int{1000, 5000} {
+			zr := rand.New(rand.NewSource(77))
+			z := rand.NewZipf(zr, 1.001, 1, uint64(wsSize-1))
+			ks := make([]string, wsSize)
+			for i := range ks {
+				ks[i] = strconv.Itoa(i)
+			}
+			mOps := make([]string, numOps)
+			for i := range mOps {
+				mOps[i] = ks[z.Uint64()]
+			}
+			var lOpsM, lHitM, lDropAbsM, oOpsM, oHitM []float64
+			for r := 0; r < runs; r++ {
+				lc := liteLRU.NewLRUCache(capacity, 10)
+				var wg sync.WaitGroup
+				wg.Add(8)
+				chunk := numOps / 8
+				st := time.Now()
+				for w := 0; w < 8; w++ {
+					go func(s, e int) {
+						defer wg.Done()
+						for i := s; i < e; i++ {
+							k := mOps[i]
+							if _, _, ok := lc.Get("GET", k, nil); !ok {
+								lc.Add("GET", k, nil, nil)
+							}
+						}
+					}(w*chunk, (w+1)*chunk)
+				}
+				wg.Wait()
+				dur := time.Since(st).Seconds()
+				_, misses, drops, ratio := lc.Stats()
+				lc.Close()
+				lOpsM = append(lOpsM, float64(numOps)/dur)
+				lHitM = append(lHitM, ratio*100)
+				dropPctMiss := 0.0
+				if misses > 0 {
+					dropPctMiss = float64(drops) / float64(misses) * 100
+				}
+				lDropAbsM = append(lDropAbsM, dropPctMiss)
+
+				oc, _ := otter.MustBuilder[string, any](capacity).Build()
+				var oHits atomic.Uint64
+				wg.Add(8)
+				st = time.Now()
+				for w := 0; w < 8; w++ {
+					go func(s, e int) {
+						defer wg.Done()
+						var localHits uint64
+						for i := s; i < e; i++ {
+							k := mOps[i]
+							if _, ok := oc.Get(k); ok {
+								localHits++
+							} else {
+								oc.Set(k, nil)
+							}
+						}
+						oHits.Add(localHits)
+					}(w*chunk, (w+1)*chunk)
+				}
+				wg.Wait()
+				dur = time.Since(st).Seconds()
+				oc.Close()
+				oOpsM = append(oOpsM, float64(numOps)/dur)
+				oHitM = append(oHitM, float64(oHits.Load())/float64(numOps)*100)
+			}
+			lm, lq1, lq3 := medianAndIQR(lOpsM)
+			lhm, _, _ := medianAndIQR(lHitM)
+			ldm, _, _ := medianAndIQR(lDropAbsM)
+			om, oq1, oq3 := medianAndIQR(oOpsM)
+			ohm, _, _ := medianAndIQR(oHitM)
+			fmt.Printf("Insert-on-Miss N=%d: liteLRU=%.0f (%.0f-%.0f) hit=%.2f%% missDrop=%.2f%% | otter=%.0f (%.0f-%.0f) hit=%.2f%% | adv=%.2fx\n",
+				wsSize, lm, lq1, lq3, lhm, ldm, om, oq1, oq3, ohm, lm/om)
+		}
 	}
 
-	fmt.Println("\n=== 5. ZIPF HIT RATE (10 runs, matched power-of-two caps, N=100k) ===")
+	if onlyAll {
+		fmt.Println("\n=== 5. ZIPF HIT RATE (10 runs, matched power-of-two caps, N=100k) ===")
 	for _, skew := range []float64{1.001, 0.80} {
 		const ws = 100000
 		const total = 2000000
@@ -1081,72 +1482,23 @@ func main() {
 			fmt.Printf("s=%.3f cap=%d (%.1f%%): liteLRU=%.2f%% vs Otter=%.2f%%\n",
 				skew, cap, float64(cap)/float64(ws)*100, lmh, omh)
 		}
+		}
 	}
 
-	fmt.Println("\n=== 6. GC ISOLATION EXPERIMENT (65,536 slots, background allocation pressure) ===")
-	measureGC := func(name string, useMmap bool) {
-		runtime.GC()
-		var mBefore, mAfter runtime.MemStats
-		runtime.ReadMemStats(&mBefore)
-
-		var offHeap *liteLRU.LRUCache
-		var onHeap *paddedOnHeapCache
-		if useMmap {
-			offHeap = liteLRU.NewLRUCache(65536, 10)
-			defer offHeap.Close()
-		} else {
-			onHeap = newPaddedOnHeapCache(65536)
+	if onlyAll || *onlyGC {
+		fmt.Println("\n=== 6. GC ISOLATION SUITE (65,536 slots, isolated subprocesses, identical 4-slice SoA fields) ===")
+		exe, err := os.Executable()
+		if err != nil {
+			panic(err)
 		}
-
-		// Pre-populate cache
-		for i := 0; i < 65536; i++ {
-			k := "/gc/" + strconv.Itoa(i)
-			if useMmap {
-				offHeap.Add("GET", k, nil, nil)
-			} else {
-				onHeap.Add("GET", k)
+		for _, mode := range []string{"1:gogc100", "0:gogc100", "1:memlimit64", "0:memlimit64", "1:steady", "0:steady"} {
+			cmd := exec.Command(exe, "--gc-sub", mode)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				fmt.Printf("mode %s error: %v (%s)\n", mode, err, string(out))
+				continue
 			}
+			fmt.Print(string(out))
 		}
-
-		// Run 8 workers doing cache ops + simulated request allocations so GC triggers repeatedly
-		var wg sync.WaitGroup
-		wg.Add(8)
-		st := time.Now()
-		for w := 0; w < 8; w++ {
-			go func(id int) {
-				defer wg.Done()
-				var sink []byte
-				for i := 0; i < 200000; i++ {
-					k := "/gc/" + strconv.Itoa((id*997+i)%65536)
-					if i%5 == 0 {
-						if useMmap {
-							offHeap.Add("GET", k, nil, nil)
-						} else {
-							onHeap.Add("GET", k)
-						}
-					} else {
-						if useMmap {
-							offHeap.Get("GET", k, nil)
-						} else {
-							onHeap.Get("GET", k)
-						}
-					}
-					if i%8 == 0 {
-						sink = make([]byte, 512)
-						sink[0] = byte(i)
-					}
-				}
-				runtime.KeepAlive(sink)
-			}(w)
-		}
-		wg.Wait()
-		dur := time.Since(st)
-		runtime.ReadMemStats(&mAfter)
-		numGC := mAfter.NumGC - mBefore.NumGC
-		pauseMs := float64(mAfter.PauseTotalNs-mBefore.PauseTotalNs) / 1e6
-		fmt.Printf("%-22s: ops/s=%9.0f | NumGC=%3d | PauseTotal=%.3fms | HeapObjects=%d | GCCPUFraction=%.5f\n",
-			name, float64(1600000)/dur.Seconds(), numGC, pauseMs, mAfter.HeapObjects, mAfter.GCCPUFraction)
 	}
-	measureGC("Off-heap mmap metadata", true)
-	measureGC("On-heap Go slice meta", false)
 }

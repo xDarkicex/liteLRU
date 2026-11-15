@@ -262,7 +262,20 @@ func (c *LRUCache) findVictim(group uint32) uint32 {
 	}
 }
 
-// Add adds a new entry to the cache or performs a best-effort in-place update of an existing one.
+// Add performs a best-effort, non-linearizable cache insertion or in-place update.
+//
+// Concurrency and progress contract:
+//   - Concurrent cold misses on the same key may insert duplicate valid entries into
+//     distinct slots within the same 64-way set; Get returns the lowest-index match,
+//     so a later-completed Add does not necessarily supersede an earlier one, and evicting
+//     an earlier slot can resurface an older duplicate.
+//   - Per-slot ownership acquisition (W_k) is bounded to R=10 CAS retries per matched
+//     fast-path slot and per findVictim eviction scan, shedding load (drops++) rather than
+//     spinning unboundedly under contention; post-claim signature-word CAS updates
+//     (chk.sigs) retry outside the R=10 budget under intra-word contention.
+//   - On miss/update, immutable key/value wrappers (and fresh []Param copies when non-empty)
+//     are allocated on the Go heap for safe atomic.Pointer publication.
+// Callers requiring strict linearizable upserts over mutable values must synchronize externally.
 func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param) {
 	hash := hashRoute(method, path)
 	group := uint32(hash % uint64(c.numGroups))
@@ -373,8 +386,10 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 	chk.writing.And(^mask)                 // release exclusive writer ownership
 }
 
-// Get retrieves an entry from the cache lock-free with zero heap allocations
-// when cap(dst) >= len(params).
+// Get retrieves an entry from the cache via bounded-probe lock-free reads, incurring
+// zero heap allocations when cap(dst) >= len(params) (including nil when len(params) == 0).
+// Slots in the hashed 64-way set are scanned in ascending index order, returning the
+// lowest-index valid match observed cleanly under its seqlock.
 func (c *LRUCache) Get(method, path string, dst []Param) (HandlerFunc, []Param, bool) {
 	hash := hashRoute(method, path)
 	group := uint32(hash % uint64(c.numGroups))
@@ -442,7 +457,13 @@ func (c *LRUCache) Get(method, path string, dst []Param) (HandlerFunc, []Param, 
 	return nil, nil, false
 }
 
-// Clear gracefully removes all entries from the cache.
+// Clear removes all entries from the cache chunk-by-chunk.
+//
+// For each 64-slot chunk, Clear waits for W_k == 0 via runtime.Gosched() and atomically
+// claims all 64 ownership bits via CompareAndSwap(0, ^uint64(0)), zeroes valid/accessed/sigs
+// atomically, monotonically advances seqlocks while clearing payload pointers, and releases W_k.
+// Because Clear is blocking and not starvation-free under continuous concurrent writes, callers
+// requiring deterministic teardown latency must quiesce writers externally.
 func (c *LRUCache) Clear() {
 	for group := uint32(0); group < c.numGroups; group++ {
 		chk := &c.chunks[group]
