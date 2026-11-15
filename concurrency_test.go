@@ -278,3 +278,169 @@ func TestS3FIFOScanResistanceAndGhostPromotion(t *testing.T) {
 		t.Fatalf("expected Ghost-hit key %s to be admitted directly to Main (prob=0)", probeKey)
 	}
 }
+
+func TestAllPoliciesScanConcurrencyAndAlloc(t *testing.T) {
+	policies := []EvictionPolicy{PolicyCLOCK, PolicyCLOCKPlus, PolicyS3FIFO}
+
+	for _, pol := range policies {
+		t.Run(pol.String(), func(t *testing.T) {
+			c := NewLRUCacheWithPolicy(256, 4, pol)
+			defer c.Close()
+
+			var pbuf [4]Param
+			params := []Param{{Key: "k", Value: "v"}}
+			c.Add("GET", "/alloc/hit", func() {}, params)
+			allocs := testing.AllocsPerRun(100, func() {
+				_, _, ok := c.Get("GET", "/alloc/hit", pbuf[:0])
+				if !ok {
+					t.Fatal("expected hit")
+				}
+			})
+			if allocs != 0 {
+				t.Fatalf("expected 0 allocs/op on %s Get hit, got %v", pol, allocs)
+			}
+
+			// Concurrent stress with contention and Clear
+			var wg sync.WaitGroup
+			for w := 0; w < 8; w++ {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					var buf [4]Param
+					for i := 0; i < 4000; i++ {
+						k := fmt.Sprintf("/k/%d", (id*31+i)%300)
+						if i%4 == 0 {
+							c.Add("GET", k, nil, params)
+						} else {
+							c.Get("GET", k, buf[:0])
+						}
+					}
+				}(w)
+			}
+			wg.Wait()
+		})
+	}
+
+	// Verify CLOCK+ scan resistance retains hot protected (F=1) keys across >cap scans
+	cp := NewLRUCacheWithPolicy(64, 4, PolicyCLOCKPlus)
+	defer cp.Close()
+	for i := 0; i < 16; i++ {
+		k := fmt.Sprintf("/hot/%d", i)
+		cp.Add("GET", k, nil, nil)
+		cp.Get("GET", k, nil)
+		cp.Get("GET", k, nil) // F=1 protected
+	}
+	for i := 0; i < 256; i++ {
+		cp.Add("GET", fmt.Sprintf("/scan/%d", i), nil, nil)
+	}
+	for i := 0; i < 16; i++ {
+		if _, _, ok := cp.Get("GET", fmt.Sprintf("/hot/%d", i), nil); !ok {
+			t.Fatalf("expected CLOCK+ protected key /hot/%d to survive scan", i)
+		}
+	}
+}
+
+func growStackAndTouchStripe(depth int, out *uint) {
+	var pad [512]byte
+	pad[0] = byte(depth)
+	if depth <= 0 {
+		*out = workerStripe()
+		_ = pad[0]
+		return
+	}
+	growStackAndTouchStripe(depth-1, out)
+}
+
+func TestWorkerStripeDistributionAndStackGrowth(t *testing.T) {
+	// Measure distinct stripe occupancy when G concurrent goroutines hold distinct stacks.
+	for _, gCount := range []int{8, 16, 32, 128} {
+		stripes := make([]uint, gCount)
+		ready := make(chan struct{})
+		var readyWG sync.WaitGroup
+		var doneWG sync.WaitGroup
+		readyWG.Add(gCount)
+		doneWG.Add(gCount)
+		for g := 0; g < gCount; g++ {
+			go func(idx int) {
+				defer doneWG.Done()
+				stripes[idx] = workerStripe()
+				readyWG.Done()
+				<-ready
+			}(g)
+		}
+		readyWG.Wait()
+		close(ready)
+		doneWG.Wait()
+
+		var counts [128]int
+		distinct := 0
+		maxBucket := 0
+		for _, s := range stripes {
+			if s >= 128 {
+				t.Fatalf("stripe index out of range: %d", s)
+			}
+			if counts[s] == 0 {
+				distinct++
+			}
+			counts[s]++
+			if counts[s] > maxBucket {
+				maxBucket = counts[s]
+			}
+		}
+		t.Logf("G=%d concurrent goroutines -> %d distinct stripes (max per stripe=%d)", gCount, distinct, maxBucket)
+		if gCount <= 32 && distinct < gCount/2 {
+			t.Fatalf("poor stripe spread for G=%d: only %d distinct stripes", gCount, distinct)
+		}
+		if gCount == 128 && distinct < 64 {
+			t.Fatalf("poor stripe spread for G=128: only %d distinct stripes", distinct)
+		}
+	}
+
+	// Verify forced stack growth preserves exact Stats() totals even if stripe index moves.
+	c := NewLRUCache(128, 4)
+	defer c.Close()
+	c.Add("GET", "/stripe/hot", nil, nil)
+
+	const goroutines = 16
+	const opsPerG = 500
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	relocated := make([]atomic.Bool, goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			defer wg.Done()
+			before := workerStripe()
+			for i := 0; i < opsPerG; i++ {
+				if i == opsPerG/2 {
+					var after uint
+					growStackAndTouchStripe(48, &after) // >24 KiB stack expansion
+					if after != before {
+						relocated[id].Store(true)
+					}
+				}
+				if i%2 == 0 {
+					c.Get("GET", "/stripe/hot", nil)
+				} else {
+					c.Get("GET", "/stripe/miss", nil)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	relocCount := 0
+	for i := range relocated {
+		if relocated[i].Load() {
+			relocCount++
+		}
+	}
+	hits, misses, _, _ := c.Stats()
+	wantHits := int64(goroutines * (opsPerG / 2))
+	wantMisses := int64(goroutines * (opsPerG / 2))
+	if hits != wantHits || misses != wantMisses {
+		t.Fatalf("stat accounting mismatch across stack growth: got hits=%d misses=%d, want hits=%d misses=%d",
+			hits, misses, wantHits, wantMisses)
+	}
+	t.Logf("stack growth (>24 KiB): %d/%d goroutines relocated stripe; exact stats hits=%d misses=%d",
+		relocCount, goroutines, hits, misses)
+}

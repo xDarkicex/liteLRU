@@ -21,7 +21,11 @@ type RouteResult struct {
 	Params  []liteLRU.Param
 }
 
-var cacheType = flag.String("cache", "none", "Cache to use: none, litelru, otter")
+var (
+	cacheType = flag.String("cache", "none", "Cache to use: none, litelru, otter")
+	cacheCap  = flag.Int("cap", 65536, "Matched power-of-two cache capacity")
+	listenAddr = flag.String("addr", ":8099", "HTTP listen address")
+)
 
 type ComplexPayload struct {
 	ID          int                      `json:"id"`
@@ -67,7 +71,7 @@ func init() {
 func main() {
 	flag.Parse()
 
-	const capacity = 75000 // 75% of 100K working set
+	capacity := *cacheCap
 
 	var lite *liteLRU.LRUCache
 	var otterCache otter.Cache[string, string]
@@ -75,7 +79,8 @@ func main() {
 
 	if *cacheType == "litelru" {
 		lite = liteLRU.NewLRUCache(capacity, 5)
-		fmt.Println("Using liteLRU cache")
+		defer lite.Close()
+		fmt.Printf("Using liteLRU v2 cache (matched cap=%d)\n", capacity)
 	} else if *cacheType == "otter" {
 		var err error
 		otterCache, err = otter.MustBuilder[string, string](capacity).Build()
@@ -88,10 +93,19 @@ func main() {
 		if err2 != nil {
 			log.Fatal(err2)
 		}
-		fmt.Println("Using Otter v2 cache")
+		fmt.Printf("Using Otter v1.2.4 cache (matched cap=%d)\n", capacity)
 	} else {
 		fmt.Println("Using NO cache (origin only)")
 	}
+
+	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		if lite != nil {
+			hits, misses, drops, ratio := lite.Stats()
+			fmt.Fprintf(w, "hits=%d misses=%d drops=%d hit_rate=%.2f%%\n", hits, misses, drops, ratio*100)
+			return
+		}
+		fmt.Fprintln(w, "stats=unavailable")
+	})
 
 	http.HandleFunc("/route/", func(w http.ResponseWriter, r *http.Request) {
 		idStr := strings.TrimPrefix(r.URL.Path, "/route/")
@@ -285,6 +299,6 @@ func main() {
 		http.NotFound(w, r)
 	})
 
-	fmt.Println("Listening on :8099...")
-	log.Fatal(http.ListenAndServe(":8099", nil))
+	fmt.Printf("Listening on %s...\n", *listenAddr)
+	log.Fatal(http.ListenAndServe(*listenAddr, nil))
 }

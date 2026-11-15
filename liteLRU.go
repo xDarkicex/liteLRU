@@ -1,5 +1,18 @@
 // Package liteLRU implements a high-performance, contention-bounded set-associative cache
 // combining off-heap mmap chunked bitmask synchronization with immutable Go-heap entries.
+//
+// Correctness and Concurrency Model:
+//   - Hard Safety via W_k and Immutable Snapshots: All slot mutations serialize via per-slot
+//     ownership bits W_k[i]; every entry snapshot (*cacheEntry and its []Param slice) is
+//     immutable after atomic.Pointer.Store publication.
+//   - Single-Pass Lock-Free Reads: Get loads chk.valid once at entry as a residency candidate
+//     filter and relies on sequential-consistency ordering of entries[idx].Store before sigs
+//     publication rather than re-checking chk.valid after dereferencing. A reader whose initial
+//     validBits snapshot had bit i=1 may therefore observe either the old or newly stored
+//     immutable snapshot during an overwrite; both remain memory-safe and untorn.
+//   - Relaxed Policy Bitmasks: Policy masks (prob, f0, f1, ghost0, ghost1) update without a
+//     single multi-word transaction, trading occasional bitmask skew under concurrent aging for
+//     zero-lock eviction selection without compromising slot ownership or snapshot safety.
 package liteLRU
 
 import (
@@ -113,11 +126,38 @@ type statStripe struct {
 	_      [CacheLineSize - 24]byte
 }
 
+// EvictionPolicy identifies the chunk-local victim selection policy on the v2 engine.
+type EvictionPolicy uint8
+
+const (
+	// PolicyS3FIFO selects victims using bit-sliced S3-FIFO with a 128-bit resetting Ghost filter.
+	PolicyS3FIFO EvictionPolicy = iota
+	// PolicyCLOCK selects victims using 1-bit per-slot CLOCK access masks (A_k stored in f0).
+	PolicyCLOCK
+	// PolicyCLOCKPlus selects victims using 2-bit frequency-protected Bitmask CLOCK+ (V & ^A & ^F & ^W).
+	PolicyCLOCKPlus
+)
+
+// String returns the canonical policy identifier.
+func (p EvictionPolicy) String() string {
+	switch p {
+	case PolicyS3FIFO:
+		return "s3fifo"
+	case PolicyCLOCK:
+		return "clock"
+	case PolicyCLOCKPlus:
+		return "clock+"
+	default:
+		return "unknown"
+	}
+}
+
 // LRUCache implements a contention-bounded 64-way set-associative cache backed by
-// off-heap mmap Bitmask S3-FIFO control chunks and immutable single-pointer Go-heap entries.
+// off-heap mmap chunk control metadata and immutable single-pointer Go-heap entries.
 type LRUCache struct {
 	capacity  uint32
 	maxParams int
+	policy    EvictionPolicy
 
 	entries []atomic.Pointer[cacheEntry]
 
@@ -154,11 +194,17 @@ func mmapSlice[T any](n int) ([]T, []byte) {
 	return unsafe.Slice((*T)(unsafe.Pointer(unsafe.SliceData(slab))), n), slab
 }
 
-// NewLRUCache creates a new lock-free 64-way set-associative Bitmask S3-FIFO cache.
+// NewLRUCache creates a new lock-free 64-way set-associative cache using the default policy.
 // Control metadata lives in off-heap mmap chunks (128 bytes per 64 slots = 2 bytes/slot),
 // while immutable entry snapshots are referenced via a single atomic.Pointer array on Go heap.
 // Call Close() to unmap off-heap slabs when the cache is no longer needed.
 func NewLRUCache(capacity, maxParams int) *LRUCache {
+	return NewLRUCacheWithPolicy(capacity, maxParams, PolicyS3FIFO)
+}
+
+// NewLRUCacheWithPolicy creates a v2 cache configured with a specific chunk-local eviction policy
+// while holding single-pointer immutable entries, SWAR lookup, W_k ownership, and telemetry fixed.
+func NewLRUCacheWithPolicy(capacity, maxParams int, policy EvictionPolicy) *LRUCache {
 	if capacity <= 0 {
 		capacity = 1024
 	}
@@ -177,11 +223,17 @@ func NewLRUCache(capacity, maxParams int) *LRUCache {
 	return &LRUCache{
 		capacity:   uint32(capacity),
 		maxParams:  maxParams,
+		policy:     policy,
 		entries:    entries,
 		chunks:     chunks,
 		chunksSlab: chunksSlab,
 		numGroups:  numGroups,
 	}
+}
+
+// Policy returns the configured chunk-local eviction policy.
+func (c *LRUCache) Policy() EvictionPolicy {
+	return c.policy
 }
 
 // Close releases all off-heap mmap slabs. The cache must not be used after Close.
@@ -234,10 +286,143 @@ func promoteFreq(chk *chunk, mask uint64) {
 	}
 }
 
-// findVictim uses Bitmask S3-FIFO within a 64-slot set to claim an unowned victim slot
-// under exclusive W_k ownership, shedding load after 10 failed retries.
+func (c *LRUCache) onHit(chk *chunk, mask uint64) {
+	if c.policy == PolicyCLOCK {
+		if (chk.f0.Load() & mask) == 0 {
+			chk.f0.Or(mask)
+		}
+		return
+	}
+	promoteFreq(chk, mask)
+}
+
+func (c *LRUCache) onAdmit(chk *chunk, mask uint64, hash uint64, old *cacheEntry) {
+	switch c.policy {
+	case PolicyCLOCK:
+		chk.f0.Or(mask)
+	case PolicyCLOCKPlus:
+		// New admissions start unprotected (A=0, F=0); hits promote 00 -> 01 -> 11.
+		chk.f0.And(^mask)
+		chk.f1.And(^mask)
+	default: // PolicyS3FIFO
+		if old != nil && (chk.prob.Load()&mask) != 0 {
+			// Unhit Small eviction: record hash into per-chunk Ghost Bloom filter.
+			c.recordGhost(chk, hashRoute(old.method, old.path))
+		}
+		if c.inGhost(chk, hash) {
+			chk.prob.And(^mask) // Ghost hit: admit directly to Main
+		} else {
+			chk.prob.Or(mask) // Cold miss: admit to Small probationary queue
+		}
+		chk.f0.And(^mask)
+		chk.f1.And(^mask)
+	}
+}
+
+func tryClaimSlot(chk *chunk, group uint32, writingBits uint64, bit uint32) (uint32, bool) {
+	casMetricAttempt()
+	if chk.writing.CompareAndSwap(writingBits, writingBits|(uint64(1)<<bit)) {
+		return group*64 + bit, true
+	}
+	casMetricFailure()
+	return 0, false
+}
+
+// findVictim claims an unowned victim slot under exclusive W_k ownership using the
+// configured policy, shedding load after 10 failed retries.
 func (c *LRUCache) findVictim(group uint32) uint32 {
 	chk := &c.chunks[group]
+	switch c.policy {
+	case PolicyCLOCK:
+		return c.findVictimCLOCK(chk, group)
+	case PolicyCLOCKPlus:
+		return c.findVictimCLOCKPlus(chk, group)
+	default:
+		return c.findVictimS3FIFO(chk, group)
+	}
+}
+
+func (c *LRUCache) findVictimCLOCK(chk *chunk, group uint32) uint32 {
+	for retries := 0; retries < 10; retries++ {
+		validBits := chk.valid.Load()
+		writingBits := chk.writing.Load()
+		avail := ^writingBits
+
+		if empty := ^validBits & avail; empty != 0 {
+			bit := uint32(bits.TrailingZeros64(empty))
+			if idx, ok := tryClaimSlot(chk, group, writingBits, bit); ok {
+				return idx
+			}
+			continue
+		}
+
+		f0 := chk.f0.Load()
+		if cold := validBits & ^f0 & avail; cold != 0 {
+			bit := pickFromHand(cold, chk.hand.Load())
+			if idx, ok := tryClaimSlot(chk, group, writingBits, bit); ok {
+				chk.hand.Store((bit + 1) & 63)
+				return idx
+			}
+			continue
+		}
+
+		if (validBits & avail) != 0 {
+			chk.f0.And(^validBits | writingBits)
+			casMetricAging()
+		}
+		if writingBits != 0 {
+			runtime.Gosched()
+		}
+	}
+	casMetricExhausted()
+	return 0xFFFFFFFF
+}
+
+func (c *LRUCache) findVictimCLOCKPlus(chk *chunk, group uint32) uint32 {
+	for retries := 0; retries < 10; retries++ {
+		validBits := chk.valid.Load()
+		writingBits := chk.writing.Load()
+		avail := ^writingBits
+
+		if empty := ^validBits & avail; empty != 0 {
+			bit := uint32(bits.TrailingZeros64(empty))
+			if idx, ok := tryClaimSlot(chk, group, writingBits, bit); ok {
+				return idx
+			}
+			continue
+		}
+
+		f0 := chk.f0.Load()
+		f1 := chk.f1.Load()
+		if cold := validBits & ^f0 & ^f1 & avail; cold != 0 {
+			bit := pickFromHand(cold, chk.hand.Load())
+			if idx, ok := tryClaimSlot(chk, group, writingBits, bit); ok {
+				chk.hand.Store((bit + 1) & 63)
+				return idx
+			}
+			continue
+		}
+
+		// Clear A_k only on unprotected slots (V & ^F & ^W) first so F=1 entries stay pinned.
+		if unprot := validBits & ^f1 & avail; unprot != 0 {
+			chk.f0.And(^unprot)
+			casMetricAging()
+		} else if availValid := validBits & avail; availValid != 0 {
+			// If all available valid slots are protected (F=1), decay (F, A) -> (0, F).
+			chk.f0.And(^availValid | f1)
+			chk.f1.And(^availValid)
+			casMetricAging()
+		}
+
+		if writingBits != 0 {
+			runtime.Gosched()
+		}
+	}
+	casMetricExhausted()
+	return 0xFFFFFFFF
+}
+
+func (c *LRUCache) findVictimS3FIFO(chk *chunk, group uint32) uint32 {
 	const smallTarget = 4
 
 	for retries := 0; retries < 10; retries++ {
@@ -248,8 +433,8 @@ func (c *LRUCache) findVictim(group uint32) uint32 {
 		// 1. Empty slots first
 		if empty := ^validBits & avail; empty != 0 {
 			bit := uint32(bits.TrailingZeros64(empty))
-			if chk.writing.CompareAndSwap(writingBits, writingBits|(uint64(1)<<bit)) {
-				return group*64 + bit
+			if idx, ok := tryClaimSlot(chk, group, writingBits, bit); ok {
+				return idx
 			}
 			continue
 		}
@@ -269,9 +454,9 @@ func (c *LRUCache) findVictim(group uint32) uint32 {
 		if bits.OnesCount64(probBits) >= smallTarget {
 			if coldSmall := probBits & ^f0 & avail; coldSmall != 0 {
 				bit := pickFromHand(coldSmall, chk.hand.Load())
-				if chk.writing.CompareAndSwap(writingBits, writingBits|(uint64(1)<<bit)) {
+				if idx, ok := tryClaimSlot(chk, group, writingBits, bit); ok {
 					chk.hand.Store((bit + 1) & 63)
-					return group*64 + bit
+					return idx
 				}
 				continue
 			}
@@ -283,9 +468,9 @@ func (c *LRUCache) findVictim(group uint32) uint32 {
 			f0 = chk.f0.Load()
 			if coldMain := mainBits & ^f0 & avail; coldMain != 0 {
 				bit := pickFromHand(coldMain, chk.handM.Load())
-				if chk.writing.CompareAndSwap(writingBits, writingBits|(uint64(1)<<bit)) {
+				if idx, ok := tryClaimSlot(chk, group, writingBits, bit); ok {
 					chk.handM.Store((bit + 1) & 63)
-					return group*64 + bit
+					return idx
 				}
 				continue
 			}
@@ -293,13 +478,14 @@ func (c *LRUCache) findVictim(group uint32) uint32 {
 			f1 := chk.f1.Load()
 			chk.f0.And(^mainBits | f1)
 			chk.f1.And(^mainBits)
+			casMetricAging()
 		} else if cold := validBits & avail; cold != 0 {
 			// Rare fallback if Small holds all 64 slots simultaneously.
 			chk.f0.Store(0)
 			bit := pickFromHand(cold, chk.hand.Load())
-			if chk.writing.CompareAndSwap(writingBits, writingBits|(uint64(1)<<bit)) {
+			if idx, ok := tryClaimSlot(chk, group, writingBits, bit); ok {
 				chk.hand.Store((bit + 1) & 63)
-				return group*64 + bit
+				return idx
 			}
 			continue
 		}
@@ -308,6 +494,7 @@ func (c *LRUCache) findVictim(group uint32) uint32 {
 			runtime.Gosched()
 		}
 	}
+	casMetricExhausted()
 	return 0xFFFFFFFF
 }
 
@@ -376,9 +563,11 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 						c.stats[workerStripe()].drops.Add(1)
 						return
 					}
+					casMetricAttempt()
 					if chk.writing.CompareAndSwap(w, w|mask) {
 						break
 					}
+					casMetricFailure()
 					if retries+1 >= 10 {
 						c.stats[workerStripe()].drops.Add(1)
 						return
@@ -392,14 +581,14 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 				}
 
 				c.entries[idx].Store(newEntry)
-				promoteFreq(chk, mask)
+				c.onHit(chk, mask)
 				chk.writing.And(^mask)
 				return
 			}
 		}
 	}
 
-	// 2. Miss: claim a victim slot in this 64-way set via Bitmask S3-FIFO.
+	// 2. Miss: claim a victim slot in this 64-way set via the configured eviction policy.
 	victimIdx := c.findVictim(group)
 	if victimIdx == 0xFFFFFFFF {
 		c.stats[workerStripe()].drops.Add(1)
@@ -409,10 +598,7 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 	mask := uint64(1) << bit
 
 	chk.valid.And(^mask)
-	if old := c.entries[victimIdx].Load(); old != nil && (chk.prob.Load()&mask) != 0 {
-		// Unhit Small eviction: record hash into per-chunk Ghost Bloom filter.
-		c.recordGhost(chk, hashRoute(old.method, old.path))
-	}
+	old := c.entries[victimIdx].Load()
 	c.entries[victimIdx].Store(newEntry)
 
 	sigWordIdx := bit / 8
@@ -420,27 +606,26 @@ func (c *LRUCache) Add(method, path string, handler HandlerFunc, params []Param)
 	for {
 		oldWord := chk.sigs[sigWordIdx].Load()
 		newWord := (oldWord & ^(uint64(0xFF) << sigByteShift)) | (uint64(sig8) << sigByteShift)
+		casMetricSigAttempt()
 		if chk.sigs[sigWordIdx].CompareAndSwap(oldWord, newWord) {
 			break
 		}
+		casMetricSigFailure()
 	}
 
-	if c.inGhost(chk, hash) {
-		chk.prob.And(^mask) // Ghost hit: admit directly to Main
-	} else {
-		chk.prob.Or(mask) // Cold miss: admit to Small probationary queue
-	}
-	chk.f0.And(^mask)
-	chk.f1.And(^mask)
+	c.onAdmit(chk, mask, hash, old)
 
 	chk.valid.Or(mask)
 	chk.writing.And(^mask)
 }
 
-// Get retrieves an entry from the cache via lock-free single-pointer immutable snapshots,
-// incurring zero heap allocations when cap(dst) >= len(params) (including nil when len(params) == 0).
-// Because key matching completes before dst is written and entries are immutable after publication,
-// dst is never mutated on a failed lookup or miss.
+// Get retrieves an entry from the cache via single-pass, lock-free immutable snapshot
+// reads, incurring zero heap allocations when cap(dst) >= len(params) (including nil when
+// len(params) == 0).
+//
+// chk.valid.Load() at entry acts as a residency candidate filter (no post-read reload).
+// Because key matching completes before dst is written and every published *cacheEntry is
+// immutable, readers always observe complete snapshots and dst is never mutated on a miss.
 func (c *LRUCache) Get(method, path string, dst []Param) (HandlerFunc, []Param, bool) {
 	hash := hashRoute(method, path)
 	group := uint32(hash & uint64(c.numGroups-1))
@@ -487,7 +672,7 @@ func (c *LRUCache) Get(method, path string, dst []Param) (HandlerFunc, []Param, 
 				copy(copiedParams, ep.params)
 			}
 
-			promoteFreq(chk, uint64(1)<<bit)
+			c.onHit(chk, uint64(1)<<bit)
 			c.stats[workerStripe()].hits.Add(1)
 			return ep.handler, copiedParams, true
 		}

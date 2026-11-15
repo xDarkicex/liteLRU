@@ -50,7 +50,7 @@ Managed Runtimes via Chunked Bitmasks}}
 \maketitle
 
 \begin{abstract}
-Concurrent approximate LRU structures often serialize cores on shared metadata. We investigate whether a bounded-probe, 64-way set-associative cache combining bit-sliced S3-FIFO eviction, single-pointer immutable payloads, and contention-aware admission load-shedding can achieve both high scan-resistant hit rates and predictable concurrency costs without centralized locking in a garbage-collected runtime. We present \texttt{liteLRU} (v2), a fixed-capacity cache in Go whose compact synchronization metadata (SWAR signatures, Small/Main partitions, 2-bit bit-sliced frequencies, 128-bit Ghost Bloom filter, and writer ownership masks) packs into 128-byte off-heap \texttt{mmap} chunks (2~bytes/slot), while key/value snapshots reside on the Go heap behind a single \texttt{atomic.Pointer[cacheEntry]} per slot (8~bytes/slot). Reads provide lock-free bounded-probe execution with zero heap allocations on hits when supplied a caller buffer and never mutate that buffer on misses; writes are best-effort, non-linearizable cache insertions/updates capping per-slot ownership CAS retries at $R=10$. Across 10-run hardened evaluations on an 8-core Apple M2 (24 GB RAM), \texttt{liteLRU} sustains \textbf{51.32M~ops/s} on the uniform 80/20 baseline ($3.14\times$ \texttt{otter v1.2.4} and $7.29\times$ \texttt{Mutex LRU}, with 500~ns sampled p99 vs.\ 9.90~\textmu s for \texttt{otter}), leads \texttt{otter} across both immutable insert-on-miss workloads (\textbf{128.59M vs.\ 113.74M~ops/s} at $N=1\text{k}$; \textbf{56.29M vs.\ 9.12M~ops/s} at \texttt{cap=16384, N=100k}) and direct overwrite contention (\textbf{26.57M--32.51M} effective ops/s, $5.33\times\text{--}6.58\times$ \texttt{otter}), achieves higher matched-capacity Zipfian hit rates than \texttt{otter} across all six $(s, \text{cap})$ points ($+0.05$ to $+2.38\text{ pp}$), and delivers a $1.30\times$ end-to-end throughput advantage under an explicit 5~\textmu s backend miss penalty (\S 9.1, \S 9.6, \S 9.7).
+Concurrent approximate LRU structures often serialize cores on shared metadata. We investigate whether a bounded-probe, 64-way set-associative cache combining bit-sliced S3-FIFO eviction, single-pointer immutable payloads, and contention-aware admission load-shedding can achieve both high scan-resistant hit rates and predictable concurrency costs without centralized locking in a garbage-collected runtime. We present \texttt{liteLRU} (v2), a fixed-capacity cache in Go whose compact synchronization metadata (SWAR signatures, Small/Main partitions, 2-bit bit-sliced frequencies, 128-bit resetting Ghost Bloom filter, and writer ownership masks) packs into 128-byte off-heap \texttt{mmap} chunks (2~bytes/slot), while key/value snapshots reside on the Go heap behind a single \texttt{atomic.Pointer[cacheEntry]} per slot (8~bytes/slot). Reads provide single-pass lock-free bounded-probe execution with zero heap allocations on hits when supplied a caller buffer and never mutate that buffer on misses; writes are best-effort, non-linearizable cache insertions/updates capping per-slot ownership CAS retries at $R=10$. Across 10-run hardened evaluations on an 8-core Apple M2 (24 GB RAM), \texttt{liteLRU} sustains \textbf{51.32M~ops/s} on the uniform 80/20 baseline ($3.14\times$ \texttt{otter v1.2.4} and $7.29\times$ \texttt{Mutex LRU}, with 500~ns sampled p99 vs.\ 9.90~\textmu s for \texttt{otter}), leads \texttt{otter} across immutable insert-on-miss workloads (\textbf{128.59M vs.\ 113.74M~ops/s} at $N=1\text{k}$ where \texttt{otter} achieves 99.94\% vs.\ 99.19\% hits; \textbf{56.29M vs.\ 9.12M~ops/s} at \texttt{cap=16384, N=100k}) and direct overwrite contention (\textbf{26.57M--32.51M} effective ops/s, $5.33\times\text{--}6.58\times$ \texttt{otter} with 4.67\%--5.30\% overlapping-slot drops vs.\ full queuing), achieves higher matched-capacity Zipfian hit rates than \texttt{otter} across all six $(s, \text{cap})$ points ($+0.05$ to $+2.38\text{ pp}$), and delivers a $1.30\times$ end-to-end throughput advantage under an explicit 5~\textmu s backend miss penalty, while matched-capacity loopback \texttt{net/http} throughput remains TCP/serialization bound (76.4k--80.7k vs.\ 82.1k--82.9k~req/s for \texttt{otter}). A controlled 3-policy comparison on the identical v2 engine validates retaining \texttt{PolicyS3FIFO} as the default over \texttt{PolicyCLOCK} and \texttt{PolicyCLOCKPlus}.
 \end{abstract}
 
 \section{Background: The Hardware Model}
@@ -142,14 +142,14 @@ Traditional LRU~\cite{lru1965} maintains doubly-linked lists requiring 8 pointer
 
 \subsection{Bit-Sliced S3-FIFO Inside 128-Byte Chunks}
 
-In v1, each chunk used a single bit $A_k$ (1-bit CLOCK~\cite{clock1969}), which lacked scan resistance (0/256 retained in \S 9.11) and collapsed to 0.00\% on a 65-key cyclic loop. \texttt{liteLRU} v2 embeds a full \textbf{S3-FIFO} replacement policy inside each 64-slot chunk's second 64~bytes ($[64,128)$) via orthogonal 64-bit masks and two 6-bit rotating hands (\texttt{hand}, \texttt{handM}):
+In v1, each chunk used a single bit $A_k$ (1-bit CLOCK~\cite{clock1969}), which lacked scan resistance (0/256 retained in \S 9.11) and collapsed to 0.00\% on a 65-key cyclic loop. \texttt{liteLRU} v2 embeds an \textbf{S3-FIFO-inspired} replacement policy inside each 64-slot chunk's second 64~bytes ($[64,128)$) via orthogonal 64-bit masks and two 6-bit rotating hands (\texttt{hand}, \texttt{handM}) (while \texttt{NewLRUCacheWithPolicy} exposes \texttt{PolicyCLOCK}, \texttt{PolicyCLOCKPlus}, and \texttt{PolicyS3FIFO} on the identical engine):
 
 \begin{itemize}
     \item $V_k \in \{0,1\}^{64}$ (\texttt{valid}): bit $i = 1$ iff slot $i$ holds a published entry.
-    \item $P_k \in \{0,1\}^{64}$ (\texttt{prob}): bit $i = 1$ iff valid slot $i$ belongs to the Small probationary queue; $M_k = V_k \land \neg P_k$ is the Main protected queue.
+    \item $P_k \in \{0,1\}^{64}$ (\texttt{prob}): bit $i = 1$ iff valid slot $i$ belongs to the Small probationary partition; $M_k = V_k \land \neg P_k$ is the Main protected partition. Rather than true linked FIFO queues, bit-sliced partitions approximate FIFO eviction via rotating \texttt{hand}/\texttt{handM} scans plus bulk frequency promotion.
     \item $(F_{1,k}, F_{0,k}) \in \{0,1\}^{64} \times \{0,1\}^{64}$ (\texttt{f1}, \texttt{f0}): 2-bit bit-sliced saturating frequency ($00 \to 01 \to 11$). Reads skip atomic writes when the target frequency bit is already set.
     \item $W_k \in \{0,1\}^{64}$ (\texttt{writing}): bit $i = 1$ iff a writer exclusively owns slot $i$.
-    \item $(G_{0,k}, G_{1,k})$ (\texttt{ghost0}, \texttt{ghost1}): a 128-bit double-hashed Ghost Bloom filter reset automatically when $\text{popcount}(\texttt{ghost0}) \ge 34$.
+    \item $(G_{0,k}, G_{1,k})$ (\texttt{ghost0}, \texttt{ghost1}): a \textbf{128-bit resetting Ghost Bloom filter} reset automatically when $\text{popcount}(\texttt{ghost0}) \ge 34$. Unlike canonical S3-FIFO's exact FIFO Ghost queue, this Bloom filter trades bounded false-positive promotions and periodic history resets for fixed 16-byte chunk storage and zero heap allocations.
     \item \texttt{hand}, \texttt{handM} $\in \{0 \dots 63\}$: rotating 6-bit offsets for Small and Main circular selection via hardware \texttt{CTZ}~\cite{inteltzcnt,armclz}.
 \end{itemize}
 
@@ -168,13 +168,13 @@ Because \texttt{liteLRU} hashes each key to a fixed 64-slot chunk $k = h(r) \bmo
     \item \textbf{Per-Slot (Go heap, 8~B/slot):} \texttt{entries []atomic.Pointer[cacheEntry]}, where each 64-byte \texttt{cacheEntry} holds an immutable \texttt{(method, path, handler, params)} snapshot.
 \end{itemize}
 
-\subsection{API Semantics, State Machine, and Control Flow}
-\textbf{Best-Effort, Non-Linearizable Cache Semantics and Duplicate Keys.} \texttt{Add} is a best-effort, non-linearizable cache insertion/update rather than a globally serialized upsert. Fast-path updates acquire $W_k[i]: 0 \to 1$ and store a new immutable \texttt{*cacheEntry} pointer (shedding redundant updates when $W_k[i]=1$). Concurrent cold misses on distinct $W_k$ bits can insert duplicate slots; \texttt{Get} returns the lowest-index match and never mutates caller buffer \texttt{dst} before full key verification succeeds, guaranteeing zero \texttt{dst} mutation on misses. An in-flight overwrite clearing $V_k[i]$ can transiently cause misses under concurrent updates.
+\subsection{API Semantics, State Machine, and Multi-Mask Invariants}
+\textbf{Best-Effort, Non-Linearizable Cache Semantics and Option~A Candidate Filtering.} \texttt{Add} is a best-effort, non-linearizable cache insertion/update rather than a globally serialized upsert. Fast-path updates acquire $W_k[i]: 0 \to 1$ and store a new immutable \texttt{*cacheEntry} pointer (shedding redundant updates when $W_k[i]=1$). Concurrent cold misses on distinct $W_k$ bits can insert duplicate slots; \texttt{Get} returns the lowest-index match and never mutates caller buffer \texttt{dst} before full key verification succeeds, guaranteeing zero \texttt{dst} mutation on misses. Under our single-pass Option~A read contract, \texttt{Get} loads \texttt{validBits = chk.valid.Load()} \textit{once} at entry as an initial residency candidate filter without re-checking \texttt{chk.valid} after \texttt{entries[idx].Load()}; thus, during an overwrite on a previously valid bit, a reader may observe either \texttt{oldEntry} or \texttt{newEntry} right before \texttt{chk.valid.Or(mask)} finishes, and both remain memory-safe and untorn because every published \texttt{*cacheEntry} is immutable.
 
-\textbf{Slot Publication \& Operations.} On eviction/insert: acquire $W_k[i]: 0 \to 1$ in \texttt{findVictim}; clear $V_k[i]\leftarrow 0$; record unhit Small victim hashes into Ghost; store \texttt{entries[idx].Store(newEntry)}; CAS \texttt{sig8} into \texttt{chk.sigs}; set $P_k[i]$ via Ghost check; clear \texttt{f0}/\texttt{f1}; publish $V_k[i]\leftarrow 1$ (visibility linearization point); and release $W_k[i]\leftarrow 0$. \texttt{Get} scans active SWAR signature words matching \texttt{sig8}, loads \texttt{entries[idx].Load()}, verifies \texttt{method} and \texttt{path}, copies \texttt{params} into \texttt{dst} (0~allocs when \texttt{cap(dst) >= len(params)}), and calls write-avoiding \texttt{promoteFreq}. \texttt{Clear()} iterates chunks sequentially, acquires all 64 $W_k$ bits via \texttt{CompareAndSwap(0, \textasciicircum uint64(0))}, zeroes chunk masks/signatures and sets \texttt{entries[idx].Store(nil)}, then clears all 128 \texttt{statStripe} counters. \texttt{Clear()} guarantees per-chunk exclusive clearing rather than globally atomic cross-chunk clearing and can starve under continuous concurrent writes.
+\textbf{Slot Publication, \texttt{Clear()}, and Relaxed Policy Mask Invariants.} On eviction/insert: acquire $W_k[i]: 0 \to 1$ in \texttt{findVictim}; clear $V_k[i]\leftarrow 0$; load \texttt{old} and store \texttt{entries[idx].Store(newEntry)}; CAS \texttt{sig8} into \texttt{chk.sigs}; run \texttt{onAdmit} (record unhit Small victim hashes into Ghost, set $P_k[i]$ via Ghost check, clear \texttt{f0}/\texttt{f1}); publish $V_k[i]\leftarrow 1$; and release $W_k[i]\leftarrow 0$. \texttt{Clear()} iterates chunks sequentially, acquires all 64 $W_k$ bits via \texttt{CompareAndSwap(0, \textasciicircum uint64(0))}, zeroes chunk masks/signatures and sets \texttt{entries[idx].Store(nil)}, then clears all 128 \texttt{statStripe} counters (\texttt{Clear()} is non-atomic across chunks and can starve under continuous writes). Crucially, concurrency safety cleanly separates \textbf{hard ownership invariants} ($W_k[i]$ serializes all writes to \texttt{entries[idx]} and \texttt{sigs[bit]}) from \textbf{relaxed bitwise policy hints} (\texttt{prob}, \texttt{f0}, \texttt{f1}, \texttt{ghost0}, \texttt{ghost1}): lock-free \texttt{promoteFreq} reads and multi-word bulk aging/promotion in \texttt{findVictimS3FIFO} can transiently produce $\texttt{prob} \land \neg \texttt{valid} \ne 0$ or lose an overlapping frequency increment between \texttt{prob.And(\textasciicircum hitSmall)} and \texttt{f0.And(\textasciicircum hitSmall)}, shifting only local eviction preference inside chunk $k$ without ever compromising slot ownership or pointer safety.
 
 \subsection{Go Memory Model Safety}
-Every \texttt{*cacheEntry} (including a fresh \texttt{[]Param} copy if non-empty) is fully initialized before single-word \texttt{atomic.Pointer.Store} publication and never mutated afterward~\cite{gomem2024}. Storing \texttt{entries[idx]} strictly precedes \texttt{chk.sigs} CAS and \texttt{chk.valid.Or}, so readers load complete immutable snapshots while all writers serialize on $W_k[i]$.
+Every \texttt{*cacheEntry} (including a fresh \texttt{[]Param} copy if non-empty) is fully initialized before single-word \texttt{atomic.Pointer.Store} publication and never mutated afterward~\cite{gomem2024}. Storing \texttt{entries[idx]} strictly precedes \texttt{chk.sigs} CAS and \texttt{chk.valid.Or}, so readers load complete immutable snapshots (including under Option~A candidate filtering) while all writers serialize on $W_k[i]$.
 
 \subsection{Correctness Theorems}
 
@@ -186,16 +186,16 @@ Every \texttt{*cacheEntry} (including a fresh \texttt{[]Param} copy if non-empty
 
 \textit{Proof:} Both \texttt{findVictim} and per-matched-slot fast-path $W_k$ acquisition increment \texttt{retries} on every failed CAS/aging pass and exit once \texttt{retries >= 10}, leaving OS scheduling, \texttt{cacheEntry} allocation, duplicate scan length $d$, and post-claim \texttt{chk.sigs[bit/8].CompareAndSwap} retries outside $R$. $\square$
 
-\textbf{Theorem 3 (Unconditional Snapshot Safety \& Clean Misses).} \textit{No two writers may simultaneously mutate the same slot; every accepted read in \texttt{Get} observes a complete, untorn snapshot without any 64-bit generation-wraparound assumption; and no miss mutates caller buffer \texttt{dst}.}
+\textbf{Theorem 3 (Mutual Writer Exclusion, Immutable Snapshot Integrity \& Clean Misses).} \textit{No two writers may simultaneously mutate the same slot; every accepted read in \texttt{Get} observes a complete, untorn immutable snapshot without any 64-bit generation-wraparound assumption; and no miss mutates caller buffer \texttt{dst}.}
 
-\textit{Proof:} Writer exclusion is enforced strictly by $W_k[i]$ ($0 \to 1$ CAS or all-ones CAS in \texttt{Clear()}). Because every published \texttt{cacheEntry} and its \texttt{[]Param} slice are immutable, concurrent \texttt{entries[idx].Load()} returns either \texttt{nil} or a live complete snapshot under Go's memory model with zero generation counters. \texttt{Get} verifies full key equality before touching \texttt{dst[:len(ep.params)]}. $\square$
+\textit{Proof:} Writer exclusion is enforced strictly by $W_k[i]$ ($0 \to 1$ CAS or all-ones CAS in \texttt{Clear()}). Under Option~A, \texttt{chk.valid.Load()} serves as an initial residency filter rather than a post-load barrier: sequential consistency of \texttt{entries[idx].Store} before \texttt{chk.sigs} CAS guarantees concurrent \texttt{entries[idx].Load()} returns either \texttt{nil} or a complete immutable \texttt{*cacheEntry} kept live by Go's GC. \texttt{Get} verifies full key equality before touching \texttt{dst[:len(ep.params)]}, leaving \texttt{dst} unmodified on misses and keeping relaxed policy-mask races confined to victim selection. $\square$
 
 \section{Coherence-Line Layout and Stack-Sharded Telemetry}
 
 Removing v1's 128-byte per-slot \texttt{slotState} seqlocks allows targeted coherence separation only where read/write traffic collides:
 \begin{enumerate}
     \item \textbf{Sub-Line \texttt{chunk} Partitioning (128~B):} \texttt{TestLayoutInvariants} verifies $\text{sizeof}(\texttt{chunk})=128$, $\text{offsetof}(\texttt{sigs})=0$ (64~B), and $\text{offsetof}(\texttt{valid})=64$ (64~B). On x86\_64 ($L=64$), read-mostly \texttt{sigs} occupies a separate coherence line from mutating masks; on ARM64 ($L=128$), the entire 64-slot control plane fits in one line.
-    \item \textbf{Stack-Sharded \texttt{statStripe} Telemetry:} Rather than v1's \texttt{hash \& 63} indexing (which caused all 8 cores hitting the same hot key to bounce a single counter cache line), v2's \texttt{workerStripe()} hashes the caller goroutine's 2~KB-aligned stack pointer (\texttt{sp >> 11}) across 128 $L$-byte-padded \texttt{statStripe} structs. Concurrent cores hit disjoint stripes even on a single key (validated in Regime~A1, where unpadding drops throughput by \textbf{-15.4\%}, \S 9.4).
+    \item \textbf{Stack-Sharded \texttt{statStripe} Telemetry:} Rather than v1's \texttt{hash \& 63} indexing (which caused all 8 cores hitting the same hot key to bounce a single counter cache line), v2's \texttt{workerStripe()} hashes the caller goroutine's 2~KB-aligned stack pointer (\texttt{sp >> 11}) across 128 $L$-byte-padded \texttt{statStripe} structs. We distinguish \textbf{counter-contention reduction} from collision-free identity: across concurrent parked goroutines (\texttt{TestWorkerStripeDistributionAndStackGrowth}), $G=8, 16, 32$ occupy 8/8, 16/16, and 29--32/32 distinct stripes across repeated runs, whereas $G=128$ yields 83--88/128 occupied stripes (max 4 per stripe) and $>24$~KiB stack growth relocates 16/16 workers across stripes while preserving exact \texttt{Stats()} totals (\texttt{hits=4000, misses=4000}). In \S 9.4, removing \texttt{statStripe} padding degrades uniform 80/20 throughput by \textbf{-15.4\%} (Regime~A1) while cache-density gains aid resident reads (+9.5\% in A0, +16.5\% in B).
 \end{enumerate}
 
 \section{Benchmark Methodology and Artifacts}
@@ -206,7 +206,7 @@ Our custom evaluation suite (\texttt{benchmarks/hardened\_eval/main.go}, 10 inde
 
 \section{Evaluation}
 
-\textbf{Platform:} Apple M2 (8-core ARM64: 4 performance + 4 efficiency cores, 24 GB RAM, macOS 26.3, Go 1.25.7). Cache capacity 1024 unless stated otherwise. All core microbenchmark sections (\S\S~9.1--9.4, \S\S~9.6--9.7, \S\S~9.11--9.12) report \textbf{10-run medians (with IQR where noted)} on \texttt{liteLRU} v2 (Bitmask S3-FIFO + single \texttt{atomic.Pointer[cacheEntry]} + stack-sharded \texttt{statStripe}); \S\S~9.8--9.10 preserve the earlier pre-hardening \texttt{vegeta} HTTP snapshot (\texttt{f826423}).
+\textbf{Platform:} Apple M2 (8-core ARM64: 4 performance + 4 efficiency cores, 24 GB RAM, macOS 26.3, Go 1.25.7). Cache capacity 1024 unless stated otherwise. All core microbenchmark sections (\S\S~9.1--9.7, \S\S~9.11--9.12) report \textbf{10-run medians (with IQR where noted)} on \texttt{liteLRU} v2 (Bitmask S3-FIFO + single \texttt{atomic.Pointer[cacheEntry]} + stack-sharded \texttt{statStripe}); \S~9.8 reports matched-capacity (\texttt{cap=65,536}) \texttt{vegeta} HTTP v2 runs alongside the consolidated pre-hardening \texttt{f826423} snapshot.
 
 \subsection{Baseline Comparison}
 
@@ -311,7 +311,32 @@ Because \texttt{NewLRUCache} rounds requested capacities up to the next power of
 \caption{Matched power-of-two Zipfian hit rates (median of 10 runs, $N=100{,}000$).}
 \end{table}
 
-Replacing v1's 1-bit CLOCK with Bitmask S3-FIFO + 128-slot Ghost Filter reverses Rev~4's eviction-quality deficit: \texttt{liteLRU} v2 now matches or exceeds \texttt{otter}~\cite{otter} at all six $(s,\text{cap})$ points (83.05\% vs.\ 80.67\% at $16\text{k}, s=1.001$, and 88.82\% vs.\ 87.09\% at $65\text{k}, s=0.800$).
+Replacing v1's 1-bit CLOCK with Bitmask S3-FIFO + 128-bit resetting Ghost Bloom filter reverses Rev~4's eviction-quality deficit: \texttt{liteLRU} v2 now matches or exceeds \texttt{otter}~\cite{otter} at all six $(s,\text{cap})$ points (83.05\% vs.\ 80.67\% at $16\text{k}, s=1.001$, and 88.82\% vs.\ 87.09\% at $65\text{k}, s=0.800$).
+
+\subsection{Controlled Eviction Policy Comparison (CLOCK vs.\ CLOCK+ vs.\ S3-FIFO)}
+
+To separate policy effects from v2's snapshot architecture, we hold the v2 engine fixed and compare \texttt{PolicyCLOCK}, \texttt{PolicyCLOCKPlus} (2-bit frequency, unprotected admission, two-tier aging clearing $A_k$ on $\neg F$ before decaying $F$, omitting \texttt{prob} and Ghost masks), and \texttt{PolicyS3FIFO} via \texttt{NewLRUCacheWithPolicy} (\texttt{benchmarks/policy\_compare}, 10 runs, 8 workers):
+
+\begin{table}[h]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Workload / Metric} & \textbf{PolicyCLOCK} & \textbf{PolicyCLOCKPlus} & \textbf{PolicyS3FIFO} & \textbf{\texttt{otter v1.2.4}} \\ \midrule
+Zipf $s=1.001$ (16k / 32k / 65k) & 78.87 / 86.53 / 94.38\% & 82.83 / 88.75 / \textbf{95.13\%} & \textbf{83.06} / \textbf{88.88} / 95.12\% & 80.75 / 87.37 / 94.72\% \\
+Zipf $s=0.800$ (16k / 32k / 65k) & 55.07 / 69.48 / 87.20\% & 62.16 / 74.00 / \textbf{88.83\%} & \textbf{62.92} / \textbf{74.40} / 88.81\% & 62.84 / 73.88 / 87.07\% \\
+Insert-on-Miss 1k/1k (Med / p99) & 116.03M / 291~ns & \textbf{119.82M} / \textbf{250~ns} & 113.88M / 291~ns & --- \\
+Insert-on-Miss 1k/5k (Med / Hit) & 48.77M / 75.13\% & \textbf{55.15M} / 80.09\% & 49.44M / \textbf{80.78\%} & --- \\
+Zipf 80/20 Evict 1k/100k (Med / Hit) & 51.39M / 54.09\% & \textbf{51.84M} / 59.61\% & 50.18M / \textbf{60.15\%} & --- \\
+Chunk-0 128-key 80/20 (Eff / Exhaust) & 15.84M / 9,828 & \textbf{16.49M} / 1,580 & 11.48M / \textbf{390} & --- \\
+Associativity 64 / 65 keys (Ch.~0) & 100.00 / 0.00\% & 100.00 / 0.00\% & \textbf{100.00 / 96.83\%} & --- \\
+Scan 256 hot + 2048 scan (1-Get/2-Get) & 0.00 / 0.00\% & \textbf{100.00 / 100.00\%} & \textbf{100.00 / 100.00\%} & --- \\ \bottomrule
+\end{tabular}%
+}
+\caption{Controlled eviction-policy comparison on the identical v2 engine (CAS exhaustions profiled via \texttt{-tags casmetrics}).}
+\end{table}
+
+While \texttt{PolicyCLOCKPlus} offers $+3.3\%$ to $+43.8\%$ higher write throughput under tight/saturated contention by omitting \texttt{prob} and Ghost bookkeeping, \textbf{only \texttt{PolicyS3FIFO}} beats \texttt{otter} across all $s=0.800$ capacities, avoids the 65-key cyclic collapse (96.83\% vs.\ 0.00\%), and minimizes chunk saturation exhaustions (390 vs.\ 1,580), justifying \texttt{PolicyS3FIFO} as the default.
 
 \subsection{Write-Heavy Workloads, Semantic-Equivalence Controls, and Miss Penalty}
 
@@ -334,79 +359,30 @@ Miss-Penalty $5\,\mu\text{s}$ (cap 16k, $N=100\text{k}$) & \textbf{4.51M} (4.36-
 \caption{Write-heavy direct overwrite contention, immutable insert-on-miss controls, and $5\,\mu\text{s}$ backend miss-penalty benchmark (10-run medians).}
 \end{table}
 
-Eliminating read-side seqlock RFOs flips v1's $N=1\text{k}$ insert-on-miss deficit ($0.36\times$) into a \textbf{1.13$\times$ lead} (128.59M vs.\ 113.74M ops/s). Under eviction churn, \texttt{liteLRU} v2 leads by \textbf{3.60$\times$} at cap~1,024/$N=5\text{k}$ and \textbf{6.17$\times$} at cap~16,384/$N=100\text{k}$ (with 82.20\% vs.\ 80.17\% hit rate), and sustains \textbf{4.51M vs.\ 3.47M ops/s} (\textbf{1.30$\times$}) when paying an explicit 5~\textmu s miss penalty. Note that \S\S~9.8--9.10 preserve the pre-hardening HTTP snapshot; end-to-end HTTP runs with v2 remain future work.
+Eliminating read-side seqlock RFOs flips v1's $N=1\text{k}$ insert-on-miss deficit ($0.36\times$) into a \textbf{1.13$\times$ lead} (128.59M vs.\ 113.74M ops/s, though \texttt{otter} achieves slightly higher hit rate at $N=1\text{k}$, 99.94\% vs.\ 99.19\%, and direct overwrite speedups reflect 4.67\%--5.30\% $W_k$ load shedding vs.\ full write queuing). Under eviction churn, \texttt{liteLRU} v2 leads by \textbf{3.60$\times$} at cap~1,024/$N=5\text{k}$ and \textbf{6.17$\times$} at cap~16,384/$N=100\text{k}$ (with 82.20\% vs.\ 80.17\% hit rate), and sustains \textbf{4.51M vs.\ 3.47M ops/s} (\textbf{1.30$\times$}) when paying an explicit 5~\textmu s miss penalty.
 
-\subsection{HTTP Router Integration (JSON Response Memoization)}
+\subsection{Matched-Capacity HTTP Server Integration (v2) vs.\ Pre-Hardening Snapshot}
 
-\textit{Historical snapshot notice (pre-hardening baseline \texttt{f826423}, non-power-of-two capacity configuration):} To evaluate \texttt{liteLRU}'s end-to-end tail-latency behavior in an HTTP application layer, we integrated it into a standard Go \texttt{net/http} server functioning as a REST API (\texttt{benchmarks/http\_server/server.go}). Because that harness passed \texttt{capacity = 75000} (75\% of the 100{,}000-key working set), \texttt{NewLRUCache}'s power-of-two constructor rounded \texttt{liteLRU}'s effective capacity to 131{,}072 entries (100\% working-set coverage) while Otter remained configured at 75{,}000 entries; accordingly, this subsection and Sections~9.9--9.10 are retained as pre-hardening (\texttt{f826423}) architectural integration case studies rather than matched-capacity comparisons against the hardened implementation.
-
-We generated 10 seconds of concurrent load (64 workers) using \texttt{vegeta}, driving HTTP \texttt{GET} requests following a Zipfian distribution ($s=1.001$, $N=100{,}000$). The server simulates a backend endpoint by dynamically selecting one of 20 complex, nested JSON payloads per request. We compared three configurations:
-\begin{enumerate}
-    \item \textbf{No Cache (Origin Only)}: The handler performs a full \texttt{json.Marshal()} on the complex payload structure for every single request before responding.
-    \item \textbf{\texttt{otter} (\texttt{v1.2.4}, capacity 75{,}000)}: The handler caches the serialized JSON string. On a cache hit, it instantly writes the string, bypassing JSON marshaling completely.
-    \item \textbf{\texttt{liteLRU} (\texttt{f826423}, effective capacity 131{,}072)}: The handler stores the serialized JSON string in the \texttt{liteLRU} parameter block. On a hit, it instantly writes the parameter string, bypassing the JSON marshaling completely.
-\end{enumerate}
+To evaluate \texttt{liteLRU} v2 inside a Go \texttt{net/http} loopback server without power-of-two capacity confounding (\texttt{benchmarks/http\_server/server.go -cap=65536}), we ran \texttt{vegeta} (\texttt{-rate=0 -workers=16 -max-workers=64}, 3s warmup + 8s measurement, 100.00\% HTTP 200) across two Zipfian ($s=1.001, N=100{,}000$) endpoints:
 
 \begin{table}[h]
 \centering
-\begin{tabular}{@{}lrrrr@{}}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llrrrrr@{}}
 \toprule
-\textbf{Configuration} & \textbf{Throughput (Req/sec)} & \textbf{p50 Latency} & \textbf{p99 Latency} & \textbf{Max Latency} \\ \midrule
-No Cache & 86,453 & 303 $\mu$s & 1.36 ms & 35.1 ms \\
-\texttt{otter} (\texttt{v1.2.4}) & 86,056 & 279 $\mu$s & 1.41 ms & 173.1 ms \\
-\texttt{liteLRU} (\texttt{f826423}) & \textbf{93,603} & \textbf{276 $\mu$s} & \textbf{1.20 ms} & 43.1 ms \\ \bottomrule
-\end{tabular}
-\caption{Pre-hardening (\texttt{f826423}) end-to-end HTTP routing tail latencies under Zipfian load caching JSON payloads (effective capacity 131{,}072 vs.\ Otter 75{,}000).}
+\textbf{Endpoint (\texttt{cap=65,536})} & \textbf{Configuration} & \textbf{Req/sec} & \textbf{p50} & \textbf{p99} & \textbf{Max} & \textbf{Hit / Drops} \\ \midrule
+\texttt{/api/user/\{id\}/profile} & No Cache & 66,562 & 504.7~$\mu$s & 2.939~ms & 10.23~ms & --- \\
+\texttt{/api/user/\{id\}/profile} & \texttt{liteLRU} v2 & 76,410 (+14.8\%) & 333.7~$\mu$s & 2.456~ms & 31.22~ms & 92.06\% / 0 \\
+\texttt{/api/user/\{id\}/profile} & \texttt{otter} (\texttt{v1.2.4}) & \textbf{82,109} (+23.4\%) & \textbf{313.0~$\mu$s} & \textbf{1.855~ms} & 24.80~ms & --- \\
+\texttt{/route/\{id\}} (JSON) & No Cache & 77,974 & 320.4~$\mu$s & 1.739~ms & 21.73~ms & --- \\
+\texttt{/route/\{id\}} (JSON) & \texttt{liteLRU} v2 & 80,726 (+3.5\%) & \textbf{287.5~$\mu$s} & 1.558~ms & 21.31~ms & 92.45\% / 0 \\
+\texttt{/route/\{id\}} (JSON) & \texttt{otter} (\texttt{v1.2.4}) & \textbf{82,850} (+6.3\%) & 306.1~$\mu$s & \textbf{1.545~ms} & \textbf{19.32~ms} & --- \\ \bottomrule
+\end{tabular}%
+}
+\caption{Matched-capacity (\texttt{cap=65,536}) \texttt{vegeta} loopback HTTP benchmarks on \texttt{liteLRU} v2 vs.\ \texttt{otter v1.2.4}.}
 \end{table}
 
-By skipping the expensive CPU overhead of \texttt{encoding/json}, both caches reduce median latency relative to the raw origin server. At the extreme tail in this 10-second run, \texttt{otter} exhibits a 173.1~ms maximum latency compared to 35.1~ms for No Cache and 43.1~ms for \texttt{liteLRU}; attributing that single-run tail spike to a specific internal mechanism versus Go scheduler, GC, or effective-capacity effects would require dedicated profiling.
-
-\subsection{Reverse Proxy Integration (Upstream Latency and Jitter)}
-
-\textit{Historical snapshot notice (pre-hardening baseline \texttt{f826423}, effective capacity 131{,}072 vs.\ Otter 75{,}000):} To evaluate cache behavior when hits bypass upstream transport latency and origin variance rather than CPU-bound serialization, we simulated a reverse proxy caching layer. On a cache miss, the handler simulates an upstream network fetch with a 50~ms base latency and up to 20~ms of random jitter before JSON marshaling. On a cache hit, the upstream request and serialization are bypassed entirely.
-
-The server was driven with a 10-second \texttt{vegeta} workload utilizing 64 concurrent workers targeting the simulated proxy endpoint.
-
-\begin{table}[h!]
-\centering
-\begin{tabular}{lrrrr}
-\toprule
-\textbf{Cache Implementation} & \textbf{Rate (Req/s)} & \textbf{p50 Latency} & \textbf{p99 Latency} & \textbf{Max Latency} \\
-\midrule
-\textbf{liteLRU (\texttt{f826423})} & \textbf{3,140} & \textbf{147 $\mu$s} & 69.22 ms & 74.14 ms \\
-Otter & 3,139 & 152 $\mu$s & 69.22 ms & 72.45 ms \\
-Origin (No Cache) & 1,101 & 57.36 ms & 69.52 ms & 90.55 ms \\
-\bottomrule
-\end{tabular}
-\caption{Pre-hardening (\texttt{f826423}) reverse proxy simulation with 50--70~ms upstream jitter on cache misses (effective capacity 131{,}072 vs.\ Otter 75{,}000).}
-\label{tab:proxy_integration}
-\end{table}
-
-By shielding the application from the simulated network upstream, \texttt{liteLRU} drops the median (p50) response time in this run from 57.36~ms down to 147~$\mu$s (approximately 390$\times$ lower). The p99 latency in the cached runs (69.22~ms) reflects the intentional upstream penalty during misses, showing that cache lookup latency is small relative to the simulated upstream delay.
-
-\subsection{Dynamic Router Integration and Pathological Stress Testing}
-\textit{Historical snapshot notice (pre-hardening baseline \texttt{f826423}, effective capacity 131{,}072 vs.\ Otter 75{,}000):} To evaluate an HTTP routing integration workload and verify contention behavior under simultaneous misses, we simulated a dynamic routing layer. We designed a synthetic stress case using timer synchronization to saturate a single chunk with 64 simultaneous misses, validating the 10-retry admission bound (Section~6.2).
-
-In the end-to-end HTTP simulation, the un-cached origin simulates a CPU-bound regex routing tree lookup and path extraction (e.g., \texttt{/api/user/\{id\}/profile}). \texttt{liteLRU} caches the resulting \texttt{HandlerFunc} and extracted \texttt{[]Param} directly using a stack-allocated buffer (\texttt{var pbuf [4]liteLRU.Param}) for parameter retrieval, eliminating per-hit heap allocations in the caller.
-
-The server was driven with a 10-second \texttt{vegeta} workload utilizing 64 concurrent workers targeting the simulated router endpoint.
-
-\begin{table}[h]
-\centering
-\begin{tabular}{lrrrr}
-\toprule
-\textbf{Cache Implementation} & \textbf{Rate (Req/s)} & \textbf{p50 Latency} & \textbf{p99 Latency} & \textbf{Max Latency} \\
-\midrule
-\textbf{liteLRU (\texttt{f826423})} & \textbf{95,708} & \textbf{253 $\mu$s} & \textbf{1.39 ms} & \textbf{18.96 ms} \\
-Otter & 91,959 & 269 $\mu$s & 1.73 ms & 37.92 ms \\
-Origin (No Cache) & 78,680 & 381 $\mu$s & 1.93 ms & 198.69 ms \\
-\bottomrule
-\end{tabular}
-\caption{Pre-hardening (\texttt{f826423}) dynamic router simulation with CPU-bound routing penalty on cache misses (effective capacity 131{,}072 vs.\ Otter 75{,}000).}
-\label{tab:router}
-\end{table}
-
-In this single-run historical measurement, caching route resolution lowered median observed latency from 381~$\mu$s (Origin) to 253~$\mu$s (\texttt{liteLRU}), with Otter achieving 91{,}959 req/s, 1.73~ms p99, and 37.92~ms max latency versus 95{,}708 req/s, 1.39~ms p99, and 18.96~ms max latency for \texttt{liteLRU}. Because the run was captured prior to concurrency hardening and without isolating effective-capacity differences (131{,}072 vs.\ 75{,}000) or asynchronous versus inline admission profiling, those single-run HTTP differences should not be attributed solely to any single architectural factor; we retain the scenario primarily to illustrate the stack-allocated parameter-slice pattern and bounded-retry thundering-herd behavior.
+Because loopback HTTP/TCP parsing consumes $\sim 300\,\mu\text{s}$ per request, nanosecond cache-lookup differences are masked; both caches outperform No Cache while \texttt{otter} leads HTTP request rate by 2.6\%--7.5\% (unlike the unthrottled in-process and 5~$\mu$s miss-penalty benchmarks where \texttt{liteLRU} leads by $1.30\times$--$6.17\times$). \textit{Consolidated historical snapshot (\texttt{f826423}):} earlier pre-hardening single runs using \texttt{capacity=75000} (rounded to 131,072 for \texttt{liteLRU} vs.\ 75,000 for \texttt{otter}) yielded 93,603 vs.\ 86,056 req/s on \texttt{/route/}, 95,708 vs.\ 91,959 req/s on \texttt{/api/user/\{id\}/profile}, and 3,140 req/s (147~$\mu$s p50) vs.\ Origin 1,101 req/s (57.36~ms p50) under a 50--70~ms reverse-proxy delay.
 
 \subsection{Controlled Occupancy, Set Pressure, and Adversarial Stress Tests}
 
@@ -428,7 +404,7 @@ Key length scaling & 100\% Get, 16/64/256/1024~B & 126.31M / 101.49M / 60.90M / 
 \caption{Controlled set pressure, occupancy decomposition (pure Get vs.\ mixed 80/20), scan resistance, and key-length scaling on v2.}
 \end{table}
 
-Three structural improvements emerge over v1: (1) under $P_k = 1.016$ ($H_0=65$ cyclic), Bitmask S3-FIFO protects frequent items in Main and retains \textbf{96.83\%} hits instead of crashing to 0.00\%; (2) a capacity-exceeding 2048-key scan leaves \textbf{256/256 (100.00\%)} hot items intact vs.\ 0/256 under CLOCK; and (3) zero-write read paths keep 100\%-full lookup throughput at \textbf{123.17M ops/s}, while single-key upsert contention sheds 80.90\% of redundant overwrites without blocking.
+Three structural improvements emerge over v1: (1) under $P_k = 1.016$ ($H_0=65$ cyclic), Bitmask S3-FIFO protects frequent items in Main and retains \textbf{96.83\%} hits instead of crashing to 0.00\%; (2) on the tested post-warmup sequential scan (256 hit-promoted hot keys + 2048 scan keys), Bitmask S3-FIFO retains \textbf{256/256 (100.00\%)} hot items vs.\ 0/256 under CLOCK; and (3) zero-write read paths keep 100\%-full lookup throughput at \textbf{123.17M ops/s}, while single-key upsert contention sheds 80.90\% of redundant overwrites without blocking.
 
 \subsection{Off-Heap Metadata vs.\ On-Heap Slices (GC Isolation)}
 
@@ -461,7 +437,7 @@ Removing per-slot seqlocks narrows the Go-heap delta to 128~KiB (6.47~MB vs.\ 6.
 
 \textbf{Memory Overhead (16.2$\times$ Reduction in Fixed Arrays).} Replacing 128-byte padded \texttt{slotState} seqlocks and 4 SoA pointer arrays with \texttt{entries []atomic.Pointer[cacheEntry]} (8~B/slot) plus 128-byte \texttt{chunk} metadata (2~B/slot) reduces fixed per-slot arrays on ARM64 ($L=128$) from 162~B/slot to \textbf{10~B/slot} (\textasciitilde 10~MB per million slots), plus one 64~B \texttt{cacheEntry} per populated slot (\textasciitilde 74~MB per million populated entries vs.\ \textasciitilde 120~MB for \texttt{otter}) and a fixed 16~KiB \texttt{[128]statStripe} array per cache.
 
-\textbf{Set-Associative Capacity Boundaries vs.\ Global Policies.} Per-chunk Bitmask S3-FIFO preserves 100.00\% scan retention (\S 9.11) and beats \texttt{otter} on Zipfian hit rates across all matched capacities (\S 9.6). Nevertheless, extreme hash skew landing $\gg 64$ hot keys into a single chunk ($H_k > 64$, e.g.\ 128 hot keys in one set) will evict entries locally even if sibling chunks are under-utilized.
+\textbf{Set-Associative Capacity Boundaries vs.\ Global Policies.} Per-chunk Bitmask S3-FIFO (\texttt{smallTarget = 4}, $\sim 6.25\%$ probationary threshold plus 128-bit resetting Ghost Bloom filter) retains 256/256 hot keys under post-warmup sequential scans (\S 9.11), avoids 65-key cyclic collapse (96.83\% vs.\ 0.00\% under \texttt{CLOCK+}), and beats \texttt{otter} on Zipfian hit rates across all matched capacities (\S 9.6). Nevertheless, extreme hash skew landing $\gg 64$ hot keys into a single chunk ($H_k > 64$, e.g.\ 128 hot keys in one set) will evict entries locally even if sibling chunks are under-utilized.
 
 \textbf{Fixed Capacity \& Scoped Bounds.} The cache does not resize and rounds capacity up to powers of two (\texttt{nextPowerOfTwo}, minimum 64). Ownership claim retries on $W_k$ are bounded by $R=10$; post-claim \texttt{chk.sigs} CAS lies outside $R$ (Theorem~2).
 
@@ -469,7 +445,7 @@ Removing per-slot seqlocks narrows the Go-heap delta to 128~KiB (6.47~MB vs.\ 6.
 
 \section{Conclusion}
 
-We have presented the architecture and evaluation of \texttt{liteLRU} v2: compact off-heap \texttt{chunk} SWAR signatures and Bitmask S3-FIFO state (2~B/slot) paired with single-pointer immutable heap snapshots (\texttt{entries []atomic.Pointer[cacheEntry]}, 8~B/slot)~\cite{gogc2018,gomem2024}, hardware \texttt{CTZ} eviction without background threads~\cite{inteltzcnt,armclz}, stack-sharded $L$-byte-padded telemetry~\cite{falsesharing1993,mesi1984}, and $R=10$ bounded ownership claims. Across 10-run evaluations (\S\S~9.1--9.7, \S\S~9.11--9.12), \texttt{liteLRU} v2 outperforms \texttt{otter v1.2.4} on both read-dominated (128.59M vs.\ 113.74M ops/s, $1.13\times$) and evicting (47.24M--56.29M vs.\ 9.12M--13.11M ops/s, $3.60\times\text{--}6.17\times$) workloads---including with an explicit 5~\textmu s miss penalty ($1.30\times$)---while achieving 100.00\% scan retention, higher matched Zipfian hit rates, and 500~ns sampled p99 latency on the uniform baseline.
+We have presented the architecture and evaluation of \texttt{liteLRU} v2: compact off-heap \texttt{chunk} SWAR signatures and Bitmask S3-FIFO state (2~B/slot) paired with single-pointer immutable heap snapshots (\texttt{entries []atomic.Pointer[cacheEntry]}, 8~B/slot)~\cite{gogc2018,gomem2024}, hardware \texttt{CTZ} eviction without background threads~\cite{inteltzcnt,armclz}, stack-sharded $L$-byte-padded telemetry~\cite{falsesharing1993,mesi1984}, and $R=10$ bounded ownership claims. Across 10-run microbenchmark evaluations (\S\S~9.1--9.7, \S\S~9.11--9.12), \texttt{liteLRU} v2 outperforms \texttt{otter v1.2.4} on both read-dominated (128.59M vs.\ 113.74M ops/s, $1.13\times$ at $N=1\text{k}$, where \texttt{otter} edges hit rate 99.94\% vs.\ 99.19\%) and evicting (47.24M--56.29M vs.\ 9.12M--13.11M ops/s, $3.60\times\text{--}6.17\times$) workloads---including with an explicit 5~\textmu s miss penalty ($1.30\times$)---while retaining 256/256 warmed hot keys across sequential scans, beating or matching \texttt{otter} on Zipfian hit rates, and cutting uniform baseline sampled p99 latency to 500~ns (while matched-capacity loopback \texttt{net/http} throughput remains TCP/serialization bound at 76.4k--80.7k vs.\ 82.1k--82.9k~req/s).
 
 \bibliographystyle{plain}
 \bibliography{references}
@@ -482,13 +458,12 @@ We have presented the architecture and evaluation of \texttt{liteLRU} v2: compac
     \item \textbf{macOS Version}: macOS 26.3
     \item \textbf{Machine RAM}: 24GB (\texttt{hw.memsize = 25769803776})
     \item \textbf{Comparator}: \texttt{github.com/maypok86/otter v1.2.4}
-    \item \textbf{v2 Evaluation}: \S\S~8 (\texttt{-count=5}), 9.1--9.4, 9.6--9.7 (10 runs, median + IQR), and 9.11--9.12 were measured on \texttt{liteLRU} v2.
-    \item \textbf{Historical Snapshot}: Commit \texttt{f826423} (\S\S~9.8--9.10 with \texttt{capacity=75000} rounded to 131,072 slots; \texttt{benchmarks/ablation/} holds an earlier hash-map ablation harness)
+    \item \textbf{v2 Evaluation}: \S\S~8 (\texttt{-count=5}), 9.1--9.7 (10 runs, median + IQR), matched HTTP \texttt{-cap=65536} (\S~9.8), and 9.11--9.12 were measured on \texttt{liteLRU} v2; pre-hardening snapshot \texttt{f826423} used \texttt{capacity=75000} (rounded to 131,072 for \texttt{liteLRU}).
     \item \textbf{Commands}:
     \begin{itemize}
-        \item Verification: \texttt{go vet ./... \&\& go test -v -race -count=1 ./...}
+        \item Verification: \texttt{go vet ./... \&\& go test -v -race -count=1 ./...} and \texttt{go test -tags casmetrics -race -count=1 ./...}
         \item Latency \& parallel Go harnesses: \texttt{go test -v -count=10 -run=TestConcurrentLatency .} and \texttt{go test -run=\^{}\$ -bench=BenchmarkParallelLRUCache -benchmem -cpu=1,2,4,8 -count=5 .}
-        \item Benchmarks (\texttt{cd benchmarks}): \texttt{go run ./hardened\_eval} (or scoped \texttt{--only-baseline}, \texttt{--only-ablation}, \texttt{--only-scale}, \texttt{--only-write}, \texttt{--only-zipf}, \texttt{--only-gc}), \texttt{go run adversarial\_bench.go}
+        \item Benchmarks (\texttt{cd benchmarks}): \texttt{go run ./hardened\_eval}, \texttt{go run ./policy\_compare}, \texttt{go run adversarial\_bench.go}, and \texttt{./http\_server/server -cap=65536}
     \end{itemize}
 \end{itemize}
 
